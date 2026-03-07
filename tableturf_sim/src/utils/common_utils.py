@@ -1,3 +1,213 @@
+import json
+import os
+from typing import List, Tuple, Optional
+from pathlib import Path
+
+# 导入类型定义
+from ..assets.tpyes import Card_Single, CardDeck, Card_Rotation
+
+
+# 全局缓存：加载一次 JSON 数据
+_card_data_cache: Optional[List[dict]] = None
+_card_dict_by_number: Optional[dict] = None
+
+
+def _load_card_data() -> List[dict]:
+    """加载卡牌 JSON 数据（带缓存）。"""
+    global _card_data_cache
+    if _card_data_cache is None:
+        # 获取项目根目录（假设 common_utils.py 在 tableturf_sim/src/utils/）
+        current_file = Path(__file__)
+        project_root = current_file.parent.parent.parent
+        json_path = project_root / "data" / "cards" / "MiniGameCardInfo.json"
+        
+        if not json_path.exists():
+            raise FileNotFoundError(f"卡牌数据文件不存在: {json_path}")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            _card_data_cache = json.load(f)
+    
+    return _card_data_cache
+
+
+def _get_card_dict_by_number() -> dict:
+    """获取按 Number 索引的卡牌字典（带缓存）。"""
+    global _card_dict_by_number
+    if _card_dict_by_number is None:
+        cards = _load_card_data()
+        _card_dict_by_number = {card["Number"]: card for card in cards}
+    return _card_dict_by_number
+
+
+def _square_str_to_int(s: str) -> int:
+    """将 Square 字符串转换为整数编码：Empty=0, Fill=1, Special=2"""
+    if s == "Empty":
+        return 0
+    elif s == "Fill":
+        return 1
+    elif s == "Special":
+        return 2
+    else:
+        raise ValueError(f"未知的 Square 值: {s}")
+
+
+def _square_list_to_matrix(square_list: List[str]) -> List[List[int]]:
+    """将 64 元素的 Square 列表转换为 8x8 矩阵。"""
+    if len(square_list) != 64:
+        raise ValueError(f"Square 列表长度必须为 64，实际为 {len(square_list)}")
+    
+    matrix = []
+    for row in range(8):
+        matrix.append([
+            _square_str_to_int(square_list[row * 8 + col])
+            for col in range(8)
+        ])
+    return matrix
+
+
+def _rotate_matrix(matrix: List[List[int]], rotation: int) -> List[List[int]]:
+    """旋转 8x8 矩阵。rotation: 0=0°, 1=90°CW, 2=180°, 3=270°CW"""
+    if rotation == 0:
+        return [row[:] for row in matrix]
+    
+    rotated = [[0] * 8 for _ in range(8)]
+    for r in range(8):
+        for c in range(8):
+            new_r, new_c = rotate_cell(r, c, rotation)
+            rotated[new_r][new_c] = matrix[r][c]
+    
+    return rotated
+
+
+def _find_first_non_empty(matrix: List[List[int]]) -> Optional[Tuple[int, int]]:
+    """找到矩阵中第一个非 Empty（非0）的坐标 (x, y)。"""
+    for y in range(8):
+        for x in range(8):
+            if matrix[y][x] != 0:
+                return (x, y)
+    return None
+
+
+def _calculate_edge(matrix: List[List[int]]) -> Tuple[int, int]:
+    """计算边界框的最小坐标 (min_x, min_y)。"""
+    min_x, min_y = 8, 8
+    for y in range(8):
+        for x in range(8):
+            if matrix[y][x] != 0:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+    
+    # 如果没有非空点，返回 (0, 0)
+    if min_x == 8:
+        return (0, 0)
+    return (min_x, min_y)
+
+
+def _rarity_str_to_int(rarity_str: str) -> int:
+    """将稀有度字符串转换为整数：Common=0, Rare=1, Fresh=2"""
+    rarity_map = {
+        "Common": 0,
+        "Rare": 1,
+        "Fresh": 2,
+    }
+    return rarity_map.get(rarity_str, 0)
+
+
+def create_card_from_id(card_id: int) -> Card_Single:
+    """
+    根据卡牌编号（Number）从 JSON 数据创建 Card_Single 对象。
+    
+    Args:
+        card_id: 卡牌编号（Number 字段）
+    
+    Returns:
+        Card_Single 对象
+    
+    Raises:
+        KeyError: 如果找不到指定编号的卡牌
+    """
+    card_dict = _get_card_dict_by_number()
+    
+    if card_id not in card_dict:
+        raise KeyError(f"找不到编号为 {card_id} 的卡牌")
+    
+    card_data = card_dict[card_id]
+    
+    # 转换 Square 列表为 8x8 矩阵
+    square_2d_0 = _square_list_to_matrix(card_data["Square"])
+    
+    # 计算 4 个旋转的矩阵
+    square_2d_90 = _rotate_matrix(square_2d_0, 1)
+    square_2d_180 = _rotate_matrix(square_2d_0, 2)
+    square_2d_270 = _rotate_matrix(square_2d_0, 3)
+    
+    # 计算参考点（第一个非 Empty 点）
+    link_pos_0 = _find_first_non_empty(square_2d_0)
+    if link_pos_0 is None:
+        link_pos_0 = (0, 0)  # 如果全是 Empty，使用 (0, 0)
+    
+    link_pos_90 = _find_first_non_empty(square_2d_90) or (0, 0)
+    link_pos_180 = _find_first_non_empty(square_2d_180) or (0, 0)
+    link_pos_270 = _find_first_non_empty(square_2d_270) or (0, 0)
+    
+    # 计算边界（min_x, min_y）
+    edge_0 = _calculate_edge(square_2d_0)
+    edge_90 = _calculate_edge(square_2d_90)
+    edge_180 = _calculate_edge(square_2d_180)
+    edge_270 = _calculate_edge(square_2d_270)
+    
+    # 计算点数（非 Empty 格子数）
+    card_point = sum(1 for row in square_2d_0 for cell in row if cell != 0)
+    
+    # 转换 Rarity 和 NameHash
+    rarity_int = _rarity_str_to_int(card_data.get("Rarity", "Common"))
+    name_hash_str = str(card_data.get("NameHash", ""))
+    
+    return Card_Single(
+        name=card_data.get("Name", ""),
+        NameHash=name_hash_str,
+        Number=card_data.get("Number", 0),
+        Rarity=rarity_int,
+        CardPoint=card_point,
+        SpecialCost=card_data.get("SpecialCost", 0),
+        square_2d_0=square_2d_0,
+        square_2d_90=square_2d_90,
+        square_2d_180=square_2d_180,
+        square_2d_270=square_2d_270,
+        link_pos_0=link_pos_0,
+        link_pos_90=link_pos_90,
+        link_pos_180=link_pos_180,
+        link_pos_270=link_pos_270,
+        edge_0=edge_0,
+        edge_90=edge_90,
+        edge_180=edge_180,
+        edge_270=edge_270,
+        SquareSortOffset=card_data.get("SquareSortOffset", 0),
+        RowId=card_data.get("__RowId"),
+    )
+
+
+def create_deck_from_ids(card_ids: List[int]) -> CardDeck:
+    """
+    根据 15 个卡牌编号创建 CardDeck 对象。
+    
+    Args:
+        card_ids: 15 个卡牌编号的列表
+    
+    Returns:
+        CardDeck 对象
+    
+    Raises:
+        ValueError: 如果 card_ids 长度不是 15
+        KeyError: 如果某个卡牌编号不存在
+    """
+    if len(card_ids) != 15:
+        raise ValueError(f"CardDeck 必须包含 15 张卡牌，实际提供了 {len(card_ids)} 张")
+    
+    cards = [create_card_from_id(card_id) for card_id in card_ids]
+    return CardDeck(cards=cards)
+
+
 def get_collision_mask(m1, x1, y1, m2, x2, y2):
     dx = x2 - x1
     dy = y2 - y1
@@ -16,7 +226,7 @@ def get_collision_mask(m1, x1, y1, m2, x2, y2):
     else:
         shifted_m2 = m2 >> abs(shift_amount)
 
-    # 关键：位移后可能会有“环绕”污染（比如第1行移到了第2行）
+    # 关键：位移后可能会有"环绕"污染（比如第1行移到了第2行）
     # 需要根据 dx 使用掩码清空无效位
     col_mask = 0xFFFFFFFFFFFFFFFF
     if dx > 0:

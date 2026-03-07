@@ -215,7 +215,15 @@ class ReplayMeta:
 class ReplayMove:
     #TODO：添加每回合手牌是哪四张
     #TODO: 添加完整地图情况（仅训练）
-    """单步动作：出牌或弃权。"""
+    """单步动作：出牌或弃权。
+
+    说明：
+    - 为了方便 JSON 序列化，这里不直接存放 `Card_Single` / `GameMap` 对象，
+      而是存放「可还原」的原始数据：
+        * `hand_card_numbers`：当回合 4 张手牌的卡牌编号（Number）
+        * `map_grid`：当前整张地图的状态快照（用 `Map_PointMask` 的 int 值）
+    - 在训练或回放时，可通过全局卡牌表 + `map_id` 将这些编号还原为完整卡面信息。
+    """
     turn: int                      # 回合号
     player: str                    # "P1" 或 "P2"
     # 弃权时 pass=True，以下字段可省略/None
@@ -226,6 +234,9 @@ class ReplayMove:
     x: Optional[int] = None        # 放置位置 x（参考点）
     y: Optional[int] = None        # 放置位置 y（参考点）
     rotation: Optional[int] = None # 旋转角度 0/90/180/270
+    # 下面两个字段为「状态快照」，可选，仅在需要做训练 / 分析时写入
+    hand_card_numbers: Optional[List[int]] = None   # 当前 4 张手牌对应的卡牌编号列表
+    map_grid: Optional[List[List[int]]] = None      # 当前整张地图的 bitmask 网格快照
 
 
 @dataclass
@@ -273,6 +284,8 @@ class Replay:
                 x=m.get("x"),
                 y=m.get("y"),
                 rotation=m.get("rotation"),
+                hand_card_numbers=m.get("hand_card_numbers"),
+                map_grid=m.get("map_grid"),
             ))
         res_d = d["result"]
         result = ReplayResult(
