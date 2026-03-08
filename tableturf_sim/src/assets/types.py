@@ -99,10 +99,10 @@ class Card_Single:
     link_pos_90: Tuple[int, int]            # 90度旋转的参考点坐标(x, y)
     link_pos_180: Tuple[int, int]           # 180度旋转的参考点坐标(x, y)
     link_pos_270: Tuple[int, int]           # 270度旋转的参考点坐标(x, y)
-    edge_0: Tuple[int, int]                 # 0度旋转的参考边界(左, 上, 右, 下)
-    edge_90: Tuple[int, int]                # 90度旋转的参考边界(左, 上, 右, 下)
-    edge_180: Tuple[int, int]               # 180度旋转的参考边界(左, 上, 右, 下)
-    edge_270: Tuple[int, int]               # 270度旋转的参考边界(左, 上, 右, 下)
+    edge_0: Tuple[int, int, int, int]                 # 0度旋转的参考边界(左, 上, 右, 下)
+    edge_90: Tuple[int, int, int, int]                # 90度旋转的参考边界(左, 上, 右, 下)
+    edge_180: Tuple[int, int, int, int]               # 180度旋转的参考边界(左, 上, 右, 下)
+    edge_270: Tuple[int, int, int, int]               # 270度旋转的参考边界(左, 上, 右, 下)
     SquareSortOffset: int                   # 排序偏移（可根据需要调整类型）
     RowId: Optional[Any] = None             # 行标识符（内部用，可选）
 
@@ -165,6 +165,7 @@ class CardDeck:
 
     def all_drawn(self) -> bool:
         """判断是否所有卡都已被抽取。"""
+        return all(self._drawn_flags)
 
 @dataclass
 class Card_In_Hand:

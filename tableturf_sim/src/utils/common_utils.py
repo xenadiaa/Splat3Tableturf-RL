@@ -1,10 +1,11 @@
 import json
 import os
+import math
 from typing import List, Tuple, Optional
 from pathlib import Path
 
 # 导入类型定义
-from ..assets.tpyes import Card_Single, CardDeck, Card_Rotation
+from ..assets.types import Card_Single, CardDeck, Card_Rotation
 
 
 # 全局缓存：加载一次 JSON 数据
@@ -58,8 +59,10 @@ def _square_list_to_matrix(square_list: List[str]) -> List[List[int]]:
     
     matrix = []
     for row in range(8):
+        # 输入顺序按“左下 -> 右，再逐行向上”，因此需要翻转 y 轴
+        source_row = 7 - row
         matrix.append([
-            _square_str_to_int(square_list[row * 8 + col])
+            _square_str_to_int(square_list[source_row * 8 + col])
             for col in range(8)
         ])
     return matrix
@@ -103,6 +106,31 @@ def _calculate_edge(matrix: List[List[int]]) -> Tuple[int, int]:
     return (min_x, min_y)
 
 
+def _calculate_bounds(matrix: List[List[int]]) -> Tuple[int, int, int, int]:
+    """计算边界框 (left, top, right, bottom)。"""
+    min_x, min_y = 8, 8
+    max_x, max_y = -1, -1
+    for y in range(8):
+        for x in range(8):
+            if matrix[y][x] != 0:
+                min_x = min(min_x, x)
+                min_y = min(min_y, y)
+                max_x = max(max_x, x)
+                max_y = max(max_y, y)
+
+    if max_x == -1:
+        return (0, 0, 0, 0)
+    return (min_x, min_y, max_x, max_y)
+
+
+def _rotate_link_pos_cw(link_pos: Tuple[int, int], steps: int) -> Tuple[int, int]:
+    """将 (x, y) 在 8x8 坐标系中按 90° CW 旋转 steps 次。"""
+    x, y = link_pos
+    for _ in range(steps % 4):
+        x, y = 7 - y, x
+    return (x, y)
+
+
 def _rarity_str_to_int(rarity_str: str) -> int:
     """将稀有度字符串转换为整数：Common=0, Rare=1, Fresh=2"""
     rarity_map = {
@@ -141,14 +169,25 @@ def create_card_from_id(card_id: int) -> Card_Single:
     square_2d_180 = _rotate_matrix(square_2d_0, 2)
     square_2d_270 = _rotate_matrix(square_2d_0, 3)
     
-    # 计算参考点（第一个非 Empty 点）
-    link_pos_0 = _find_first_non_empty(square_2d_0)
-    if link_pos_0 is None:
-        link_pos_0 = (0, 0)  # 如果全是 Empty，使用 (0, 0)
+    # 0度下 link_pos 按边界中心点计算：
+    # x(左右)仅在有小数时向下取整；y(上下)仅在有小数时向上取整
+    left, top, right, bottom = _calculate_bounds(square_2d_0)
+    center_x = (left + right) / 2.0
+    center_y = (top + bottom) / 2.0
+    link_pos_0 = (math.floor(center_x), math.ceil(center_y))
     
-    link_pos_90 = _find_first_non_empty(square_2d_90) or (0, 0)
-    link_pos_180 = _find_first_non_empty(square_2d_180) or (0, 0)
-    link_pos_270 = _find_first_non_empty(square_2d_270) or (0, 0)
+    width = right - left + 1
+    height = bottom - top + 1
+    if width % 2 == 0 and height % 2 == 0:
+        # 双偶数边长：不做旋转映射，四个角度中心点一致
+        link_pos_90 = link_pos_0
+        link_pos_180 = link_pos_0
+        link_pos_270 = link_pos_0
+    else:
+        # 存在奇数边长：从 0 度中心点按旋转映射得到其余角度
+        link_pos_90 = _rotate_link_pos_cw(link_pos_0, 1)
+        link_pos_180 = _rotate_link_pos_cw(link_pos_0, 2)
+        link_pos_270 = _rotate_link_pos_cw(link_pos_0, 3)
     
     # 计算边界（min_x, min_y）
     edge_0 = _calculate_edge(square_2d_0)

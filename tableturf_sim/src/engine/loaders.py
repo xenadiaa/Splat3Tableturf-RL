@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from ..assets.tpyes import GameMap
+from ..assets.types import GameMap
 
 # 全局缓存
 _map_data_cache: Optional[list] = None
