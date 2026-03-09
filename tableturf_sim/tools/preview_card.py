@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.common_utils import create_card_from_id  # noqa: E402
+from src.utils.localization import lookup_card_name_zh  # noqa: E402
 
 
 SYMBOL_MAP = {
@@ -67,8 +68,10 @@ def calc_bounds(matrix: List[List[int]]) -> Tuple[int, int, int, int]:
 def print_card_structure(card) -> None:
     """Print key metadata and raw card structure."""
     structure = asdict(card)
+    name_zh = lookup_card_name_zh(card.name)
     print("=== Card Structure (summary) ===")
     print(f"name: {card.name}")
+    print(f"name_zh: {name_zh or '(not found)'}")
     print(f"number: {card.Number}")
     print(f"rarity: {card.Rarity} ({RARITY_MAP.get(card.Rarity, 'Unknown')})")
     print(f"special_cost: {card.SpecialCost}")

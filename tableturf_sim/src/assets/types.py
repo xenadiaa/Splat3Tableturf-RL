@@ -210,6 +210,10 @@ class ReplayMeta:
     map_id: str                    # 地图 id
     p1_deck: List[int]             # P1 牌组（卡牌 Number 列表，顺序决定抽牌）
     p2_deck: List[int]             # P2 牌组（同上）
+    replay_version: int = 2        # 回放结构版本，便于后续兼容升级
+    rng_seed: Optional[int] = None # 随机种子（用于严格复现）
+    p1_draw_order: Optional[List[int]] = None  # P1 抽牌顺序（可选）
+    p2_draw_order: Optional[List[int]] = None  # P2 抽牌顺序（可选）
 
 
 @dataclass
@@ -227,6 +231,7 @@ class ReplayMove:
     """
     turn: int                      # 回合号
     player: str                    # "P1" 或 "P2"
+    phase: Optional[str] = None    # 阶段：如 "select"/"resolve"/"post"
     # 弃权时 pass=True，以下字段可省略/None
     pass_turn: bool = False        # 是否弃权
     card_idx: Optional[int] = None # 手牌下标（0~3）
@@ -235,6 +240,12 @@ class ReplayMove:
     x: Optional[int] = None        # 放置位置 x（参考点）
     y: Optional[int] = None        # 放置位置 y（参考点）
     rotation: Optional[int] = None # 旋转角度 0/90/180/270
+    valid_action: Optional[bool] = None        # 是否为有效动作
+    invalid_reason: Optional[str] = None       # 无效动作原因
+    p1_sp_before: Optional[int] = None         # P1 行动前 SP
+    p1_sp_after: Optional[int] = None          # P1 行动后 SP
+    p2_sp_before: Optional[int] = None         # P2 行动前 SP
+    p2_sp_after: Optional[int] = None          # P2 行动后 SP
     # 下面两个字段为「状态快照」，可选，仅在需要做训练 / 分析时写入
     hand_card_numbers: Optional[List[int]] = None   # 当前 4 张手牌对应的卡牌编号列表
     map_grid: Optional[List[List[int]]] = None      # 当前整张地图的 bitmask 网格快照
@@ -246,6 +257,7 @@ class ReplayResult:
     p1_score: int
     p2_score: int
     winner: str                    # "P1" / "P2" / "draw"
+    rounds_played: Optional[int] = None  # 实际完成回合数（通常为12）
 
 
 @dataclass
@@ -268,9 +280,13 @@ class Replay:
         """从字典（如 json.load）构建。支持 "pass" 或 "pass_turn" 键。"""
         meta_d = d["meta"]
         meta = ReplayMeta(
+            replay_version=meta_d.get("replay_version", 1),
             map_id=meta_d["map_id"],
             p1_deck=meta_d["p1_deck"],
             p2_deck=meta_d["p2_deck"],
+            rng_seed=meta_d.get("rng_seed"),
+            p1_draw_order=meta_d.get("p1_draw_order"),
+            p2_draw_order=meta_d.get("p2_draw_order"),
         )
         moves = []
         for m in d["moves"]:
@@ -278,6 +294,7 @@ class Replay:
             moves.append(ReplayMove(
                 turn=m["turn"],
                 player=m["player"],
+                phase=m.get("phase"),
                 pass_turn=pass_val,
                 card_idx=m.get("card_idx"),
                 card_number=m.get("card_number"),
@@ -285,6 +302,12 @@ class Replay:
                 x=m.get("x"),
                 y=m.get("y"),
                 rotation=m.get("rotation"),
+                valid_action=m.get("valid_action"),
+                invalid_reason=m.get("invalid_reason"),
+                p1_sp_before=m.get("p1_sp_before"),
+                p1_sp_after=m.get("p1_sp_after"),
+                p2_sp_before=m.get("p2_sp_before"),
+                p2_sp_after=m.get("p2_sp_after"),
                 hand_card_numbers=m.get("hand_card_numbers"),
                 map_grid=m.get("map_grid"),
             ))
@@ -293,5 +316,6 @@ class Replay:
             p1_score=res_d["p1_score"],
             p2_score=res_d["p2_score"],
             winner=res_d["winner"],
+            rounds_played=res_d.get("rounds_played"),
         )
         return cls(meta=meta, moves=moves, result=result)

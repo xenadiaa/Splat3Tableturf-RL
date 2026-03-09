@@ -7,30 +7,19 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.view.map_view import render_point_type_grid_lines  # noqa: E402
+
 MAP_JSON_CANDIDATES = [
     PROJECT_ROOT / "data" / "maps" / "MiniGameMapInfo.json",
     PROJECT_ROOT / "src" / "assets" / "MiniGameMapInfo.json",
 ]
-
-# PointType / mask preview symbols
-SYMBOL_MAP: Dict[int, str] = {
-    0: " ",  # NotMap
-    1: ".",  # Placeable / Empty
-    2: "x",  # Conflict
-    3: "S",  # SelfSP
-    4: "s",  # SelfNormal
-    5: "E",  # EnemySP
-    6: "e",  # EnemyNormal
-    7: "x",  # Conflict (bitmask)
-    11: "S", # P1Special (bitmask)
-    13: "E", # P2Special (bitmask)
-    27: "A", # P1 SP active (bitmask)
-    29: "B", # P2 SP active (bitmask)
-}
 
 
 def resolve_map_json() -> Path:
@@ -55,10 +44,7 @@ def match_map(item: dict, key: str) -> bool:
 
 
 def render_grid(point_type: List[List[int]]) -> List[str]:
-    lines: List[str] = []
-    for row in point_type:
-        lines.append("".join(SYMBOL_MAP.get(v, "?") for v in row))
-    return lines
+    return render_point_type_grid_lines(point_type)
 
 
 def print_map(item: dict) -> None:
@@ -71,7 +57,7 @@ def print_map(item: dict) -> None:
 
     print(f"=== {name} ({ename}) | id={map_id} ===")
     print(f"size: {width}x{height}")
-    print("legend: ' '=NotMap, '.'=Placeable, 'x'=Conflict, 'S'=SelfSP, 's'=Self, 'E'=EnemySP, 'e'=Enemy, 'A/B'=ActiveSP")
+    print("legend: ' '=NotMap, '.'=Placeable, 'x'=Conflict, 's'=SelfSP, 'e'=EnemySP, 'r'=Self(non-SP), 'b'=Enemy(non-SP)")
     print("grid:")
     for line in render_grid(point_type):
         print(line)
