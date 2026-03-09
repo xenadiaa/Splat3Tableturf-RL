@@ -1,0 +1,738 @@
+"""Core turn engine for Tableturf battle flow.
+
+Features:
+- 2P sync submit/resolve
+- 1P mode with P2 bot (9 strategies: 3 styles x 3 levels)
+- structured turn/event logging (JSONL) for replay/RL usage
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+import json
+from pathlib import Path
+import random
+from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
+
+from ..assets.types import Card_Single, GameMap, Map_PointBit, Map_PointMask
+from ..utils.common_utils import (
+    _card_cells_on_map,  # internal helper reused here
+    activate_special_points_and_gain_sp,
+    create_card_from_id,
+    validate_place_card_action,
+)
+from .loaders import load_map
+
+
+MAX_TURNS = 12
+PLAYER_IDS = ("P1", "P2")
+BOT_STYLES = ("balanced", "aggressive", "conservative")
+BOT_LEVELS = ("low", "mid", "high")
+
+
+@dataclass
+class BotConfig:
+    style: str = "balanced"   # balanced/aggressive/conservative
+    level: str = "mid"        # low/mid/high
+
+
+@dataclass
+class PlayerState:
+    deck_ids: List[int]
+    draw_pile: List[Card_Single]
+    hand: List[Card_Single]
+    sp: int = 0
+
+
+@dataclass
+class Action:
+    player: str
+    card_number: Optional[int] = None
+    surrender: bool = False
+    pass_turn: bool = False
+    use_sp_attack: bool = False
+    rotation: int = 0
+    x: Optional[int] = None
+    y: Optional[int] = None
+
+
+@dataclass
+class GameState:
+    map: GameMap
+    players: Dict[str, PlayerState]
+    turn: int = 1
+    max_turns: int = MAX_TURNS
+    mode: str = "2P"
+    pending_actions: Dict[str, Action] = field(default_factory=dict)
+    done: bool = False
+    winner: Optional[str] = None
+    reason: Optional[str] = None
+    seed: Optional[int] = None
+    rng: random.Random = field(default_factory=random.Random)
+    bot_config: BotConfig = field(default_factory=BotConfig)
+    log_path: Optional[str] = None
+    event_seq: int = 0
+
+
+def _default_log_path(seed: Optional[int]) -> str:
+    # kept for backward compatibility; prefer _build_log_path(...)
+    root = Path(__file__).resolve().parent.parent.parent
+    log_dir = root / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    suffix = uuid4().hex[:8]
+    return str(log_dir / f"Tableturf_{ts}_{suffix}.jsonl")
+
+
+def _safe_name(name: str, max_len: int = 16) -> str:
+    raw = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(name))
+    raw = raw.strip("_") or "NA"
+    return raw[:max_len]
+
+
+def _build_log_path(map_id: str, p1_name: str, p2_name: str) -> str:
+    root = Path(__file__).resolve().parent.parent.parent
+    log_dir = root / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    suffix = uuid4().hex[:8]
+    fname = (
+        f"Tableturf_{ts}_{_safe_name(map_id,12)}_{_safe_name(p1_name,12)}_{_safe_name(p2_name,12)}_{suffix}.jsonl"
+    )
+    return str(log_dir / fname)
+
+
+def _log_event(state: GameState, event: str, payload: Dict[str, object]) -> None:
+    if not state.log_path:
+        return
+    state.event_seq += 1
+    record = {
+        "seq": state.event_seq,
+        "utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "event": event,
+        "turn": state.turn,
+        "payload": payload,
+    }
+    with open(state.log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _write_log_meta_once(state: GameState, meta: Dict[str, object]) -> None:
+    if not state.log_path:
+        return
+    with open(state.log_path, "w", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "seq": 0,
+                    "utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "event": "meta",
+                    "payload": meta,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+
+def _validate_deck_ids(deck_ids: List[int]) -> None:
+    if len(deck_ids) != 15:
+        raise ValueError(f"deck must have exactly 15 cards, got {len(deck_ids)}")
+    if len(set(deck_ids)) != len(deck_ids):
+        raise ValueError("deck has duplicated card numbers")
+
+
+def _validate_mode(mode: str) -> None:
+    if mode not in ("1P", "2P"):
+        raise ValueError(f"unsupported mode: {mode}")
+
+
+def _validate_bot_config(bot_config: BotConfig) -> None:
+    if bot_config.style not in BOT_STYLES:
+        raise ValueError(f"unsupported bot style: {bot_config.style}")
+    if bot_config.level not in BOT_LEVELS:
+        raise ValueError(f"unsupported bot level: {bot_config.level}")
+
+
+def _build_player_state(deck_ids: List[int], rng: random.Random) -> PlayerState:
+    cards = [create_card_from_id(cid) for cid in deck_ids]
+    rng.shuffle(cards)
+    hand = cards[:4]
+    draw_pile = cards[4:]
+    return PlayerState(deck_ids=list(deck_ids), draw_pile=draw_pile, hand=hand, sp=0)
+
+
+def init_state(
+    map_id: str,
+    p1_deck_ids: List[int],
+    p2_deck_ids: List[int],
+    seed: Optional[int] = None,
+    mode: str = "2P",
+    bot_style: str = "balanced",
+    bot_level: str = "mid",
+    log_path: Optional[str] = None,
+    p1_player_id: str = "P1",
+    p2_player_id: str = "P2",
+    p1_player_name: str = "P1",
+    p2_player_name: str = "P2",
+    p1_deck_name: Optional[str] = None,
+    p2_deck_name: Optional[str] = None,
+) -> GameState:
+    """Initialize game state and draw 4 random cards for each player."""
+    _validate_deck_ids(p1_deck_ids)
+    _validate_deck_ids(p2_deck_ids)
+    _validate_mode(mode)
+    bot_config = BotConfig(style=bot_style, level=bot_level)
+    _validate_bot_config(bot_config)
+
+    rng = random.Random(seed)
+    game_map = load_map(map_id)
+    players = {
+        "P1": _build_player_state(p1_deck_ids, rng),
+        "P2": _build_player_state(p2_deck_ids, rng),
+    }
+    state = GameState(
+        map=game_map,
+        players=players,
+        turn=1,
+        max_turns=MAX_TURNS,
+        mode=mode,
+        pending_actions={},
+        done=False,
+        seed=seed,
+        rng=rng,
+        bot_config=bot_config,
+        log_path=log_path or _build_log_path(map_id, p1_player_name, p2_player_name),
+    )
+    _write_log_meta_once(
+        state,
+        {
+            "map_id": map_id,
+            "mode": mode,
+            "seed": seed,
+            "log_path": state.log_path,
+            "bot_strategy": {
+                "style": bot_style if mode == "1P" else "",
+                "level": bot_level if mode == "1P" else "",
+            },
+            "players": {
+                "P1": {
+                    "player_id": p1_player_id,
+                    "player_name": p1_player_name,
+                    "deck_name": p1_deck_name or "",
+                    "deck_ids": list(p1_deck_ids),
+                },
+                "P2": {
+                    "player_id": p2_player_id,
+                    "player_name": p2_player_name,
+                    "deck_name": p2_deck_name or "",
+                    "deck_ids": list(p2_deck_ids),
+                },
+            },
+        },
+    )
+    _log_event(
+        state,
+        "init_state",
+        {
+            "p1_hand": [c.Number for c in state.players["P1"].hand],
+            "p2_hand": [c.Number for c in state.players["P2"].hand],
+        },
+    )
+    return state
+
+
+def _find_card_in_hand(player_state: PlayerState, card_number: Optional[int]) -> Optional[Card_Single]:
+    if card_number is None:
+        return None
+    for c in player_state.hand:
+        if c.Number == card_number:
+            return c
+    return None
+
+
+def _to_owner_mask(player: str, cell_type: int) -> int:
+    if player == "P1":
+        return int(Map_PointMask.P1Special if cell_type == 2 else Map_PointMask.P1Normal)
+    return int(Map_PointMask.P2Special if cell_type == 2 else Map_PointMask.P2Normal)
+
+
+def _priority(card_point: int, is_special_cell: bool, use_sp_attack: bool) -> float:
+    # 与 compare_single_box_final_result 逻辑一致
+    return 30.0 + (0.5 if use_sp_attack else 0.0) - card_point + (30.0 if is_special_cell else 0.0)
+
+
+def _resolve_contested_cell(
+    p_action: Action,
+    p_card: Card_Single,
+    p_cell_type: int,
+    e_action: Action,
+    e_card: Card_Single,
+    e_cell_type: int,
+) -> int:
+    # special 仅可被 special 顶掉
+    if p_cell_type == 2 and e_cell_type != 2:
+        return _to_owner_mask("P1", 2)
+    if e_cell_type == 2 and p_cell_type != 2:
+        return _to_owner_mask("P2", 2)
+
+    p_score = _priority(p_card.CardPoint, p_cell_type == 2, p_action.use_sp_attack)
+    e_score = _priority(e_card.CardPoint, e_cell_type == 2, e_action.use_sp_attack)
+    eps = 1e-6
+    if abs(p_score - e_score) < eps:
+        if p_cell_type == 2 and e_cell_type == 2:
+            return int(Map_PointMask.ConflictSp)
+        return int(Map_PointMask.Conflict)
+    if p_score > e_score:
+        return _to_owner_mask("P1", p_cell_type)
+    return _to_owner_mask("P2", e_cell_type)
+
+
+def _apply_action_effect(state: GameState, player: str, action: Action) -> Tuple[Optional[Card_Single], List[Tuple[int, int, int]]]:
+    ps = state.players[player]
+    card = _find_card_in_hand(ps, action.card_number)
+    if card is None:
+        return None, []
+    if action.pass_turn:
+        return card, []
+    cells = _card_cells_on_map(card, int(action.x), int(action.y), action.rotation)
+    return card, cells
+
+
+def _remove_card_from_hand_and_draw(ps: PlayerState, card_number: int) -> None:
+    idx = next((i for i, c in enumerate(ps.hand) if c.Number == card_number), None)
+    if idx is None:
+        raise ValueError(f"card #{card_number} not found in hand")
+    ps.hand.pop(idx)
+    if ps.draw_pile:
+        ps.hand.append(ps.draw_pile.pop(0))
+
+
+def _compute_scores(game_map: GameMap) -> Tuple[int, int]:
+    p1 = 0
+    p2 = 0
+    for y in range(game_map.height):
+        for x in range(game_map.width):
+            m = int(game_map.get_point(x, y))
+            is_valid = (m & int(Map_PointBit.IsValid)) != 0
+            if not is_valid:
+                continue
+            is_p1 = (m & int(Map_PointBit.IsP1)) != 0
+            is_p2 = (m & int(Map_PointBit.IsP2)) != 0
+            if is_p1 and not is_p2:
+                p1 += 1
+            elif is_p2 and not is_p1:
+                p2 += 1
+    return p1, p2
+
+
+def _update_done_and_winner(state: GameState) -> None:
+    if state.turn > state.max_turns:
+        state.done = True
+    if not state.done:
+        return
+    p1, p2 = _compute_scores(state.map)
+    if p1 > p2:
+        state.winner = "P1"
+    elif p2 > p1:
+        state.winner = "P2"
+    else:
+        state.winner = "draw"
+
+
+def validate_action(state: GameState, action: Action) -> Tuple[bool, str]:
+    if state.done:
+        return False, "GAME_ALREADY_DONE"
+    if action.player not in PLAYER_IDS:
+        return False, "INVALID_PLAYER"
+    if action.player in state.pending_actions:
+        return False, "PLAYER_ALREADY_SUBMITTED"
+
+    if action.surrender:
+        return True, "OK"
+
+    ps = state.players[action.player]
+    card = _find_card_in_hand(ps, action.card_number)
+    if card is None:
+        return False, "CARD_NOT_IN_HAND"
+
+    if action.pass_turn:
+        return True, "OK"
+
+    if action.x is None or action.y is None:
+        return False, "MISSING_POSITION"
+    if action.rotation not in (0, 1, 2, 3):
+        return False, "INVALID_ROTATION"
+
+    if action.use_sp_attack and ps.sp < card.SpecialCost:
+        return False, "SP_NOT_ENOUGH"
+
+    ok, reason, _ = validate_place_card_action(
+        card=card,
+        game_map=state.map,
+        anchor_x=int(action.x),
+        anchor_y=int(action.y),
+        rotation=action.rotation,
+        is_p1=(action.player == "P1"),
+        use_sp_attack=action.use_sp_attack,
+    )
+    return ok, reason
+
+
+def submit_action(state: GameState, action: Action) -> Tuple[bool, str]:
+    ok, reason = validate_action(state, action)
+    if not ok:
+        _log_event(state, "submit_rejected", {"player": action.player, "reason": reason, "action": asdict(action)})
+        return False, reason
+    state.pending_actions[action.player] = action
+    _log_event(state, "submit_accepted", {"player": action.player, "action": asdict(action)})
+    return True, "OK"
+
+
+def _resolve_surrender(state: GameState, action: Action) -> Dict[str, object]:
+    """立即处理投降，直接结束对局。"""
+    loser = action.player
+    winner = "P2" if loser == "P1" else "P1"
+    state.done = True
+    state.reason = "SURRENDER"
+    state.winner = winner
+    state.pending_actions.clear()
+    p1_score, p2_score = _compute_scores(state.map)
+    result = {
+        "turn": state.turn,
+        "reason": "SURRENDER",
+        "loser": loser,
+        "winner": winner,
+        "p1_score": p1_score,
+        "p2_score": p2_score,
+        "done": True,
+    }
+    _log_event(
+        state,
+        "surrender_resolved",
+        {
+            "action": asdict(action),
+            "result": result,
+            "p1_hand": [c.Number for c in state.players["P1"].hand],
+            "p2_hand": [c.Number for c in state.players["P2"].hand],
+        },
+    )
+    return result
+
+
+def _resolve_turn(state: GameState) -> Dict[str, object]:
+    p_action = state.pending_actions.get("P1")
+    e_action = state.pending_actions.get("P2")
+    if p_action is None or e_action is None:
+        raise RuntimeError("resolve_turn requires both P1 and P2 actions")
+
+    p_card, p_cells = _apply_action_effect(state, "P1", p_action)
+    e_card, e_cells = _apply_action_effect(state, "P2", e_action)
+    if p_card is None or e_card is None:
+        raise RuntimeError("card not found while resolving turn")
+
+    p_by_pos = {(x, y): cell_type for x, y, cell_type in p_cells}
+    e_by_pos = {(x, y): cell_type for x, y, cell_type in e_cells}
+    all_pos = set(p_by_pos.keys()) | set(e_by_pos.keys())
+
+    # 应用格子归属
+    for x, y in all_pos:
+        p_cell = p_by_pos.get((x, y))
+        e_cell = e_by_pos.get((x, y))
+        if p_cell is not None and e_cell is not None:
+            new_mask = _resolve_contested_cell(
+                p_action=p_action,
+                p_card=p_card,
+                p_cell_type=p_cell,
+                e_action=e_action,
+                e_card=e_card,
+                e_cell_type=e_cell,
+            )
+        elif p_cell is not None:
+            new_mask = _to_owner_mask("P1", p_cell)
+        else:
+            new_mask = _to_owner_mask("P2", e_cell)  # type: ignore[arg-type]
+        state.map.set_point(x, y, int(new_mask))
+
+    # SP 变化：先扣SP/跳过加SP，再做special激活加SP
+    if p_action.pass_turn:
+        state.players["P1"].sp += 1
+    elif p_action.use_sp_attack:
+        state.players["P1"].sp -= p_card.SpecialCost
+    if e_action.pass_turn:
+        state.players["P2"].sp += 1
+    elif e_action.use_sp_attack:
+        state.players["P2"].sp -= e_card.SpecialCost
+
+    p1_gain = activate_special_points_and_gain_sp(state.map, is_p1=True)
+    p2_gain = activate_special_points_and_gain_sp(state.map, is_p1=False)
+    state.players["P1"].sp += p1_gain
+    state.players["P2"].sp += p2_gain
+
+    # 移除使用/弃置的手牌并抽1张
+    _remove_card_from_hand_and_draw(state.players["P1"], p_action.card_number)
+    _remove_card_from_hand_and_draw(state.players["P2"], e_action.card_number)
+
+    state.pending_actions.clear()
+    state.turn += 1
+    _update_done_and_winner(state)
+
+    p1_score, p2_score = _compute_scores(state.map)
+    result = {
+        "turn": state.turn,
+        "p1_sp_gain": p1_gain,
+        "p2_sp_gain": p2_gain,
+        "p1_sp": state.players["P1"].sp,
+        "p2_sp": state.players["P2"].sp,
+        "p1_score": p1_score,
+        "p2_score": p2_score,
+        "done": state.done,
+        "winner": state.winner,
+    }
+    _log_event(
+        state,
+        "turn_resolved",
+        {
+            "p1_action": asdict(p_action),
+            "p2_action": asdict(e_action),
+            "result": result,
+            "p1_hand": [c.Number for c in state.players["P1"].hand],
+            "p2_hand": [c.Number for c in state.players["P2"].hand],
+        },
+    )
+    return result
+
+
+def _owner_cells(state: GameState, is_p1: bool) -> List[Tuple[int, int, bool]]:
+    owner_bit = int(Map_PointBit.IsP1) if is_p1 else int(Map_PointBit.IsP2)
+    out: List[Tuple[int, int, bool]] = []
+    for y in range(state.map.height):
+        for x in range(state.map.width):
+            m = int(state.map.get_point(x, y))
+            if (m & owner_bit) == 0:
+                continue
+            is_sp = (m & int(Map_PointBit.IsSp)) != 0
+            out.append((x, y, is_sp))
+    return out
+
+
+def _centroid(cells: List[Tuple[int, int, bool]], width: int, height: int) -> Tuple[float, float]:
+    if not cells:
+        return (width / 2.0, height / 2.0)
+    sx = sum(x for x, _, _ in cells)
+    sy = sum(y for _, y, _ in cells)
+    n = len(cells)
+    return (sx / n, sy / n)
+
+
+def _action_cells(action: Action, card: Card_Single) -> List[Tuple[int, int, int]]:
+    if action.pass_turn or action.x is None or action.y is None:
+        return []
+    return _card_cells_on_map(card, action.x, action.y, action.rotation)
+
+
+def _shape_span(card: Card_Single, rotation: int) -> int:
+    mat = card.get_square_matrix(rotation)
+    xs: List[int] = []
+    ys: List[int] = []
+    for y in range(8):
+        for x in range(8):
+            if mat[y][x] != 0:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return 0
+    return max(max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+
+
+def _score_bot_action(state: GameState, player: str, action: Action, style: str, level: str) -> float:
+    ps = state.players[player]
+    card = _find_card_in_hand(ps, action.card_number)
+    if card is None:
+        return -1e9
+    if action.pass_turn:
+        # 允许但默认弱于出牌；保守风格略放宽
+        base = -8.0 if style != "conservative" else -3.0
+        return base + (2.0 if ps.sp <= 2 else 0.0)
+
+    own_cells = _owner_cells(state, is_p1=(player == "P1"))
+    opp_cells = _owner_cells(state, is_p1=(player != "P1"))
+    own_cx, own_cy = _centroid(own_cells, state.map.width, state.map.height)
+    opp_cx, opp_cy = _centroid(opp_cells, state.map.width, state.map.height)
+
+    cells = _action_cells(action, card)
+    if not cells:
+        return -1e9
+    act_cx = sum(x for x, _, _ in cells) / len(cells)
+    act_cy = sum(y for _, y, _ in cells) / len(cells)
+    vec_x = opp_cx - own_cx
+    vec_y = opp_cy - own_cy
+    norm = (vec_x * vec_x + vec_y * vec_y) ** 0.5 or 1.0
+    ux, uy = vec_x / norm, vec_y / norm
+    adv = (act_cx - own_cx) * ux + (act_cy - own_cy) * uy  # 向对手方向推进值
+
+    special_count = sum(1 for _, _, t in cells if t == 2)
+    span = _shape_span(card, action.rotation)
+    point = card.CardPoint
+    sp_cost = card.SpecialCost
+
+    turn_phase = "early" if state.turn <= 4 else ("mid" if state.turn <= 8 else "late")
+    lvl = {"low": 0.7, "mid": 1.0, "high": 1.4}[level]
+
+    if style == "aggressive":
+        # 越高级越倾向高点数/长条并强推进
+        score = (4.0 * lvl) * adv + (1.1 * lvl) * point + (1.0 * lvl) * span
+        score += 0.4 * special_count
+        score += 0.8 if action.use_sp_attack else 0.0
+        score -= 0.15 * sp_cost if action.use_sp_attack else 0.0
+    elif style == "conservative":
+        # 偏向巩固本方半区，偏好高点数/special，谨慎用SP攻击
+        score = (-2.2 * lvl) * adv + 1.0 * point + 1.2 * special_count + 0.5 * span
+        score += 0.4 if not action.use_sp_attack else -0.6
+        score += 0.3 if ps.sp >= sp_cost + 2 else 0.0
+    else:
+        # balanced：前期推进，中后期逐步转巩固
+        if turn_phase == "early":
+            w_adv = 2.8
+        elif turn_phase == "mid":
+            w_adv = 0.8
+        else:
+            w_adv = -1.2
+        score = (w_adv * lvl) * adv + 0.9 * point + 0.8 * span + 0.7 * special_count
+        score += 0.2 if action.use_sp_attack and turn_phase != "late" else 0.0
+    return score
+
+
+def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
+    ps = state.players[player]
+    actions = legal_actions(state, player)
+    if not actions:
+        # 理论上不会空；兜底用首张手牌跳过
+        return Action(player=player, card_number=ps.hand[0].Number, pass_turn=True)
+
+    scored: List[Tuple[float, Action]] = []
+    for a in actions:
+        scored.append((_score_bot_action(state, player, a, state.bot_config.style, state.bot_config.level), a))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # low/mid/high 对应不同“近似最优”采样范围
+    if state.bot_config.level == "high":
+        pick = scored[0][1]
+    elif state.bot_config.level == "mid":
+        top_k = max(1, len(scored) // 5)
+        pick = state.rng.choice([a for _, a in scored[:top_k]])
+    else:
+        top_k = max(1, len(scored) // 2)
+        pick = state.rng.choice([a for _, a in scored[:top_k]])
+
+    _log_event(
+        state,
+        "bot_action_selected",
+        {
+            "player": player,
+            "style": state.bot_config.style,
+            "level": state.bot_config.level,
+            "action": asdict(pick),
+            "best_score": scored[0][0],
+        },
+    )
+    return pick
+
+
+def step(state: GameState, action: Action) -> Tuple[bool, str, Dict[str, object]]:
+    """
+    Submit one player's action.
+    - 返回 action 是否有效。
+    - 若双方动作尚未齐全，返回等待状态。
+    - 若双方齐全，自动 resolve 本回合并返回回合结果。
+    - 1P 模式下，P1 提交后会自动生成 P2 电脑动作并结算。
+    """
+    if state.mode == "1P" and action.player != "P1":
+        return False, "ONLY_P1_CAN_SUBMIT_IN_1P_MODE", {}
+
+    ok, reason = submit_action(state, action)
+    if not ok:
+        return False, reason, {"waiting_for": [p for p in PLAYER_IDS if p not in state.pending_actions]}
+
+    if action.surrender:
+        result = _resolve_surrender(state, action)
+        return True, "GAME_OVER_SURRENDER", result
+
+    waiting = [p for p in PLAYER_IDS if p not in state.pending_actions]
+    if state.mode == "1P" and waiting == ["P2"]:
+        bot_action = _choose_bot_action(state, "P2")
+        bok, breason = submit_action(state, bot_action)
+        if not bok:
+            return False, f"BOT_SUBMIT_FAILED:{breason}", {}
+        waiting = [p for p in PLAYER_IDS if p not in state.pending_actions]
+
+    if waiting:
+        return True, "ACCEPTED_WAITING_OTHER_PLAYER", {"waiting_for": waiting}
+
+    result = _resolve_turn(state)
+    return True, "TURN_RESOLVED", result
+
+
+def legal_actions(state: GameState, player: str) -> List[Action]:
+    """
+    枚举玩家所有可行动作（包含跳过）。
+    用于AI/前端提示。动作空间较大时可按需裁剪。
+    """
+    if state.done:
+        return []
+    if player not in PLAYER_IDS:
+        raise ValueError(f"invalid player: {player}")
+    ps = state.players[player]
+    is_p1 = player == "P1"
+    actions: List[Action] = []
+    for card in ps.hand:
+        actions.append(Action(player=player, card_number=card.Number, pass_turn=True))
+        for rot in (0, 1, 2, 3):
+            for y in range(state.map.height):
+                for x in range(state.map.width):
+                    ok_n, _, _ = validate_place_card_action(
+                        card=card,
+                        game_map=state.map,
+                        anchor_x=x,
+                        anchor_y=y,
+                        rotation=rot,
+                        is_p1=is_p1,
+                        use_sp_attack=False,
+                    )
+                    if ok_n:
+                        actions.append(
+                            Action(
+                                player=player,
+                                card_number=card.Number,
+                                pass_turn=False,
+                                use_sp_attack=False,
+                                rotation=rot,
+                                x=x,
+                                y=y,
+                            )
+                        )
+                    if ps.sp >= card.SpecialCost:
+                        ok_s, _, _ = validate_place_card_action(
+                            card=card,
+                            game_map=state.map,
+                            anchor_x=x,
+                            anchor_y=y,
+                            rotation=rot,
+                            is_p1=is_p1,
+                            use_sp_attack=True,
+                        )
+                        if ok_s:
+                            actions.append(
+                                Action(
+                                    player=player,
+                                    card_number=card.Number,
+                                    pass_turn=False,
+                                    use_sp_attack=True,
+                                    rotation=rot,
+                                    x=x,
+                                    y=y,
+                                )
+                            )
+    return actions

@@ -5,7 +5,14 @@ from typing import List, Tuple, Optional
 from pathlib import Path
 
 # 导入类型定义
-from ..assets.types import Card_Single, CardDeck, Card_Rotation
+from ..assets.types import (
+    Card_Single,
+    CardDeck,
+    Card_Rotation,
+    GameMap,
+    Map_PointBit,
+    Map_PointMask,
+)
 
 
 # 全局缓存：加载一次 JSON 数据
@@ -297,22 +304,206 @@ def compare_single_box_final_result(player, enemy):
     else:
         return enemy['box_type']
 
-#存在相邻卡牌返回True，否则返回False
-def have_neighbor_with_card(card, pos, map):
-    #TODO：判断相邻卡牌逻辑
-    return True
+def _clear_preview(mask: int) -> int:
+    """清除预览位，便于做真实格子状态判断。"""
+    return int(mask) & ~int(Map_PointBit.IsPreview)
 
-def have_neighbor_with_special(card, pos, map):
-    #TODO：判断相邻卡牌逻辑
-    return True
 
-def is_able_to_place_card(card, map):
-    #TODO：前端用于判断是否有可以放置卡牌的位置
-    return True
+def _is_valid_cell(mask: int) -> bool:
+    return (_clear_preview(mask) & int(Map_PointBit.IsValid)) != 0
 
-def is_able_to_place_withsp(card, map):
-    #TODO：前端用于判断是否有可以放置使用sp的卡牌位置
-    return True
+
+def _is_empty_cell(mask: int) -> bool:
+    return _clear_preview(mask) == int(Map_PointMask.Empty)
+
+
+def _is_conflict_cell(mask: int) -> bool:
+    m = _clear_preview(mask)
+    return (m & int(Map_PointBit.IsP1)) != 0 and (m & int(Map_PointBit.IsP2)) != 0
+
+
+def _is_special_cell(mask: int) -> bool:
+    return (_clear_preview(mask) & int(Map_PointBit.IsSp)) != 0
+
+
+def _is_owner_cell(mask: int, is_p1: bool) -> bool:
+    m = _clear_preview(mask)
+    owner_bit = int(Map_PointBit.IsP1) if is_p1 else int(Map_PointBit.IsP2)
+    return (m & owner_bit) != 0
+
+
+def _is_owner_normal_cell(mask: int, is_p1: bool) -> bool:
+    m = _clear_preview(mask)
+    return _is_owner_cell(m, is_p1) and not _is_special_cell(m) and not _is_conflict_cell(m)
+
+
+def _is_owner_special_cell(mask: int, is_p1: bool) -> bool:
+    m = _clear_preview(mask)
+    return _is_owner_cell(m, is_p1) and _is_special_cell(m)
+
+
+def _neighbor_coords(x: int, y: int):
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            yield (x + dx, y + dy)
+
+
+def _card_cells_on_map(
+    card: Card_Single,
+    anchor_x: int,
+    anchor_y: int,
+    rotation: int,
+) -> List[Tuple[int, int, int]]:
+    """
+    返回卡牌有效格投影到地图后的坐标：
+    (map_x, map_y, cell_type[1=Fill,2=Special])
+    """
+    matrix = card.get_square_matrix(rotation)
+    link_x, link_y = card.get_link_pos(rotation)
+    cells: List[Tuple[int, int, int]] = []
+    for cy in range(8):
+        for cx in range(8):
+            cell = matrix[cy][cx]
+            if cell == 0:
+                continue
+            mx = anchor_x + (cx - link_x)
+            my = anchor_y + (cy - link_y)
+            cells.append((mx, my, cell))
+    return cells
+
+
+def _is_adjacent_to_self(
+    game_map: GameMap,
+    x: int,
+    y: int,
+    is_p1: bool,
+    need_special_only: bool,
+) -> bool:
+    for nx, ny in _neighbor_coords(x, y):
+        if not (0 <= nx < game_map.width and 0 <= ny < game_map.height):
+            continue
+        neighbor = game_map.get_point(nx, ny)
+        if need_special_only:
+            if _is_owner_special_cell(neighbor, is_p1):
+                return True
+        else:
+            if _is_owner_special_cell(neighbor, is_p1) or _is_owner_normal_cell(neighbor, is_p1):
+                return True
+    return False
+
+
+def validate_place_card_action(
+    card: Card_Single,
+    game_map: GameMap,
+    anchor_x: int,
+    anchor_y: int,
+    rotation: int,
+    is_p1: bool,
+    use_sp_attack: bool = False,
+) -> Tuple[bool, str, List[Tuple[int, int, int]]]:
+    """
+    基础放置合法性检查。
+
+    Returns:
+        (is_valid, reason, card_cells_on_map)
+    """
+    cells = _card_cells_on_map(card, anchor_x, anchor_y, rotation)
+    if not cells:
+        return False, "CARD_HAS_NO_VALID_CELLS", cells
+
+    has_required_neighbor = False
+    for x, y, _cell_type in cells:
+        if not (0 <= x < game_map.width and 0 <= y < game_map.height):
+            return False, "OUT_OF_MAP", cells
+
+        target = game_map.get_point(x, y)
+        if not _is_valid_cell(target):
+            return False, "TARGET_NOT_VALID_MAP_CELL", cells
+
+        if use_sp_attack:
+            # SP攻击：可落在 Empty / 自己Fill / 敌方Fill；不可落在任何 Special、Conflict
+            if _is_special_cell(target) or _is_conflict_cell(target):
+                return False, "SP_ATTACK_FORBID_ON_SPECIAL_OR_CONFLICT", cells
+            if not (_is_empty_cell(target) or _is_owner_normal_cell(target, True) or _is_owner_normal_cell(target, False)):
+                return False, "SP_ATTACK_TARGET_NOT_ALLOWED", cells
+            if _is_adjacent_to_self(game_map, x, y, is_p1, need_special_only=True):
+                has_required_neighbor = True
+        else:
+            # 普通放置：所有有效格必须落在 Empty
+            if not _is_empty_cell(target):
+                return False, "NORMAL_PLACE_REQUIRES_EMPTY", cells
+            if _is_adjacent_to_self(game_map, x, y, is_p1, need_special_only=False):
+                has_required_neighbor = True
+
+    if not has_required_neighbor:
+        if use_sp_attack:
+            return False, "NEED_ADJACENT_SELF_SPECIAL", cells
+        return False, "NEED_ADJACENT_SELF_FILL_OR_SPECIAL", cells
+    return True, "OK", cells
+
+
+def activate_special_points_and_gain_sp(game_map: GameMap, is_p1: bool) -> int:
+    """
+    每回合结束调用一次：
+    - 对己方 Special 点，若周围8格没有 Empty，则激活并 +1 SP。
+    - 激活后会打 IsSupplySp 位，避免重复获得。
+    """
+    gained = 0
+    owner_bit = int(Map_PointBit.IsP1) if is_p1 else int(Map_PointBit.IsP2)
+    for y in range(game_map.height):
+        for x in range(game_map.width):
+            mask = _clear_preview(game_map.get_point(x, y))
+            if (mask & owner_bit) == 0:
+                continue
+            if (mask & int(Map_PointBit.IsSp)) == 0:
+                continue
+            if (mask & int(Map_PointBit.IsSupplySp)) != 0:
+                continue
+
+            has_empty_neighbor = False
+            for nx, ny in _neighbor_coords(x, y):
+                if not (0 <= nx < game_map.width and 0 <= ny < game_map.height):
+                    continue
+                neighbor = game_map.get_point(nx, ny)
+                if _is_empty_cell(neighbor):
+                    has_empty_neighbor = True
+                    break
+
+            if not has_empty_neighbor:
+                game_map.set_point(x, y, int(mask) | int(Map_PointBit.IsSupplySp))
+                gained += 1
+    return gained
+
+
+# ---- 兼容旧占位函数命名 ----
+def have_neighbor_with_card(card, pos, game_map, is_p1=True, rotation=0):
+    cells = _card_cells_on_map(card, pos[0], pos[1], rotation)
+    return any(_is_adjacent_to_self(game_map, x, y, is_p1, need_special_only=False) for x, y, _ in cells)
+
+
+def have_neighbor_with_special(card, pos, game_map, is_p1=True, rotation=0):
+    cells = _card_cells_on_map(card, pos[0], pos[1], rotation)
+    return any(_is_adjacent_to_self(game_map, x, y, is_p1, need_special_only=True) for x, y, _ in cells)
+
+
+def is_able_to_place_card(card, game_map, is_p1=True, rotation=0):
+    for y in range(game_map.height):
+        for x in range(game_map.width):
+            ok, _, _ = validate_place_card_action(card, game_map, x, y, rotation, is_p1, use_sp_attack=False)
+            if ok:
+                return True
+    return False
+
+
+def is_able_to_place_withsp(card, game_map, is_p1=True, rotation=0):
+    for y in range(game_map.height):
+        for x in range(game_map.width):
+            ok, _, _ = validate_place_card_action(card, game_map, x, y, rotation, is_p1, use_sp_attack=True)
+            if ok:
+                return True
+    return False
 
 def rotate_cell(r: int, c: int, rotation: int) -> tuple[int, int]:
     """(r,c) 旋转后所在的新坐标。rotation: 0,1,2,3 → 0°,90°,180°,270° CW"""
