@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.engine.env_core import init_state
+from src.engine.loaders import load_map
 from src.utils.deck_utils import (
     deck_display_name,
     extract_npc_strategy,
@@ -199,12 +200,25 @@ def _menu_select_raw(title: str, items: List[str], hint: str, start_idx: int = 0
 
 
 def _wizard_config_raw() -> Dict[str, object]:
-    npcs = load_npc_data()
+    npcs = sorted(
+        load_npc_data(),
+        key=lambda n: int(n.get("Order", 10**9)),
+    )
     npc_labels: List[str] = []
     for n in npcs:
         en = n.get("Name", "")
         zh = npc_name_zh(en) or "未找到中文"
-        npc_labels.append(f"{en} [{zh}] | order={n.get('Order')}")
+        strategies = extract_npc_strategy(n)
+        map_text = "地图:未知"
+        if strategies:
+            best = sorted(strategies, key=lambda x: x["level"])[-1]
+            map_id = best["map_id"]
+            try:
+                map_zh = load_map(map_id).name
+                map_text = f"地图:{map_zh}"
+            except Exception:
+                map_text = f"地图:{map_id}"
+        npc_labels.append(f"{en} [{zh}] | order={n.get('Order')} | {map_text}")
 
     npc_idx = _menu_select_raw("[选择NPC]", npc_labels, "方向键上下移动，z确认")
     npc = npcs[npc_idx]
@@ -215,8 +229,9 @@ def _wizard_config_raw() -> Dict[str, object]:
 
     diff_labels: List[str] = []
     for s in strategies:
+        map_name_zh = load_map(s["map_id"]).name
         diff_labels.append(
-            f"level={s['level']} | ai={s['ai_type']} | map={s['map_id']} | deck={deck_display_name(s['deck_rowid'])}"
+            f"level={s['level']} | ai={s['ai_type']} | map={s['map_id']}({map_name_zh}) | deck={deck_display_name(s['deck_rowid'])}"
         )
 
     diff_idx = _menu_select_raw("[选择难度]", diff_labels, "方向键上下移动，z确认")

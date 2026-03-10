@@ -67,5 +67,12 @@ def lookup_npc_name_zh(name_en: str) -> Optional[str]:
     d = glossary_name_map()
     if name_en in d:
         return d[name_en]
+    # Some NPC ids use underscore variants, while glossary keys are often compact
+    # forms like GearShopClothesFsodr / MizutaSdodr.
+    compact = name_en.replace("_", "")
+    if compact in d:
+        return d[compact]
     d2 = mini_game_card_name_map()
-    return d2.get(name_en)
+    if name_en in d2:
+        return d2[name_en]
+    return d2.get(compact)
