@@ -5,7 +5,7 @@ from typing import List, Tuple, Optional
 from pathlib import Path
 
 # 导入类型定义
-from ..assets.types import (
+from ..assets.tableturf_types import (
     Card_Single,
     CardDeck,
     Card_Rotation,

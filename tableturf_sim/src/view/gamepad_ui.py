@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from ..assets.types import Card_Single, GameMap, Map_PointBit
+from ..assets.tableturf_types import Card_Single, GameMap, Map_PointBit
 from ..engine.env_core import Action, GameState, step
 from ..engine.loaders import MAP_PADDING
 from ..utils.common_utils import _card_cells_on_map, create_card_from_id, validate_place_card_action

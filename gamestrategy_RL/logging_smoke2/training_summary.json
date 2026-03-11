@@ -1,0 +1,20 @@
+{
+  "utc": "2026-03-11T08:51:06Z",
+  "run_name": "train_Cross",
+  "total_updates": 1,
+  "total_steps_seen": 64,
+  "total_elapsed_sec": 12.334385871887207,
+  "final_recent_mean_ep_reward": -1.6799999999999997,
+  "final_recent_win_rate": 0.2,
+  "episodes_finished": 5,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/logging_smoke2",
+  "run_config": {
+    "map_id": "Cross",
+    "p1_deck": "MiniGame_Atarime",
+    "p2_deck": "MiniGame_WeaponShop",
+    "bot_style": "conservative",
+    "bot_level": "low",
+    "seed": 42,
+    "resume_checkpoint": ""
+  }
+}

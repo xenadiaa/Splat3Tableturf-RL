@@ -7,6 +7,7 @@ import argparse
 from typing import Tuple
 
 from src.engine.env_core import Action, init_state, step
+from src.utils.deck_utils import deck_display_name, load_deck_cards_by_rowid
 from src.utils.localization import lookup_card_name_zh
 from src.utils.player_deck_utils import (
     get_player_deck_card_numbers,
@@ -75,10 +76,24 @@ def _prompt_action(state, player: str) -> Action:
             print(f"input error: {exc}")
 
 
+def _resolve_deck(index: int, npc_rowid: str) -> Tuple[str, list[int], str]:
+    rowid = str(npc_rowid or "").strip()
+    if rowid:
+        cards = load_deck_cards_by_rowid(rowid)
+        deck_ids = [int(c["number"]) for c in cards]
+        deck_name = deck_display_name(rowid)
+        return deck_name, deck_ids, f"npc_rowid:{rowid}"
+    deck_name = get_player_deck_name(index)
+    deck_ids = get_player_deck_card_numbers(index, require_full_15=True)
+    return deck_name, deck_ids, f"player_deck:{index}"
+
+
 def run_game(
     map_id: str,
     p1_deck_index: int,
     p2_deck_index: int,
+    p1_npc_deck_rowid: str,
+    p2_npc_deck_rowid: str,
     seed: int | None,
     mode: str,
     bot_style: str,
@@ -88,10 +103,8 @@ def run_game(
     p1_player_name: str,
     p2_player_name: str,
 ) -> None:
-    p1_deck_name = get_player_deck_name(p1_deck_index)
-    p2_deck_name = get_player_deck_name(p2_deck_index)
-    p1_deck = get_player_deck_card_numbers(p1_deck_index, require_full_15=True)
-    p2_deck = get_player_deck_card_numbers(p2_deck_index, require_full_15=True)
+    p1_deck_name, p1_deck, p1_deck_src = _resolve_deck(p1_deck_index, p1_npc_deck_rowid)
+    p2_deck_name, p2_deck, p2_deck_src = _resolve_deck(p2_deck_index, p2_npc_deck_rowid)
     state = init_state(
         map_id=map_id,
         p1_deck_ids=p1_deck,
@@ -109,8 +122,8 @@ def run_game(
     )
     print(
         f"Start game map={map_id}, mode={mode}, "
-        f"P1={p1_player_name}[{p1_player_id}] deck={p1_deck_index}({p1_deck_name}), "
-        f"P2={p2_player_name}[{p2_player_id}] deck={p2_deck_index}({p2_deck_name}), "
+        f"P1={p1_player_name}[{p1_player_id}] deck={p1_deck_src}({p1_deck_name}), "
+        f"P2={p2_player_name}[{p2_player_id}] deck={p2_deck_src}({p2_deck_name}), "
         f"bot={bot_style}/{bot_level}"
     )
 
@@ -168,6 +181,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["1P", "2P"], default="2P", help="Game mode")
     parser.add_argument("--p1-deck", type=int, default=0, help="Player deck index 0~32")
     parser.add_argument("--p2-deck", type=int, default=1, help="Player deck index 0~32")
+    parser.add_argument(
+        "--p1-npc-deck-rowid",
+        default="",
+        help="Use NPC preset deck rowid for P1 (e.g. MiniGame_Aori), overrides --p1-deck",
+    )
+    parser.add_argument(
+        "--p2-npc-deck-rowid",
+        default="",
+        help="Use NPC preset deck rowid for P2 (e.g. MiniGame_Hotaru), overrides --p2-deck",
+    )
     parser.add_argument("--p1-id", default="P1", help="P1 player id")
     parser.add_argument("--p2-id", default="P2", help="P2 player id")
     parser.add_argument("--p1-name", default="P1", help="P1 player name")
@@ -184,6 +207,8 @@ def main() -> int:
         map_id=args.map,
         p1_deck_index=args.p1_deck,
         p2_deck_index=args.p2_deck,
+        p1_npc_deck_rowid=args.p1_npc_deck_rowid,
+        p2_npc_deck_rowid=args.p2_npc_deck_rowid,
         seed=args.seed,
         mode=args.mode,
         bot_style=args.bot_style,

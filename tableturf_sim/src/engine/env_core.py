@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import importlib.util
 import json
 from pathlib import Path
 import random
 from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
-from ..assets.types import Card_Single, GameMap, Map_PointBit, Map_PointMask
+from ..assets.tableturf_types import Card_Single, GameMap, Map_PointBit, Map_PointMask
 from ..utils.common_utils import (
     _card_cells_on_map,  # internal helper reused here
     activate_special_points_and_gain_sp,
@@ -72,6 +73,7 @@ class GameState:
     seed: Optional[int] = None
     rng: random.Random = field(default_factory=random.Random)
     bot_config: BotConfig = field(default_factory=BotConfig)
+    bot_nn_spec: Optional[Dict[str, object]] = None
     log_path: Optional[str] = None
     event_seq: int = 0
 
@@ -172,6 +174,7 @@ def init_state(
     mode: str = "2P",
     bot_style: str = "balanced",
     bot_level: str = "mid",
+    bot_nn_spec: Optional[Dict[str, object]] = None,
     log_path: Optional[str] = None,
     p1_player_id: str = "P1",
     p2_player_id: str = "P2",
@@ -204,6 +207,7 @@ def init_state(
         seed=seed,
         rng=rng,
         bot_config=bot_config,
+        bot_nn_spec=bot_nn_spec,
         log_path=log_path or _build_log_path(map_id, p1_player_name, p2_player_name),
     )
     _write_log_meta_once(
@@ -216,6 +220,7 @@ def init_state(
             "bot_strategy": {
                 "style": bot_style if mode == "1P" else "",
                 "level": bot_level if mode == "1P" else "",
+                "nn_spec": bot_nn_spec if mode == "1P" else {},
             },
             "players": {
                 "P1": {
@@ -612,6 +617,28 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
         # 理论上不会空；兜底用首张手牌跳过
         return Action(player=player, card_number=ps.hand[0].Number, pass_turn=True)
 
+    nn_pick, nn_reason = _choose_bot_action_from_nn(state, player, actions)
+    if nn_pick is not None:
+        _log_event(
+            state,
+            "bot_action_selected_nn",
+            {
+                "player": player,
+                "reason": nn_reason,
+                "action": asdict(nn_pick),
+            },
+        )
+        return nn_pick
+    if state.bot_nn_spec:
+        _log_event(
+            state,
+            "bot_action_nn_fallback",
+            {
+                "player": player,
+                "reason": nn_reason or "NO_NN_SPEC",
+            },
+        )
+
     scored: List[Tuple[float, Action]] = []
     for a in actions:
         scored.append((_score_bot_action(state, player, a, state.bot_config.style, state.bot_config.level), a))
@@ -639,6 +666,107 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
         },
     )
     return pick
+
+
+def _match_action_from_payload(actions: List[Action], payload: Dict[str, object]) -> Optional[Action]:
+    def _norm_bool(v: object, default: bool = False) -> bool:
+        return bool(v) if v is not None else default
+
+    target = {
+        "card_number": int(payload.get("card_number")) if payload.get("card_number") is not None else None,
+        "pass_turn": _norm_bool(payload.get("pass_turn"), False),
+        "use_sp_attack": _norm_bool(payload.get("use_sp_attack"), False),
+        "rotation": int(payload.get("rotation", 0)),
+        "x": int(payload.get("x")) if payload.get("x") is not None else None,
+        "y": int(payload.get("y")) if payload.get("y") is not None else None,
+    }
+    for a in actions:
+        if (
+            a.card_number == target["card_number"]
+            and a.pass_turn == target["pass_turn"]
+            and a.use_sp_attack == target["use_sp_attack"]
+            and a.rotation == target["rotation"]
+            and a.x == target["x"]
+            and a.y == target["y"]
+        ):
+            return a
+    return None
+
+
+def _choose_bot_action_from_nn(
+    state: GameState,
+    player: str,
+    actions: List[Action],
+) -> Tuple[Optional[Action], str]:
+    """
+    NN strategy interface (optional):
+    - type=file_action_json, action_file=<path>
+      File contains one action payload dict.
+    - type=python_module, module_file=<path>, function=<name|choose_action>
+      function signature: fn(state, player, legal_actions, context) -> action payload dict
+
+    On any failure, returns (None, reason) and caller falls back to default 3x3 policy.
+    """
+    spec = state.bot_nn_spec or {}
+    if not spec:
+        return None, "NO_SPEC"
+
+    spec_type = str(spec.get("type", "")).strip()
+    if not spec_type:
+        return None, "SPEC_TYPE_EMPTY"
+
+    if spec_type == "file_action_json":
+        action_file = str(spec.get("action_file", "")).strip()
+        if not action_file:
+            return None, "ACTION_FILE_EMPTY"
+        path = Path(action_file)
+        if not path.exists():
+            return None, "ACTION_FILE_NOT_FOUND"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None, "ACTION_FILE_BAD_JSON"
+        if not isinstance(payload, dict):
+            return None, "ACTION_FILE_NOT_DICT"
+        pick = _match_action_from_payload(actions, payload)
+        if pick is None:
+            return None, "ACTION_NOT_LEGAL"
+        return pick, "FILE_ACTION"
+
+    if spec_type == "python_module":
+        module_file = str(spec.get("module_file", "")).strip()
+        fn_name = str(spec.get("function", "choose_action")).strip() or "choose_action"
+        if not module_file:
+            return None, "MODULE_FILE_EMPTY"
+        path = Path(module_file)
+        if not path.exists():
+            return None, "MODULE_FILE_NOT_FOUND"
+        try:
+            mod_name = f"tableturf_nn_{path.stem}"
+            module_spec = importlib.util.spec_from_file_location(mod_name, str(path))
+            if module_spec is None or module_spec.loader is None:
+                return None, "MODULE_SPEC_FAILED"
+            module = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            fn = getattr(module, fn_name, None)
+            if fn is None:
+                return None, "MODULE_FN_NOT_FOUND"
+            payload = fn(
+                state=state,
+                player=player,
+                legal_actions=[asdict(a) for a in actions],
+                context=dict(spec),
+            )
+            if not isinstance(payload, dict):
+                return None, "MODULE_FN_BAD_RETURN"
+            pick = _match_action_from_payload(actions, payload)
+            if pick is None:
+                return None, "ACTION_NOT_LEGAL"
+            return pick, "MODULE_ACTION"
+        except Exception:
+            return None, "MODULE_EXCEPTION"
+
+    return None, f"UNSUPPORTED_SPEC_TYPE:{spec_type}"
 
 
 def step(state: GameState, action: Action) -> Tuple[bool, str, Dict[str, object]]:

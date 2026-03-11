@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from ..assets.types import Card_Single, GameMap
+from ..assets.tableturf_types import Card_Single, GameMap
 from ..utils.common_utils import create_card_from_id
 
 # 全局缓存

@@ -24,11 +24,10 @@ from src.engine.env_core import init_state
 from src.engine.loaders import load_map
 from src.utils.deck_utils import (
     deck_display_name,
-    extract_npc_strategy,
     load_deck_cards_by_rowid,
-    load_npc_data,
     npc_name_zh,
 )
+from src.utils.npc_strategy_utils import load_npc_strategy_table, resolve_nn_spec
 from src.utils.player_deck_utils import (
     DECK_MAX_INDEX,
     DECK_MIN_INDEX,
@@ -64,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--map", default="Square")
     p.add_argument("--p1-deck", type=int, default=15)
+    p.add_argument(
+        "--p1-npc-deck-rowid",
+        default="",
+        help="Use NPC preset deck rowid for P1 (e.g. MiniGame_Aori). Overrides --p1-deck.",
+    )
+    p.add_argument(
+        "--p1-npc-name",
+        default="",
+        help="Use highest-level deck of this NPC for P1 (by npc_name). Overrides --p1-deck when rowid is empty.",
+    )
     p.add_argument("--p2-deck", type=int, default=1)
     p.add_argument("--bot-style", choices=["balanced", "aggressive", "conservative"], default="aggressive")
     p.add_argument("--bot-level", choices=["low", "mid", "high"], default="high")
@@ -81,13 +90,54 @@ def _list_valid_player_decks() -> List[Tuple[int, str]]:
     return out
 
 
+def _deck_ids_from_rowid(deck_rowid: str) -> List[int]:
+    cards = load_deck_cards_by_rowid(deck_rowid)
+    return [c["number"] for c in cards]
+
+
+def _resolve_npc_deck_rowid_by_name(npc_name: str) -> str:
+    q = str(npc_name).strip().lower()
+    if not q:
+        raise ValueError("empty npc name")
+    rows = load_npc_strategy_table()
+    for row in rows:
+        if str(row.get("npc_name", "")).strip().lower() != q:
+            continue
+        strategies = sorted(row.get("strategies", []), key=lambda x: int(x["ai_level"]))
+        if not strategies:
+            break
+        return str(strategies[-1]["deck_rowid"])
+    raise ValueError(f"npc not found or no strategy: {npc_name}")
+
+
 def _direct_config(args: argparse.Namespace) -> Dict[str, object]:
+    p1_deck_ids: List[int]
+    p1_deck_name: str
+    p1_deck_source: str
+    if args.p1_npc_deck_rowid:
+        deck_rowid = str(args.p1_npc_deck_rowid).strip()
+        p1_deck_ids = _deck_ids_from_rowid(deck_rowid)
+        p1_deck_name = deck_display_name(deck_rowid)
+        p1_deck_source = f"npc_rowid:{deck_rowid}"
+    elif args.p1_npc_name:
+        deck_rowid = _resolve_npc_deck_rowid_by_name(args.p1_npc_name)
+        p1_deck_ids = _deck_ids_from_rowid(deck_rowid)
+        p1_deck_name = deck_display_name(deck_rowid)
+        p1_deck_source = f"npc_name:{args.p1_npc_name}"
+    else:
+        p1_deck_ids = get_player_deck_card_numbers(args.p1_deck, require_full_15=True)
+        p1_deck_name = get_player_deck_name(args.p1_deck)
+        p1_deck_source = f"player_deck:{args.p1_deck}"
+
     return {
         "map_id": args.map,
-        "p1_deck_index": args.p1_deck,
+        "p1_deck_ids": p1_deck_ids,
+        "p1_deck_name": p1_deck_name,
+        "p1_deck_source": p1_deck_source,
         "p2_deck_ids": get_player_deck_card_numbers(args.p2_deck, require_full_15=True),
         "bot_style": args.bot_style,
         "bot_level": args.bot_level,
+        "bot_nn_spec": {},
         "p2_id": args.p2_id,
         "p2_name": args.p2_name,
         "p2_deck_name": get_player_deck_name(args.p2_deck),
@@ -201,72 +251,114 @@ def _menu_select_raw(title: str, items: List[str], hint: str, start_idx: int = 0
 
 def _wizard_config_raw() -> Dict[str, object]:
     npcs = sorted(
-        load_npc_data(),
-        key=lambda n: int(n.get("Order", 10**9)),
+        load_npc_strategy_table(),
+        key=lambda n: int(n.get("order", 10**9)),
     )
     npc_labels: List[str] = []
     for n in npcs:
-        en = n.get("Name", "")
+        en = n.get("npc_name", "")
         zh = npc_name_zh(en) or "未找到中文"
-        strategies = extract_npc_strategy(n)
+        strategies = n.get("strategies", [])
         map_text = "地图:未知"
         if strategies:
-            best = sorted(strategies, key=lambda x: x["level"])[-1]
+            best = sorted(strategies, key=lambda x: int(x["ai_level"]))[-1]
             map_id = best["map_id"]
             try:
                 map_zh = load_map(map_id).name
                 map_text = f"地图:{map_zh}"
             except Exception:
                 map_text = f"地图:{map_id}"
-        npc_labels.append(f"{en} [{zh}] | order={n.get('Order')} | {map_text}")
+        npc_labels.append(f"{en} [{zh}] | order={n.get('order')} | {map_text}")
 
     npc_idx = _menu_select_raw("[选择NPC]", npc_labels, "方向键上下移动，z确认")
     npc = npcs[npc_idx]
 
-    strategies = sorted(extract_npc_strategy(npc), key=lambda x: x["level"])
+    strategies = sorted(npc.get("strategies", []), key=lambda x: int(x["ai_level"]))
     if not strategies:
-        raise RuntimeError(f"NPC {npc.get('Name')} 没有策略数据")
+        raise RuntimeError(f"NPC {npc.get('npc_name')} 没有策略数据")
 
     diff_labels: List[str] = []
     for s in strategies:
         map_name_zh = load_map(s["map_id"]).name
         diff_labels.append(
-            f"level={s['level']} | ai={s['ai_type']} | map={s['map_id']}({map_name_zh}) | deck={deck_display_name(s['deck_rowid'])}"
+            f"level={s['ai_level']} | ai={s['ai_type']} | map={s['map_id']}({map_name_zh}) | deck={deck_display_name(s['deck_rowid'])}"
         )
 
     diff_idx = _menu_select_raw("[选择难度]", diff_labels, "方向键上下移动，z确认")
     strategy = strategies[diff_idx]
 
-    valid_decks = _list_valid_player_decks()
-    if not valid_decks:
-        raise RuntimeError("没有可用的完整玩家牌组（0~32中无15张合法卡组）")
-    deck_labels = [f"deck={idx:02d} | {name}" for idx, name in valid_decks]
-    deck_pick = _menu_select_raw("[选择玩家牌组]", deck_labels, "方向键上下移动，z确认")
-    p1_deck_index = valid_decks[deck_pick][0]
+    deck_mode_idx = _menu_select_raw(
+        "[选择P1牌组来源]",
+        ["玩家牌组(0~32)", "NPC预设牌组(deck_rowid)"],
+        "方向键上下移动，z确认",
+    )
+    if deck_mode_idx == 0:
+        valid_decks = _list_valid_player_decks()
+        if not valid_decks:
+            raise RuntimeError("没有可用的完整玩家牌组（0~32中无15张合法卡组）")
+        deck_labels = [f"deck={idx:02d} | {name}" for idx, name in valid_decks]
+        deck_pick = _menu_select_raw("[选择玩家牌组]", deck_labels, "方向键上下移动，z确认")
+        p1_deck_index = valid_decks[deck_pick][0]
+        p1_deck_ids = get_player_deck_card_numbers(p1_deck_index, require_full_15=True)
+        p1_deck_name = get_player_deck_name(p1_deck_index)
+        p1_deck_source = f"player_deck:{p1_deck_index}"
+    else:
+        npc_rows = sorted(load_npc_strategy_table(), key=lambda r: int(r.get("order", 10**9)))
+        rowid_meta: Dict[str, Tuple[str, str]] = {}
+        for row in npc_rows:
+            npc_en = str(row.get("npc_name", ""))
+            npc_zh = npc_name_zh(npc_en) or "未找到中文"
+            for s in row.get("strategies", []):
+                deck_rowid = str(s.get("deck_rowid", "")).strip()
+                if not deck_rowid or deck_rowid in rowid_meta:
+                    continue
+                map_id = str(s.get("map_id", "")).strip()
+                try:
+                    map_zh = load_map(map_id).name
+                except Exception:
+                    map_zh = map_id or "未知地图"
+                rowid_meta[deck_rowid] = (npc_zh, map_zh)
+
+        rowids = sorted(rowid_meta.keys())
+        if not rowids:
+            raise RuntimeError("找不到 NPC 预设牌组")
+        deck_labels = []
+        for r in rowids:
+            npc_zh, map_zh = rowid_meta.get(r, ("未找到中文", "未知地图"))
+            deck_labels.append(f"{deck_display_name(r)} ({r}) [{npc_zh}+{map_zh}]")
+        pick = _menu_select_raw("[选择NPC预设牌组]", deck_labels, "方向键上下移动，z确认")
+        picked_rowid = rowids[pick]
+        p1_deck_ids = _deck_ids_from_rowid(picked_rowid)
+        p1_deck_name = deck_display_name(picked_rowid)
+        p1_deck_source = f"npc_rowid:{picked_rowid}"
 
     p2_deck_cards = load_deck_cards_by_rowid(strategy["deck_rowid"])
     p2_deck_ids = [c["number"] for c in p2_deck_cards]
 
-    npc_en = npc.get("Name", "NPC")
-    level = int(strategy["level"])
-    bot_level = LEVEL_TO_BOT_LEVEL.get(level, "high")
-    bot_style = AI_TYPE_TO_BOT_STYLE.get(strategy["ai_type"], "balanced")
+    npc_en = npc.get("npc_name", "NPC")
+    level = int(strategy["ai_level"])
+    bot_level = str(strategy.get("bot_level", LEVEL_TO_BOT_LEVEL.get(level, "high")))
+    bot_style = str(strategy.get("bot_style", AI_TYPE_TO_BOT_STYLE.get(strategy["ai_type"], "balanced")))
+    nn_spec = resolve_nn_spec(npc_en) or {}
 
     return {
         "map_id": strategy["map_id"],
-        "p1_deck_index": p1_deck_index,
+        "p1_deck_ids": p1_deck_ids,
+        "p1_deck_name": p1_deck_name,
+        "p1_deck_source": p1_deck_source,
         "p2_deck_ids": p2_deck_ids,
         "bot_style": bot_style,
         "bot_level": bot_level,
-        "p2_id": f"NPC{npc.get('Order', 0)}",
+        "bot_nn_spec": nn_spec,
+        "p2_id": f"NPC{npc.get('order', 0)}",
         "p2_name": npc_en,
         "p2_deck_name": deck_display_name(strategy["deck_rowid"]),
     }
 
 
 def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
-    p1_idx = int(conf["p1_deck_index"])
-    p1_ids = get_player_deck_card_numbers(p1_idx, require_full_15=True)
+    p1_ids = list(conf["p1_deck_ids"])
+    p1_deck_name = str(conf.get("p1_deck_name", ""))
     p2_ids = list(conf["p2_deck_ids"])
 
     state = init_state(
@@ -277,11 +369,12 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
         mode="1P",
         bot_style=str(conf["bot_style"]),
         bot_level=str(conf["bot_level"]),
+        bot_nn_spec=dict(conf.get("bot_nn_spec", {})),
         p1_player_id=args.p1_id,
         p2_player_id=str(conf["p2_id"]),
         p1_player_name=args.p1_name,
         p2_player_name=str(conf["p2_name"]),
-        p1_deck_name=get_player_deck_name(p1_idx),
+        p1_deck_name=p1_deck_name,
         p2_deck_name=str(conf["p2_deck_name"]),
     )
 
@@ -313,8 +406,8 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
 
 
 def _run_game_line_input(args: argparse.Namespace, conf: Dict[str, object]) -> int:
-    p1_idx = int(conf["p1_deck_index"])
-    p1_ids = get_player_deck_card_numbers(p1_idx, require_full_15=True)
+    p1_ids = list(conf["p1_deck_ids"])
+    p1_deck_name = str(conf.get("p1_deck_name", ""))
     p2_ids = list(conf["p2_deck_ids"])
 
     state = init_state(
@@ -325,11 +418,12 @@ def _run_game_line_input(args: argparse.Namespace, conf: Dict[str, object]) -> i
         mode="1P",
         bot_style=str(conf["bot_style"]),
         bot_level=str(conf["bot_level"]),
+        bot_nn_spec=dict(conf.get("bot_nn_spec", {})),
         p1_player_id=args.p1_id,
         p2_player_id=str(conf["p2_id"]),
         p1_player_name=args.p1_name,
         p2_player_name=str(conf["p2_name"]),
-        p1_deck_name=get_player_deck_name(p1_idx),
+        p1_deck_name=p1_deck_name,
         p2_deck_name=str(conf["p2_deck_name"]),
     )
 
