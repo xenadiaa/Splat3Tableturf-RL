@@ -22,17 +22,22 @@ if str(TABLETURF_SIM_ROOT) not in sys.path:
     sys.path.insert(0, str(TABLETURF_SIM_ROOT))
 
 from src.assets.tableturf_types import Map_PointMask
-from switch_connect.policies.router import choose_action
 from switch_connect.ui.terminal_select import choose_with_arrows
 from switch_connect.virtual_gamepad.device_discovery import list_serial_port_labels, parse_device_from_label
-from switch_connect.virtual_gamepad.input_mapper import BIT_A, RemoteStep, compile_action_to_remote_steps
+from switch_connect.virtual_gamepad.input_mapper import BIT_A, BIT_DPAD_DOWN, BIT_DPAD_LEFT, BIT_DPAD_RIGHT, BIT_DPAD_UP, BIT_X, BIT_Y, RemoteStep
 from switch_connect.virtual_gamepad.serial_controller import SerialRemoteController
 from tableturf_vision.mapper_preview import _match_card
 from tableturf_vision.playable_detector import detect_playable_banner
 from tableturf_vision.reference_matcher import match_map_by_reference_board_labels
+from tableturf_vision.sp_detector import get_sp_count_frame
 from tableturf_vision.tableturf_mapper import _load_layout, analyze_image
 from vision_capture.adapter import FFmpegCaptureSource, auto_detect_capture_device_name
 from vision_capture.state_types import ObservedState
+from src.engine.env_core import GameState, PlayerState, legal_actions
+from src.engine.loaders import MAP_PADDING, load_map
+from src.strategy.registry import choose_action_from_strategy_id
+from src.utils.common_utils import create_card_from_id
+from src.view.gamepad_ui import _find_local_view_rightbottom_self_special_anchor
 
 
 class MissingInterfaceError(RuntimeError):
@@ -132,11 +137,7 @@ class ControllerConfig:
     wait_press_gap_ms: int = 1000
     playable_poll_seconds: float = 0.35
     max_turns: int = 12
-    policy: str = "engine"
-    style: str = ""
-    level: str = "high"
-    nn_module: str = ""
-    nn_command: str = ""
+    strategy_id: str = "default:balanced:high"
     strict_missing_interfaces: bool = True
     layout_json: str = "tableturf_vision/tableturf_layout.json"
     manual_fields: ManualVisionFields = field(default_factory=ManualVisionFields)
@@ -207,6 +208,138 @@ class ASpamWorker:
             self._thread.join(timeout=2.0)
 
 
+def _press_button(steps: List[RemoteStep], bit_index: int, hold_ms: int = 90, gap_ms: int = 40) -> None:
+    steps.append(RemoteStep(bits=(1 << bit_index), hold_ms=hold_ms, gap_ms=gap_ms))
+
+
+def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 80) -> None:
+    if dx > 0:
+        for _ in range(dx):
+            _press_button(steps, BIT_DPAD_RIGHT, hold_ms=move_hold_ms, gap_ms=30)
+    elif dx < 0:
+        for _ in range(-dx):
+            _press_button(steps, BIT_DPAD_LEFT, hold_ms=move_hold_ms, gap_ms=30)
+    if dy > 0:
+        for _ in range(dy):
+            _press_button(steps, BIT_DPAD_DOWN, hold_ms=move_hold_ms, gap_ms=30)
+    elif dy < 0:
+        for _ in range(-dy):
+            _press_button(steps, BIT_DPAD_UP, hold_ms=move_hold_ms, gap_ms=30)
+
+
+def _build_state_from_observation(obs: ObservedState) -> GameState:
+    game_map = load_map(obs.map_id)
+    if obs.map_grid is not None:
+        if len(obs.map_grid) != game_map.height or any(len(r) != game_map.width for r in obs.map_grid):
+            raise ValueError("map_grid size mismatch with map_id")
+        game_map.grid = [row[:] for row in obs.map_grid]
+    p1_hand = [create_card_from_id(n) for n in obs.hand_card_numbers]
+    p1 = PlayerState(deck_ids=[], draw_pile=[], hand=p1_hand, sp=obs.p1_sp)
+    p2 = PlayerState(deck_ids=[], draw_pile=[], hand=[], sp=0)
+    return GameState(map=game_map, players={"P1": p1, "P2": p2}, turn=obs.turn)
+
+
+def _initial_engine_anchor_for_map(obs: ObservedState) -> Tuple[int, int]:
+    game_map = load_map(obs.map_id)
+    if obs.map_grid is not None:
+        game_map.grid = [row[:] for row in obs.map_grid]
+    pad = MAP_PADDING
+    if game_map.width > pad * 2 and game_map.height > pad * 2:
+        logical_w = game_map.width - pad * 2
+        logical_h = game_map.height - pad * 2
+        view_x0 = pad
+        view_y0 = pad
+    else:
+        logical_w = game_map.width
+        logical_h = game_map.height
+        view_x0 = 0
+        view_y0 = 0
+    anchor_local = _find_local_view_rightbottom_self_special_anchor(
+        game_map=game_map,
+        is_p1=True,
+        view_x0=view_x0,
+        view_y0=view_y0,
+        view_w=logical_w,
+        view_h=logical_h,
+        flip_180=False,
+    )
+    return (int(anchor_local[0] + view_x0), int(anchor_local[1] + view_y0))
+
+
+def choose_action_from_strategy(obs: ObservedState, strategy_id: str):
+    state = _build_state_from_observation(obs)
+    return choose_action_from_strategy_id(state=state, player="P1", strategy_id=strategy_id)
+
+
+def _sp_pick_pool(obs: ObservedState) -> List[int]:
+    state = _build_state_from_observation(obs)
+    actions = legal_actions(state, "P1")
+    seen: set[int] = set()
+    ordered: List[int] = []
+    for hand_card in obs.hand_card_numbers:
+        for action in actions:
+            card_number = action.card_number
+            if (
+                card_number == hand_card
+                and action.use_sp_attack
+                and card_number not in seen
+            ):
+                ordered.append(int(card_number))
+                seen.add(int(card_number))
+                break
+    return ordered
+
+
+def compile_action_with_defaults(action, obs: ObservedState) -> List[RemoteStep]:
+    hand = obs.hand_card_numbers
+    if not hand:
+        raise ValueError("hand_card_numbers is empty")
+    action_card = action.card_number if action.card_number is not None else hand[0]
+    if action_card not in hand:
+        raise ValueError(f"card {action.card_number} not in observed hand {hand}")
+
+    steps: List[RemoteStep] = []
+    if action.pass_turn:
+        target_idx = hand.index(action_card)
+        _move_axis(steps, dx=0, dy=2)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+        _move_axis(steps, dx=target_idx, dy=0)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+        return steps
+
+    if action.use_sp_attack:
+        sp_pool = _sp_pick_pool(obs)
+        if action_card not in sp_pool:
+            raise ValueError(f"card {action_card} not available in sp pick pool {sp_pool}")
+        target_idx = sp_pool.index(action_card)
+        _move_axis(steps, dx=1, dy=2)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+        _move_axis(steps, dx=target_idx, dy=0)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+    else:
+        target_idx = hand.index(action_card)
+        delta_idx = target_idx - int(obs.selected_hand_index or 0)
+        _move_axis(steps, dx=delta_idx, dy=0)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+
+    cursor_x, cursor_y = _initial_engine_anchor_for_map(obs)
+
+    cw_steps = int(action.rotation) % 4
+    ccw_steps = (-int(action.rotation)) % 4
+    if cw_steps <= ccw_steps:
+        for _ in range(cw_steps):
+            _press_button(steps, BIT_X)
+    else:
+        for _ in range(ccw_steps):
+            _press_button(steps, BIT_Y)
+
+    if action.x is None or action.y is None:
+        raise ValueError("non-pass action requires x/y")
+    _move_axis(steps, dx=int(action.x) - int(cursor_x), dy=int(action.y) - int(cursor_y))
+    _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+    return steps
+
+
 class TerminalDebugUI:
     def __init__(self, runtime: "AutoControllerRuntime"):
         self._runtime = runtime
@@ -272,7 +405,9 @@ class TerminalDebugUI:
             f"map: {state['map_id']}",
             f"playable: {state['playable']}",
             f"hand: {state['hand']}",
+            f"sp: {state['p1_sp']}",
             f"action: {state['last_action']}",
+            f"strategy: {state['strategy_id']}",
             f"serial: {state['serial_port']}",
             f"frame: {state['last_frame_path']}",
             f"analysis: {state['last_analysis_path']}",
@@ -319,7 +454,9 @@ class AutoControllerRuntime:
             "map_id": "",
             "playable": False,
             "hand": "",
+            "p1_sp": 0,
             "last_action": "",
+            "strategy_id": self.config.strategy_id,
             "serial_port": self.serial_port,
             "last_frame_path": "",
             "last_analysis_path": "",
@@ -405,6 +542,7 @@ class AutoControllerRuntime:
                     playable=bool(playable_result.get("playable")),
                     last_frame_path=self.vision.last_frame_path,
                     last_analysis_path=self.vision.last_analysis_path,
+                    p1_sp=self.vision.last_sp_count,
                 )
                 if playable_result.get("playable"):
                     self._push_event("playable_detected")
@@ -430,25 +568,19 @@ class AutoControllerRuntime:
                     map_id=state.map_id,
                     playable=bool(state.playable_result.get("playable")),
                     hand=",".join(str(n) for n in state.hand_card_numbers),
+                    p1_sp=state.p1_sp,
                     last_frame_path=self.vision.last_frame_path,
                     last_analysis_path=self.vision.last_analysis_path,
                     last_error="",
                 )
-                action = choose_action(
-                    obs=observed_state,
-                    policy=self.config.policy,
-                    style=self.config.style or None,
-                    level=self.config.level,
-                    nn_module=self.config.nn_module,
-                    nn_command=self.config.nn_command,
-                )
+                action = choose_action_from_strategy(observed_state, self.config.strategy_id)
                 action_text = (
                     f"card={action.card_number} rot={action.rotation} "
                     f"xy=({action.x},{action.y}) pass={action.pass_turn} sp={action.use_sp_attack}"
                 )
                 self._set_status(last_action=action_text)
                 self._push_event(f"action_turn_{self.turn_index}: {action_text}")
-                steps = compile_action_to_remote_steps(action, observed_state)
+                steps = compile_action_with_defaults(action, observed_state)
                 self._set_status(phase="executing_action")
                 self.controller.run_steps(steps)
                 self.turn_index += 1
@@ -492,6 +624,7 @@ class _FrameVisionPipeline:
             _load_callable(config.supplemental_state_provider) if config.supplemental_state_provider else None
         )
         self._map_id: Optional[str] = None
+        self.last_sp_count = 0
         debug_dir = Path(config.debug_frame_dir)
         if not debug_dir.is_absolute():
             debug_dir = REPO_ROOT / debug_dir
@@ -516,6 +649,7 @@ class _FrameVisionPipeline:
         frame = self._read_latest_frame()
         result = detect_playable_banner(frame)
         result["frame_shape"] = [int(frame.shape[0]), int(frame.shape[1]), int(frame.shape[2])]
+        self.last_sp_count = int(get_sp_count_frame(frame))
         return result
 
     def _analyze_frame(self, frame) -> Dict[str, Any]:
@@ -580,14 +714,18 @@ class _FrameVisionPipeline:
 
         supplemental = self._supplemental_state(frame, analysis_result, turn_index)
         missing: List[str] = []
-        if supplemental.selected_hand_index is None:
-            missing.append("selected_hand_index")
-        if supplemental.cursor_xy is None:
-            missing.append("cursor_xy")
-        if supplemental.rotation is None:
-            missing.append("rotation")
-        if supplemental.p1_sp is None:
-            missing.append("p1_sp")
+        selected_hand_index = supplemental.selected_hand_index if supplemental.selected_hand_index is not None else 0
+        rotation = supplemental.rotation if supplemental.rotation is not None else 0
+        p1_sp = supplemental.p1_sp if supplemental.p1_sp is not None else int(get_sp_count_frame(frame))
+        cursor_xy = supplemental.cursor_xy if supplemental.cursor_xy is not None else _initial_engine_anchor_for_map(
+            ObservedState(
+                map_id=self._map_id,
+                hand_card_numbers=hand_card_numbers,
+                p1_sp=int(p1_sp),
+                turn=turn_index,
+                map_grid=_extract_board_grid(analysis_result["board"]["labels"]),
+            )
+        )
         if missing and self._config.strict_missing_interfaces:
             raise MissingInterfaceError(missing)
 
@@ -599,10 +737,10 @@ class _FrameVisionPipeline:
             analysis_result=analysis_result,
             card_matches=card_matches,
             turn=turn_index,
-            selected_hand_index=supplemental.selected_hand_index,
-            cursor_xy=supplemental.cursor_xy,
-            rotation=int(supplemental.rotation or 0),
-            p1_sp=int(supplemental.p1_sp or 0),
+            selected_hand_index=int(selected_hand_index),
+            cursor_xy=(int(cursor_xy[0]), int(cursor_xy[1])),
+            rotation=int(rotation),
+            p1_sp=int(p1_sp),
         )
 
 

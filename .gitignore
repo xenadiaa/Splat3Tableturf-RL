@@ -24,3 +24,5 @@
 /switch_connect/vision_capture/debug
 /switch_connect/policies/__pycache__
 /autocontroller_rebuild_for_RL/__pycache__
+/tableturf_sim/src/strategy/__pycache__
+/tableturf_sim/src/view/__pycache__

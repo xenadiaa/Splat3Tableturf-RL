@@ -21,4 +21,11 @@ Playable-banner detection:
 - use `tableturf_vision.playable_detector.is_playable_frame(...)` or
   `tableturf_vision.playable_detector.is_playable_image_path(...)`
 
+SP detection:
+- reference image: `tableturf_vision/参照基础/sp_check.png`
+- point-confirmation image: `tableturf_vision/参照基础_坐标点确定/sp_check.png`
+- the current implementation extracts 16 left-to-right SP reference points from the green circles
+- use `tableturf_vision.sp_detector.get_sp_count_frame(...)` or
+  `tableturf_vision.sp_detector.get_sp_count_image_path(...)`
+
 This package intentionally excludes device capture and controller output.

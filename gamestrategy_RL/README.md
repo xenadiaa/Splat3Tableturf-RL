@@ -72,3 +72,18 @@ Training logs are written into each `save-dir`:
 - `training_summary.json`: final summary
 
 Checkpoints are written to `gamestrategy_RL/checkpoints/`.
+
+## Strategic PPO
+
+This repo also includes a separate PPO pipeline with a richer, situation-dependent shaping reward:
+
+- `strategic_env.py`: strategic reward wrapper with breakthrough/compression/SP/fortify shaping
+- `strategic_networks.py`: separate policy/value network for strategic reward training
+- `strategic_ppo_trainer.py`: separate PPO trainer and logs
+- `train_strategic.py`: CLI entry
+
+Example:
+
+```bash
+python -m gamestrategy_RL.train_strategic --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high
+```
