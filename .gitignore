@@ -17,3 +17,10 @@
 /tableturf_sim/tools/__pycache__
 /switch_connect/vision_capture/__pycache__
 /switch_connect/virtual_gamepad/__pycache__
+/vision_capture/__pycache__
+/vision_capture/debug
+/tableturf_vision/__pycache__
+/tableturf_sim/src/view/__pycache__
+/switch_connect/vision_capture/debug
+/switch_connect/policies/__pycache__
+/autocontroller_rebuild_for_RL/__pycache__

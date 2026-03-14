@@ -1,0 +1,31 @@
+{
+  "capture_device_name": "",
+  "capture_width": 1920,
+  "capture_height": 1080,
+  "capture_fps": 30,
+  "capture_read_timeout_seconds": 5.0,
+  "capture_drain_ms": 60,
+  "serial_port": "",
+  "pick_serial": true,
+  "wait_press_hold_ms": 110,
+  "wait_press_gap_ms": 1000,
+  "playable_poll_seconds": 0.35,
+  "max_turns": 12,
+  "policy": "engine",
+  "style": "",
+  "level": "high",
+  "nn_module": "",
+  "nn_command": "",
+  "strict_missing_interfaces": true,
+  "layout_json": "tableturf_vision/tableturf_layout.json",
+  "debug_ui_enabled": true,
+  "save_debug_frames": true,
+  "debug_frame_dir": "autocontroller_rebuild_for_RL/debug_runtime",
+  "manual_fields": {
+    "selected_hand_index": null,
+    "cursor_xy": null,
+    "rotation": null,
+    "p1_sp": null
+  },
+  "supplemental_state_provider": ""
+}

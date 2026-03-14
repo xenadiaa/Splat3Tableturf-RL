@@ -28,6 +28,10 @@ DECK_JSON_CANDIDATES = [
     REPO_ROOT / "tableturf_sim" / "data" / "cards" / "MiniGamePresetDeck.json",
     REPO_ROOT / "tableturf_sim" / "src" / "assets" / "MiniGamePresetDeck.json",
 ]
+PLAYER_DECK_JSON_CANDIDATES = [
+    REPO_ROOT / "tableturf_sim" / "data" / "cards" / "PlayerPresetDeck.json",
+    REPO_ROOT / "tableturf_sim" / "src" / "assets" / "PlayerPresetDeck.json",
+]
 MAP_JSON_CANDIDATES = [
     REPO_ROOT / "tableturf_sim" / "data" / "maps" / "MiniGameMapInfo.json",
     REPO_ROOT / "tableturf_sim" / "src" / "assets" / "MiniGameMapInfo.json",
@@ -59,6 +63,10 @@ def _load_preset_decks() -> List[dict]:
     return _read_json_from_candidates(DECK_JSON_CANDIDATES)
 
 
+def _load_player_preset_decks() -> List[dict]:
+    return _read_json_from_candidates(PLAYER_DECK_JSON_CANDIDATES)
+
+
 def _load_npc_data() -> List[dict]:
     return _read_json_from_candidates(NPC_JSON_CANDIDATES)
 
@@ -68,8 +76,30 @@ def list_map_ids() -> List[str]:
     return [str(item["id"]) for item in maps]
 
 
+def map_name_by_id(map_id: str) -> str:
+    maps = _read_json_from_candidates(MAP_JSON_CANDIDATES)
+    match = next((item for item in maps if str(item["id"]) == map_id), None)
+    if match is None:
+        valid = ", ".join(list_map_ids()[:8])
+        raise ValueError(f"Unknown map id: {map_id}. e.g. {valid}")
+    return str(match["name"])
+
+
 def list_deck_rowids() -> List[str]:
     return [str(item["__RowId"]) for item in _load_preset_decks()]
+
+
+def list_player_deck_names() -> List[str]:
+    return [str(item.get("Name", "")) for item in _load_player_preset_decks()]
+
+
+def player_map_deck_selector(map_id: str) -> str:
+    map_name = map_name_by_id(map_id)
+    names = set(list_player_deck_names())
+    if map_name not in names:
+        sample = ", ".join(list_player_deck_names()[:8])
+        raise ValueError(f"No player preset deck matched map {map_id} -> {map_name}. e.g. {sample}")
+    return f"player:{map_name}"
 
 
 def map_deck_candidates(map_id: str) -> List[str]:
@@ -100,23 +130,66 @@ def auto_deck_rowids_for_map(map_id: str) -> Tuple[str, str]:
     return p1, p2
 
 
+def level_npc_profiles_for_map(level: int, map_id: str) -> List[Dict[str, str]]:
+    profiles: List[Dict[str, str]] = []
+    for npc in _load_npc_data():
+        rowid = str(npc.get("__RowId", ""))
+        name = str(npc.get("Name", rowid))
+        for ai_level, npc_map, ai_type, deck_path in zip(
+            npc.get("AILevel", []),
+            npc.get("Map", []),
+            npc.get("AIType", []),
+            npc.get("Deck", []),
+        ):
+            if int(ai_level) != int(level) or str(npc_map) != map_id:
+                continue
+            profiles.append(
+                {
+                    "npc_rowid": rowid,
+                    "npc_name": name,
+                    "map_id": str(npc_map),
+                    "p2_deck": _gyml_to_rowid(str(deck_path)),
+                    "bot_style_raw": str(ai_type),
+                }
+            )
+    return profiles
+
+
 def resolve_deck_numbers(selector: Optional[str], fallback_index: int = 0) -> List[int]:
     decks = _load_preset_decks()
+    player_decks = _load_player_preset_decks()
     card_by_rowid = _load_card_number_index()
 
     if selector is None:
         chosen = decks[fallback_index % len(decks)]
+        chosen_cards = chosen["Card"]
+    elif selector.startswith("player:"):
+        query = selector.split(":", 1)[1].strip()
+        picked = next((d for d in player_decks if d.get("__RowId") == query), None)
+        if picked is None:
+            picked = next((d for d in player_decks if str(d.get("Name", "")) == query), None)
+        if picked is None and query.isdigit():
+            idx = int(query)
+            if 0 <= idx < len(player_decks):
+                picked = player_decks[idx]
+        if picked is None:
+            sample = ", ".join(list_player_deck_names()[:8])
+            raise ValueError(f"Unknown player deck selector: {selector}. e.g. player:{sample}")
+        chosen = {"__RowId": picked.get("__RowId", "PlayerDeck"), "Card": picked["Card"]}
+        chosen_cards = picked["Card"]
     elif selector.isdigit():
         chosen = decks[int(selector) % len(decks)]
+        chosen_cards = chosen["Card"]
     else:
         match = next((d for d in decks if d["__RowId"] == selector), None)
         if match is None:
             valid = ", ".join(list_deck_rowids()[:8])
             raise ValueError(f"Unknown deck selector: {selector}. e.g. {valid}")
         chosen = match
+        chosen_cards = chosen["Card"]
 
     numbers: List[int] = []
-    for card_path in chosen["Card"]:
+    for card_path in chosen_cards:
         rowid = _gyml_to_rowid(card_path)
         numbers.append(card_by_rowid[rowid])
     if len(numbers) != 15:

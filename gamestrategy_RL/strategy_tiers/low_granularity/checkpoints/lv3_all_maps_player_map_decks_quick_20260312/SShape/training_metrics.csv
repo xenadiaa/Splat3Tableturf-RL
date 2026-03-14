@@ -1,0 +1,2 @@
+event,utc,update,total_updates,steps_seen,policy_loss,value_loss,entropy,mean_ep_reward,win_rate,elapsed_sec
+update,2026-03-12T12:10:38Z,1,1,256,-8.743163198232651e-05,13.980709314346313,3.600499987602234,-6.805,0.0,49.373759031295776

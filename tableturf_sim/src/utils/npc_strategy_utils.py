@@ -1,23 +1,10 @@
-"""NPC strategy table loader and NN override resolver."""
+"""Compatibility wrapper for strategy package."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Dict, List, Optional
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-NPC_ASSET_DIR = PROJECT_ROOT / "src" / "assets" / "NPC"
-NPC_STRATEGY_JSON = NPC_ASSET_DIR / "npc_strategies.json"
-
-
-def load_npc_strategy_table() -> List[dict]:
-    if not NPC_STRATEGY_JSON.exists():
-        raise FileNotFoundError(f"NPC strategy table missing: {NPC_STRATEGY_JSON}")
-    data = json.loads(NPC_STRATEGY_JSON.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise ValueError("npc_strategies.json root must be list")
-    return data
+from ..strategy.registry import load_npc_strategy_table, resolve_npc_nn_spec
 
 
 def get_npc_entry_by_name(npc_name: str) -> Optional[dict]:
@@ -48,33 +35,14 @@ def get_level_strategy(npc_name: str, level: int) -> Optional[dict]:
     return None
 
 
-def _nn_spec_path_candidates(npc_name: str) -> List[Path]:
-    # Preferred naming requested by user: NPCName_nn
-    return [
-        NPC_ASSET_DIR / f"{npc_name}_nn.json",
-        NPC_ASSET_DIR / f"{npc_name}_nn.py",
-    ]
-
-
 def resolve_nn_spec(npc_name: str) -> Optional[Dict[str, object]]:
-    candidates = _nn_spec_path_candidates(npc_name)
-    json_path = candidates[0]
-    py_path = candidates[1]
-    if json_path.exists():
-        try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        if isinstance(data, dict):
-            # keep explicit type if provided; default to file_action_json
-            out = dict(data)
-            out.setdefault("type", "file_action_json")
-            return out
-        return None
-    if py_path.exists():
-        return {
-            "type": "python_module",
-            "module_file": str(py_path),
-            "function": "choose_action",
-        }
-    return None
+    return resolve_npc_nn_spec(npc_name)
+
+
+__all__ = [
+    "load_npc_strategy_table",
+    "get_npc_entry_by_name",
+    "get_npc_entry_by_order",
+    "get_level_strategy",
+    "resolve_nn_spec",
+]

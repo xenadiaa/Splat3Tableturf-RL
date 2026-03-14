@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Callable, Dict, Tuple
 
 from src.engine.env_core import Action
-from switch_connect.vision_capture.state_types import ObservedState
+from vision_capture.state_types import ObservedState
 
 
 def _parse_module_ref(ref: str) -> Tuple[str, str]:

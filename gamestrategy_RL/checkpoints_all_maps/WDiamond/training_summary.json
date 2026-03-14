@@ -1,0 +1,20 @@
+{
+  "utc": "2026-03-11T16:03:37Z",
+  "run_name": "train_WDiamond",
+  "total_updates": 48,
+  "total_steps_seen": 49152,
+  "total_elapsed_sec": 10620.134578943253,
+  "final_recent_mean_ep_reward": 1.08,
+  "final_recent_win_rate": 0.56,
+  "episodes_finished": 4096,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/checkpoints_all_maps/WDiamond",
+  "run_config": {
+    "map_id": "WDiamond",
+    "p1_deck": "MiniGame_JudgeJr",
+    "p2_deck": "MiniGame_WeaponShop_Fsodr",
+    "bot_style": "balanced",
+    "bot_level": "mid",
+    "seed": 43,
+    "resume_checkpoint": ""
+  }
+}

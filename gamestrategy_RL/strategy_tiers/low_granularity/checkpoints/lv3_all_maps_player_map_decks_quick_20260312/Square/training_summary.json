@@ -1,0 +1,25 @@
+{
+  "utc": "2026-03-12T12:12:28Z",
+  "run_name": "train_Square_vs_MiniGame_Aori",
+  "total_updates": 1,
+  "total_steps_seen": 256,
+  "total_elapsed_sec": 39.06241798400879,
+  "final_recent_mean_ep_reward": -3.425,
+  "final_recent_win_rate": 0.047619047619047616,
+  "episodes_finished": 21,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/Square",
+  "run_config": {
+    "mode": "train_all_maps_vs_lv3_npc",
+    "map_id": "Square",
+    "map_name": "正方广场",
+    "p1_deck": "player:正方广场",
+    "p2_deck": "MiniGame_Aori",
+    "bot_style": "aggressive",
+    "bot_level": "high",
+    "npc_rowid": "MiniGame_Aori",
+    "npc_name": "Aori",
+    "npc_level": 2,
+    "seed": 46,
+    "resume_checkpoint": ""
+  }
+}

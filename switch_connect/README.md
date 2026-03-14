@@ -1,14 +1,20 @@
 # switch_connect
 
-Realtime switch bridge without changing existing engine files.
+Realtime Switch bridge for:
+- policy selection
+- action mapping
+- virtual gamepad / serial output
+
 Pipeline:
-`vision_capture -> ObservedState -> policy(engine/nn) -> action -> virtual_gamepad -> serial`
+`ObservedState -> policy(engine/nn) -> action -> virtual_gamepad -> serial`
+
+Repository split by responsibility:
+- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture`: capture-card device access and screenshots
+- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision`: Tableturf-specific image parsing and judge tools
+- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/switch_connect`: strategy and controller output only
 
 ## Layout
 
-- `vision_capture/`
-  - `types.py`: observed game state schema
-  - `adapter.py`: AVFoundation capture-card adapter (`ffmpeg` by device name, default `UGREEN 35287`)
 - `virtual_gamepad/`
   - `input_mapper.py`: action -> button step mapping
   - `serial_controller.py`: 0xFF remote mode sender
@@ -33,86 +39,10 @@ python3 switch_connect/bridge_runner.py \
   --print-steps
 ```
 
-## Config-driven Capture (Recommended Daily Use)
-
-Configure once in:
-- [`capture_config.json`](/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/switch_connect/capture_config.json)
-
-Then run one command:
-
-```bash
-cd /Users/xenadia/Documents/GitHub/Splat3Tableturf-RL
-./.venv/bin/python switch_connect/capture_runner.py
-```
-
-Behavior:
-- Select capture device with arrow keys (if `pick_device=true`)
-- Capture screenshots using configured parameters
-- Save to configured output directory
-- If `pick_device=false`, it uses `device_name` from config.
-- If `pick_device=false` but `device_name` is empty, it auto-enters picker.
-- Every manual selection updates `device_name` in config automatically.
-
-Probe capture card frame (by device name, not camera index):
-
-```bash
-python3 switch_connect/vision_capture/probe_video.py \
-  --dump-devices \
-  --device-name "UGREEN 35287"
-```
-
-Auto-detect capture card (recommended):
-
-```bash
-python3 switch_connect/vision_capture/probe_video.py \
-  --dump-devices \
-  --auto-device
-```
-
-Manual selection with arrow keys (video device):
-
-```bash
-python3 switch_connect/vision_capture/probe_video.py --pick-device
-```
-
-Continuous capture with unique filenames, skip duplicates, and keep card active:
-
-```bash
-python3 switch_connect/vision_capture/probe_video.py \
-  --device-name "UGREEN 35287" \
-  --shots 20 \
-  --interval-ms 1000 \
-  --warmup-seconds 5 \
-  --prefix capture \
-  --keep-active-seconds 0
-```
-
-Debug mode (continuous screenshots until Ctrl+C):
-
-```bash
-python3 switch_connect/vision_capture/probe_video.py \
-  --device-name "UGREEN 35287" \
-  --debug \
-  --interval-ms 1000 \
-  --prefix capture
-```
-
-Press Enter to capture (keep capture active; `q` + Enter to quit):
-
-```bash
-python3 switch_connect/vision_capture/capture_on_enter.py
-```
-
-This command reads `switch_connect/capture_config.json`.
-
-Notes:
-- Filenames are always unique (`prefix_YYYYMMDD_HHMMSS_microsec_idx.jpg`).
-- Duplicate consecutive frames are skipped by default.
-- `--debug` disables duplicate-skip and keeps saving continuously.
-- Snapshot uses latest-frame drain to avoid saving stale buffered frames.
-- Default is restart-per-shot to force fresh frame each screenshot.
-- `--keep-active-seconds 0` keeps capture active until `Ctrl+C`.
-- Use `--no-keep-active` to stop immediately after snapshot phase.
+Capture and vision tools have been moved out of this package.
+Use:
+- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture`
+- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision`
 
 Use NN policy (python module callable):
 

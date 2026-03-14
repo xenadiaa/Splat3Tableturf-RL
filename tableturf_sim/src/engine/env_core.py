@@ -310,9 +310,12 @@ def _remove_card_from_hand_and_draw(ps: PlayerState, card_number: int) -> None:
     idx = next((i for i, c in enumerate(ps.hand) if c.Number == card_number), None)
     if idx is None:
         raise ValueError(f"card #{card_number} not found in hand")
-    ps.hand.pop(idx)
     if ps.draw_pile:
-        ps.hand.append(ps.draw_pile.pop(0))
+        # Keep 0/1/2/3 hand slot stable: replace in-place instead of shifting.
+        ps.hand[idx] = ps.draw_pile.pop(0)
+    else:
+        # No draw remains (endgame), remove card as fallback.
+        ps.hand.pop(idx)
 
 
 def _compute_scores(game_map: GameMap) -> Tuple[int, int]:
@@ -666,6 +669,27 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
         },
     )
     return pick
+
+
+def choose_default_strategy_action(state: GameState, player: str, style: str, level: str) -> Action:
+    """Public helper for default heuristic strategy selection on either side."""
+    ps = state.players[player]
+    actions = legal_actions(state, player)
+    if not actions:
+        return Action(player=player, card_number=ps.hand[0].Number, pass_turn=True)
+
+    scored: List[Tuple[float, Action]] = []
+    for a in actions:
+        scored.append((_score_bot_action(state, player, a, style, level), a))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if level == "high":
+        return scored[0][1]
+    if level == "mid":
+        top_k = max(1, len(scored) // 5)
+        return state.rng.choice([a for _, a in scored[:top_k]])
+    top_k = max(1, len(scored) // 2)
+    return state.rng.choice([a for _, a in scored[:top_k]])
 
 
 def _match_action_from_payload(actions: List[Action], payload: Dict[str, object]) -> Optional[Action]:

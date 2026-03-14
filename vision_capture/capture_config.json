@@ -1,0 +1,23 @@
+{
+  "device_name": "UGREEN 35287",
+  "auto_device": true,
+  "pick_device": true,
+  "prefer_usb_only": true,
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "out_dir": "vision_capture/debug",
+  "warmup_seconds": 5.0,
+  "prefix": "capture",
+  "read_timeout_seconds": 5.0,
+  "restart_per_shot": true,
+  "discard_open_frames": 2,
+  "drain_ms": 10,
+  "shots": 20,
+  "interval_ms": 1000,
+  "debug": false,
+  "skip_duplicates": false,
+  "first_frame_timeout_seconds": 12.0,
+  "keep_active": false,
+  "keep_active_seconds": 0.0
+}

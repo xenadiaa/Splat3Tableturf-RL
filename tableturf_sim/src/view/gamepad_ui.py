@@ -27,6 +27,7 @@ PHASE_SP_PICK = "sp_pick"
 PHASE_PASS_PICK = "pass_pick"
 PHASE_PLACE = "place"
 PHASE_SURRENDER_CONFIRM = "surrender_confirm"
+PHASE_WAITING_RESOLVE = "waiting_resolve"
 
 # ANSI truecolor helpers (RGB)
 CLR_RESET = "\033[0m"
@@ -37,6 +38,7 @@ RGB_P2_SP = (0, 176, 240)      # light blue
 RGB_CONFLICT = (128, 128, 128) # gray
 RGB_EMPTY = (0, 0, 0)          # black
 RGB_PREVIEW = (160, 255, 160)  # preview hint
+RGB_PREVIEW_BAD = (255, 64, 64)  # preview blocked warning (red)
 RGB_LINK = (255, 64, 255)      # anchor marker
 
 
@@ -52,18 +54,35 @@ class DeckSnapshot:
     hand: List[int]
 
 
-def _find_rightmost_self_special_anchor(game_map: GameMap, is_p1: bool = True) -> Tuple[int, int]:
+def _find_local_view_rightbottom_self_special_anchor(
+    game_map: GameMap,
+    is_p1: bool,
+    view_x0: int,
+    view_y0: int,
+    view_w: int,
+    view_h: int,
+    flip_180: bool,
+) -> Tuple[int, int]:
     owner_bit = int(Map_PointBit.IsP1) if is_p1 else int(Map_PointBit.IsP2)
     special_bit = int(Map_PointBit.IsSp)
     candidates: List[Tuple[int, int]] = []
-    for y in range(game_map.height):
-        for x in range(game_map.width):
+    for y in range(view_y0, view_y0 + view_h):
+        for x in range(view_x0, view_x0 + view_w):
             cell = int(game_map.get_point(x, y))
             if (cell & owner_bit) != 0 and (cell & special_bit) != 0:
-                candidates.append((x, y))
+                lx = x - view_x0
+                ly = y - view_y0
+                if flip_180:
+                    lx = view_w - 1 - lx
+                    ly = view_h - 1 - ly
+                candidates.append((lx, ly))
     if not candidates:
-        return (game_map.width // 2, game_map.height // 2)
-    candidates.sort(key=lambda p: (p[0], -p[1]), reverse=True)
+        return (view_w // 2, view_h // 2)
+    if str(game_map.map_id) == "ManyHole":
+        # Sticky_Thicket: special-case to use the left-side spawn point.
+        candidates.sort(key=lambda p: (p[0], -p[1]))
+        return candidates[0]
+    candidates.sort(key=lambda p: (p[0], p[1]), reverse=True)
     return candidates[0]
 
 
@@ -80,9 +99,110 @@ def _card_name_by_number(card_number: int) -> str:
         return f"{card_number}"
 
 
+def _card_total_cells(card: Card_Single) -> int:
+    # Card shape cell count is rotation-invariant; use 0 degree.
+    matrix = card.get_square_matrix(0)
+    total = 0
+    for row in matrix:
+        for value in row:
+            if value != 0:
+                total += 1
+    return total
+
+
+def _card_is_even_square_anchor_invariant(card: Card_Single) -> bool:
+    matrix = card.get_square_matrix(0)
+    xs: List[int] = []
+    ys: List[int] = []
+    for y in range(8):
+        for x in range(8):
+            if matrix[y][x] != 0:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return False
+    width = max(xs) - min(xs) + 1
+    height = max(ys) - min(ys) + 1
+    if width != height or (width % 2) != 0:
+        return False
+    lp0 = card.get_link_pos(0)
+    return (
+        card.get_link_pos(1) == lp0
+        and card.get_link_pos(2) == lp0
+        and card.get_link_pos(3) == lp0
+    )
+
+
+def _card_bounds(card: Card_Single, rotation: int) -> Tuple[int, int, int, int]:
+    matrix = card.get_square_matrix(rotation)
+    xs: List[int] = []
+    ys: List[int] = []
+    for y in range(8):
+        for x in range(8):
+            if matrix[y][x] != 0:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return (0, 0, 0, 0)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _render_card_matrix_0deg(card: Card_Single) -> List[str]:
+    """Render 8x8 card shape at 0 degree. '*'=special, '■'=fill, ' '=empty."""
+    matrix = card.get_square_matrix(0)
+    out: List[str] = []
+    for row in matrix:
+        chars: List[str] = []
+        for value in row:
+            if value == 2:
+                chars.append("*")
+            elif value == 1:
+                chars.append("■")
+            else:
+                chars.append(".")
+        out.append("".join(chars))
+    return out
+
+
+def _render_all_hand_previews(
+    hand: List[Card_Single],
+    normal_placeable: set[int],
+    sp_placeable: set[int],
+) -> List[str]:
+    """Render 4 card previews in 2x2 layout with compact spacing."""
+    lines: List[str] = []
+    cards: List[Optional[Card_Single]] = [hand[i] if i < len(hand) else None for i in range(4)]
+
+    def _preview(c: Optional[Card_Single]) -> List[str]:
+        if c is None:
+            return ["........"] * 8
+        return _render_card_matrix_0deg(c)
+
+    def _meta(c: Optional[Card_Single]) -> str:
+        if c is None:
+            return "(empty)"
+        n_ok = "N" if c.Number in normal_placeable else "-"
+        s_ok = "S" if c.Number in sp_placeable else "-"
+        return f"{_card_total_cells(c)}#{c.SpecialCost}#{n_ok}{s_ok}"
+
+    p0 = _preview(cards[0])
+    p1 = _preview(cards[1])
+    p2 = _preview(cards[2])
+    p3 = _preview(cards[3])
+
+    for i in range(8):
+        lines.append(f"{p0[i]}  {p1[i]}")
+    lines.append(f"{_meta(cards[0])}  {_meta(cards[1])}")
+    lines.append("")
+    for i in range(8):
+        lines.append(f"{p2[i]}  {p3[i]}")
+    lines.append(f"{_meta(cards[2])}  {_meta(cards[3])}")
+    return lines
+
+
 def _render_grid_choices(
     hand: List[Card_Single],
-    cursor: Tuple[int, int],
+    cursor: Optional[Tuple[int, int]],
     sp: int,
     normal_placeable: Optional[set[int]] = None,
     sp_placeable: Optional[set[int]] = None,
@@ -95,25 +215,31 @@ def _render_grid_choices(
             c = hand[i]
             n_ok = "N" if c.Number in normal_placeable else "-"
             s_ok = "S" if c.Number in sp_placeable else "-"
-            slots.append(f"#{c.Number:03d}(sp{c.SpecialCost},{n_ok}{s_ok})")
+            total_points = _card_total_cells(c)
+            sp_blocks = "■" * max(0, int(c.SpecialCost))
+            sp_text = sp_blocks if sp_blocks else "0"
+            slots.append(f"{total_points}#{sp_text}#{n_ok}{s_ok}")
         else:
             slots.append("(empty)")
 
     rows = [
         [slots[0], slots[1]],
         [slots[2], slots[3]],
-        ["[特殊攻击]", "[跳过]"],
+        ["[跳过]", "[特殊攻击]"],
     ]
+
+    cell_width = max(len(item) for row in rows for item in row) + 4
 
     lines: List[str] = []
     for y in range(3):
         row_text: List[str] = []
         for x in range(2):
             item = rows[y][x]
-            if (x, y) == cursor:
-                row_text.append(f"> {item} <")
+            if cursor is not None and (x, y) == cursor:
+                token = f"> {item} <"
             else:
-                row_text.append(f"  {item}  ")
+                token = f"  {item}  "
+            row_text.append(token.ljust(cell_width))
         lines.append(" | ".join(row_text))
 
     affordable = [c.Number for c in hand if c.SpecialCost <= sp]
@@ -186,17 +312,30 @@ def _simulate_apply_p1(game_map: GameMap, cells: List[Tuple[int, int, int]]) -> 
 def _overlay_preview_lines(
     game_map: GameMap,
     preview_cells: Optional[List[Tuple[int, int, int]]] = None,
+    preview_valid: Optional[bool] = None,
+    preview_use_sp_attack: Optional[bool] = None,
     link_anchor: Optional[Tuple[int, int]] = None,
     view_x0: int = 0,
     view_y0: int = 0,
     view_w: Optional[int] = None,
     view_h: Optional[int] = None,
+    flip_180: bool = False,
 ) -> List[str]:
     overlay: Dict[Tuple[int, int], int] = {}
     if preview_cells:
         for x, y, cell_type in preview_cells:
-            if 0 <= x < game_map.width and 0 <= y < game_map.height:
-                overlay[(x, y)] = cell_type
+            if not (0 <= x < game_map.width and 0 <= y < game_map.height):
+                continue
+            dx = x - view_x0
+            dy = y - view_y0
+            if not (0 <= dx < (view_w if view_w is not None else game_map.width)):
+                continue
+            if not (0 <= dy < (view_h if view_h is not None else game_map.height)):
+                continue
+            if flip_180:
+                dx = (view_w if view_w is not None else game_map.width) - 1 - dx
+                dy = (view_h if view_h is not None else game_map.height) - 1 - dy
+            overlay[(dx, dy)] = cell_type
 
     lines: List[str] = []
     vw = view_w if view_w is not None else game_map.width
@@ -207,20 +346,50 @@ def _overlay_preview_lines(
     # Fixed-width (2 chars) tokens for strict alignment across terminals.
     TOK_SQUARE = "[]"
     TOK_TRI = "/\\"
-    TOK_PREV = "{}"
+    TOK_PREV = "[]"
     TOK_ANCHOR = "<>"
+
+    def _view_to_game(x: int, y: int) -> Tuple[int, int]:
+        if not flip_180:
+            return (x + view_x0, y + view_y0)
+        return (
+            view_x0 + (vw - 1 - x),
+            view_y0 + (vh - 1 - y),
+        )
+
+    def _cell_is_occupied_on_map_layer(x: int, y: int) -> bool:
+        m = int(game_map.get_point(x, y))
+        # Occupied means already has owner bits (fill/special/conflict are all covered).
+        return _is_p1(m) or _is_p2(m)
+
+    def _cell_is_special_or_conflict_on_map_layer(x: int, y: int) -> bool:
+        m = int(game_map.get_point(x, y))
+        return _is_sp(m) or _is_conflict(m)
 
     for y in range(vh):
         row_out = [f"{y:02d}"]
         for x in range(vw):
-            gx = x + view_x0
-            gy = y + view_y0
+            gx, gy = _view_to_game(x, y)
             # link_anchor stays backend-only (not rendered).
-            if (gx, gy) in overlay:
-                if overlay[(gx, gy)] == 2:
-                    row_out.append(_rgb(TOK_TRI, RGB_PREVIEW))
+            if (x, y) in overlay:
+                # preview priority:
+                # 1) occupied rule -> red (highest)
+                # 2) whole preview invalid -> gray all remaining preview cells
+                # 3) normal preview -> green
+                if preview_use_sp_attack:
+                    is_red = _cell_is_special_or_conflict_on_map_layer(gx, gy)
                 else:
-                    row_out.append(_rgb(TOK_PREV, RGB_PREVIEW))
+                    is_red = _cell_is_occupied_on_map_layer(gx, gy)
+                if is_red:
+                    pv_color = RGB_PREVIEW_BAD
+                elif preview_valid is False:
+                    pv_color = RGB_CONFLICT
+                else:
+                    pv_color = RGB_PREVIEW
+                if overlay[(x, y)] == 2:
+                    row_out.append(_rgb(TOK_TRI, pv_color))
+                else:
+                    row_out.append(_rgb(TOK_PREV, pv_color))
                 continue
 
             m = int(game_map.get_point(gx, gy))
@@ -315,18 +484,36 @@ def _logical_overflow_for_anchor(
     logical_h: int,
     view_x0: int,
     view_y0: int,
+    flip_180: bool,
 ) -> Dict[str, int]:
     """Return overflow amount on each side in logical map coordinates."""
-    ex = anchor_logical[0] + view_x0
-    ey = anchor_logical[1] + view_y0
+    ax, ay = anchor_logical
+    if flip_180:
+        ax = logical_w - 1 - ax
+        ay = logical_h - 1 - ay
+    ex = ax + view_x0
+    ey = ay + view_y0
+    if flip_180 and _card_is_even_square_anchor_invariant(card):
+        left, top, right, bottom = _card_bounds(card, rotation)
+        ex += left - right
+        ey += bottom - top
     cells = _card_cells_on_map(card, ex, ey, rotation)
     if not cells:
         return {"left": 0, "right": 0, "top": 0, "bottom": 0}
 
-    min_x = min(x - view_x0 for x, _y, _t in cells)
-    max_x = max(x - view_x0 for x, _y, _t in cells)
-    min_y = min(y - view_y0 for _x, y, _t in cells)
-    max_y = max(y - view_y0 for _x, y, _t in cells)
+    local_points: List[Tuple[int, int]] = []
+    for x, y, _t in cells:
+        lx = x - view_x0
+        ly = y - view_y0
+        if flip_180:
+            lx = logical_w - 1 - lx
+            ly = logical_h - 1 - ly
+        local_points.append((lx, ly))
+
+    min_x = min(x for x, _y in local_points)
+    max_x = max(x for x, _y in local_points)
+    min_y = min(y for _x, y in local_points)
+    max_y = max(y for _x, y in local_points)
 
     return {
         "left": max(0, -min_x),
@@ -374,8 +561,11 @@ def _clamp_anchor(card: Card_Single, rotation: int, game_map: GameMap, anchor: T
 
 
 class TerminalGamepadUI:
-    def __init__(self, state: GameState):
+    def __init__(self, state: GameState, local_player: str = "P1", submit_action_fn=None):
         self.state = state
+        self.local_player = local_player
+        self.enemy_player = "P2" if local_player == "P1" else "P1"
+        self.submit_action_fn = submit_action_fn or step
         self.pad = MAP_PADDING
         # User-facing logical map excludes the padded tolerance border.
         if state.map.width > self.pad * 2 and state.map.height > self.pad * 2:
@@ -394,10 +584,14 @@ class TerminalGamepadUI:
         self.pick_index = 0
         self.pick_pool: List[Card_Single] = []
 
-        initial_engine_anchor = _find_rightmost_self_special_anchor(state.map, is_p1=True)
-        self.initial_anchor = (
-            max(0, min(self.logical_w - 1, initial_engine_anchor[0] - self.view_x0)),
-            max(0, min(self.logical_h - 1, initial_engine_anchor[1] - self.view_y0)),
+        self.initial_anchor = _find_local_view_rightbottom_self_special_anchor(
+            state.map,
+            is_p1=(self.local_player == "P1"),
+            view_x0=self.view_x0,
+            view_y0=self.view_y0,
+            view_w=self.logical_w,
+            view_h=self.logical_h,
+            flip_180=(self.local_player == "P2"),
         )
         self.remembered_anchor: Optional[Tuple[int, int]] = None
 
@@ -405,11 +599,61 @@ class TerminalGamepadUI:
         self.use_sp_attack = False
         self.rotation = 0
         self.anchor = self.initial_anchor
+        self.submitted_action: Optional[Action] = None
+        self.submitted_card: Optional[Card_Single] = None
 
         self.last_message = ""
         self.last_turn_p1_action: Optional[dict] = None
         self.last_turn_p2_action: Optional[dict] = None
         self.surrender_choice_yes = False
+
+    def _uses_flipped_view(self) -> bool:
+        return self.local_player == "P2"
+
+    def _engine_rotation_for_card(self, card: Optional[Card_Single]) -> int:
+        if not self._uses_flipped_view():
+            return self.rotation % 4
+        # Even-square anchor-invariant cards already keep the same effective
+        # link corner after the local-view board flip; applying an extra 180deg
+        # offset would move the apparent link_pos to the opposite corner.
+        if card is not None and _card_is_even_square_anchor_invariant(card):
+            return self.rotation % 4
+        return (self.rotation + 2) % 4
+
+    def _display_rotation_deg(self) -> int:
+        # Rotation is presented in local-view semantics.
+        return (self.rotation % 4) * 90
+
+    def _local_overflow_side_for_key(self, key: str) -> str:
+        return {
+            "LEFT": "left",
+            "RIGHT": "right",
+            "UP": "top",
+            "DOWN": "bottom",
+        }[key]
+
+    def _anchor_to_engine_xy(
+        self,
+        anchor: Optional[Tuple[int, int]] = None,
+        card: Optional[Card_Single] = None,
+        engine_rotation: Optional[int] = None,
+    ) -> Tuple[int, int]:
+        ax, ay = anchor if anchor is not None else self.anchor
+        if self._uses_flipped_view():
+            ax = self.logical_w - 1 - ax
+            ay = self.logical_h - 1 - ay
+        ex = ax + self.view_x0
+        ey = ay + self.view_y0
+        if (
+            self._uses_flipped_view()
+            and card is not None
+            and engine_rotation is not None
+            and _card_is_even_square_anchor_invariant(card)
+        ):
+            left, top, right, bottom = _card_bounds(card, engine_rotation)
+            ex += left - right
+            ey += bottom - top
+        return (ex, ey)
 
     def _deck_snapshot(self, player: str) -> DeckSnapshot:
         ps = self.state.players[player]
@@ -420,26 +664,37 @@ class TerminalGamepadUI:
     def _preview_outcome(self) -> Tuple[Optional[Tuple[int, int]], Optional[str], Optional[Tuple[int, int, int]]]:
         if self.phase != PHASE_PLACE or self.selected_card is None:
             return None, None, None
-        ex = self.anchor[0] + self.view_x0
-        ey = self.anchor[1] + self.view_y0
+        engine_rotation = self._engine_rotation_for_card(self.selected_card)
+        ex, ey = self._anchor_to_engine_xy(card=self.selected_card, engine_rotation=engine_rotation)
         ok, reason, cells = validate_place_card_action(
             card=self.selected_card,
             game_map=self.state.map,
             anchor_x=ex,
             anchor_y=ey,
-            rotation=self.rotation,
-            is_p1=True,
+            rotation=engine_rotation,
+            is_p1=(self.local_player == "P1"),
             use_sp_attack=self.use_sp_attack,
         )
         if not ok:
             return None, reason, None
         p1_now, p2_now = _score_grid(self.state.map)
-        sim_grid = _simulate_apply_p1(self.state.map, cells)
+        sim_grid = [row[:] for row in self.state.map.grid]
+        owner_bit = int(Map_PointBit.IsP1) if self.local_player == "P1" else int(Map_PointBit.IsP2)
+        for x, y, cell_type in cells:
+            if not (0 <= x < self.state.map.width and 0 <= y < self.state.map.height):
+                continue
+            old = int(sim_grid[y][x])
+            if not _is_valid_cell(old):
+                continue
+            new_mask = int(Map_PointBit.IsValid) | owner_bit
+            if cell_type == 2:
+                new_mask |= int(Map_PointBit.IsSp)
+            sim_grid[y][x] = new_mask
         p1_new, p2_new = _score_grid(self.state.map, sim_grid)
         return (p1_new, p2_new), reason, (p1_new - p1_now, p2_new - p2_now, len(cells))
 
     def _has_any_place_for_card(self, card: Card_Single, use_sp_attack: bool) -> bool:
-        if use_sp_attack and self.state.players["P1"].sp < card.SpecialCost:
+        if use_sp_attack and self.state.players[self.local_player].sp < card.SpecialCost:
             return False
         for rot in (0, 1, 2, 3):
             for y in range(self.logical_h):
@@ -447,10 +702,30 @@ class TerminalGamepadUI:
                     ok, _reason, _cells = validate_place_card_action(
                         card=card,
                         game_map=self.state.map,
-                        anchor_x=x + self.view_x0,
-                        anchor_y=y + self.view_y0,
-                        rotation=rot,
-                        is_p1=True,
+                        anchor_x=self._anchor_to_engine_xy(
+                            anchor=(x, y),
+                            card=card,
+                            engine_rotation=(
+                                rot
+                                if (not self._uses_flipped_view() or _card_is_even_square_anchor_invariant(card))
+                                else (rot + 2) % 4
+                            ),
+                        )[0],
+                        anchor_y=self._anchor_to_engine_xy(
+                            anchor=(x, y),
+                            card=card,
+                            engine_rotation=(
+                                rot
+                                if (not self._uses_flipped_view() or _card_is_even_square_anchor_invariant(card))
+                                else (rot + 2) % 4
+                            ),
+                        )[1],
+                        rotation=(
+                            rot
+                            if (not self._uses_flipped_view() or _card_is_even_square_anchor_invariant(card))
+                            else (rot + 2) % 4
+                        ),
+                        is_p1=(self.local_player == "P1"),
                         use_sp_attack=use_sp_attack,
                     )
                     if ok:
@@ -460,7 +735,7 @@ class TerminalGamepadUI:
     def _placeable_sets_for_hand(self) -> Tuple[set[int], set[int]]:
         normal_ok: set[int] = set()
         sp_ok: set[int] = set()
-        for c in self.state.players["P1"].hand:
+        for c in self.state.players[self.local_player].hand:
             if self._has_any_place_for_card(c, use_sp_attack=False):
                 normal_ok.add(c.Number)
             if self._has_any_place_for_card(c, use_sp_attack=True):
@@ -469,32 +744,41 @@ class TerminalGamepadUI:
 
     def _render_right_panel(self) -> List[str]:
         lines = ["[右侧出牌信息]"]
-        if self.selected_card is not None:
-            lines.append(f"己方当前(正面): {_card_name(self.selected_card)}")
+        shown_card = self.selected_card if self.selected_card is not None else self.submitted_card
+        if shown_card is not None:
+            lines.append(f"己方当前(正面): {_card_name(shown_card)}")
             lines.append("对手当前(背面): [CARD BACK]")
         else:
             lines.append("己方当前(正面): (未选择)")
             lines.append("对手当前(背面): (等待)")
 
-        if self.last_turn_p1_action:
-            n1 = self.last_turn_p1_action.get("card_number")
-            lines.append(f"上回合P1: {_card_name_by_number(int(n1)) if n1 is not None else 'PASS'}")
-        if self.last_turn_p2_action:
-            lines.append("上回合P2: [CARD BACK]")
+        my_last = self.last_turn_p1_action if self.local_player == "P1" else self.last_turn_p2_action
+        enemy_last = self.last_turn_p2_action if self.local_player == "P1" else self.last_turn_p1_action
+        if my_last:
+            n1 = my_last.get("card_number")
+            lines.append(f"上回合己方: {_card_name_by_number(int(n1)) if n1 is not None else 'PASS'}")
+        if enemy_last:
+            lines.append("上回合对手: [CARD BACK]")
         return lines
 
     def render(self) -> str:
-        p1 = self.state.players["P1"]
-        p2 = self.state.players["P2"]
+        p1 = self.state.players[self.local_player]
+        p2 = self.state.players[self.enemy_player]
         p1_score, p2_score = _score_grid(self.state.map)
 
         lines: List[str] = []
-        lines.append(f"[对手] P2  SP={p2.sp}")
-        lines.append(f"[我方] P1  SP={p1.sp}")
-        lines.append(f"回合 {self.state.turn}/{self.state.max_turns}  当前比分 P1:{p1_score} P2:{p2_score}")
+        lines.append(f"[对手] {self.enemy_player}  SP={p2.sp}")
+        lines.append(f"[我方] {self.local_player}  SP={p1.sp}")
+        if self.local_player == "P1":
+            my_score, opp_score = p1_score, p2_score
+        else:
+            my_score, opp_score = p2_score, p1_score
+        lines.append(f"回合 {self.state.turn}/{self.state.max_turns}  当前比分 我方:{my_score} 对手:{opp_score}")
         lines.append(f"阶段: {self.phase}")
 
         preview_cells: Optional[List[Tuple[int, int, int]]] = None
+        preview_valid: Optional[bool] = None
+        preview_use_sp_attack: Optional[bool] = None
         link_anchor: Optional[Tuple[int, int]] = None
 
         if self.phase == PHASE_CARD_GRID:
@@ -504,6 +788,12 @@ class TerminalGamepadUI:
             idx = self._cursor_card_index()
             if idx is not None and idx < len(p1.hand):
                 lines.append(f"卡牌名称: {_card_name(p1.hand[idx])}")
+
+        elif self.phase == PHASE_WAITING_RESOLVE:
+            normal_ok, sp_ok = self._placeable_sets_for_hand()
+            lines.append("\n[等待对手确认]")
+            lines.extend(_render_grid_choices(p1.hand, None, p1.sp, normal_placeable=normal_ok, sp_placeable=sp_ok))
+            lines.append("已提交本回合动作，等待双方结算...")
 
         elif self.phase in (PHASE_SP_PICK, PHASE_PASS_PICK):
             pick_title = "特殊攻击选卡" if self.phase == PHASE_SP_PICK else "跳过选卡"
@@ -519,20 +809,22 @@ class TerminalGamepadUI:
             lines.append("\n[放置阶段] 方向键移动link-pos, X顺时针, Y逆时针, A确认, B取消")
             lines.append(f"当前卡: {_card_name(self.selected_card)}")
             lines.append(f"模式: {'SP攻击' if self.use_sp_attack else '普通放置'}")
-            lines.append(f"rotation={self.rotation * 90}°")
-            ex = self.anchor[0] + self.view_x0
-            ey = self.anchor[1] + self.view_y0
+            lines.append(f"rotation={self._display_rotation_deg()}°")
+            engine_rotation = self._engine_rotation_for_card(self.selected_card)
+            ex, ey = self._anchor_to_engine_xy(card=self.selected_card, engine_rotation=engine_rotation)
             ok, reason, cells = validate_place_card_action(
                 card=self.selected_card,
                 game_map=self.state.map,
                 anchor_x=ex,
                 anchor_y=ey,
-                rotation=self.rotation,
-                is_p1=True,
+                rotation=engine_rotation,
+                is_p1=(self.local_player == "P1"),
                 use_sp_attack=self.use_sp_attack,
             )
             lines.append(f"可放置: {ok} ({reason})")
-            preview_cells = _card_cells_on_map(self.selected_card, ex, ey, self.rotation)
+            preview_cells = _card_cells_on_map(self.selected_card, ex, ey, engine_rotation)
+            preview_valid = ok
+            preview_use_sp_attack = self.use_sp_attack
             link_anchor = None
 
             predicted, _, deltas = self._preview_outcome()
@@ -545,7 +837,7 @@ class TerminalGamepadUI:
                 lines.append("预估落子后比分: 无效位置，无法计算")
 
             # Keep SP overwrite hint for both normal/SP placement as requested
-            self_delta, enemy_delta = _simulate_sp_delta(self.state.map, cells, is_p1=True)
+            self_delta, enemy_delta = _simulate_sp_delta(self.state.map, cells, is_p1=(self.local_player == "P1"))
             lines.append(f"覆盖预估: 敌方被覆盖 {enemy_delta}格, 己方被覆盖 {self_delta}格")
         elif self.phase == PHASE_SURRENDER_CONFIRM:
             yes = "> 是 <" if self.surrender_choice_yes else "  是  "
@@ -553,21 +845,32 @@ class TerminalGamepadUI:
             lines.append("\n[投降确认] 左右选择，A确认，B取消")
             lines.append(f"{yes}   |   {no}")
 
+        if self.phase == PHASE_WAITING_RESOLVE and self.submitted_action is not None:
+            if not self.submitted_action.pass_turn and self.submitted_card is not None:
+                ex = int(self.submitted_action.x or 0)
+                ey = int(self.submitted_action.y or 0)
+                preview_cells = _card_cells_on_map(self.submitted_card, ex, ey, self.submitted_action.rotation)
+                preview_valid = True
+                preview_use_sp_attack = self.submitted_action.use_sp_attack
+            else:
+                preview_cells = None
+                preview_valid = None
+                preview_use_sp_attack = None
+
         lines.append("\n" + "\n".join(self._render_right_panel()))
-        lines.append("\n[地图预览] 图例: []普通格  /\\激活special  {}预览fill")
-        lines.append(
-            "颜色: 己方SP(255,192,0) 己方Fill(255,255,0) 敌方Fill(0,112,192) "
-            "敌方SP(0,176,240) 冲突(128,128,128) 可放置空格(0,0,0)"
-        )
+        lines.append("\n[地图预览]")
         lines.extend(
             _overlay_preview_lines(
                 self.state.map,
                 preview_cells=preview_cells,
+                preview_valid=preview_valid,
+                preview_use_sp_attack=preview_use_sp_attack,
                 link_anchor=link_anchor,
                 view_x0=self.view_x0,
                 view_y0=self.view_y0,
                 view_w=self.logical_w,
                 view_h=self.logical_h,
+                flip_180=self._uses_flipped_view(),
             )
         )
 
@@ -577,15 +880,18 @@ class TerminalGamepadUI:
         return "\n".join(lines)
 
     def render_deck_page(self) -> str:
-        s1 = self._deck_snapshot("P1")
-        s2 = self._deck_snapshot("P2")
+        s1 = self._deck_snapshot(self.local_player)
+        s2 = self._deck_snapshot(self.enemy_player)
+        undrawn_self = [c.Number for c in self.state.players[self.local_player].draw_pile]
         lines = ["[牌组状态页]"]
-        lines.append(f"P1 手牌: {s1.hand}")
-        lines.append(f"P1 已使用: {s1.used}")
-        lines.append(f"P1 剩余牌堆: {[c.Number for c in self.state.players['P1'].draw_pile]}")
-        lines.append(f"P2 手牌数量: {len(self.state.players['P2'].hand)}")
-        lines.append(f"P2 已使用: {s2.used}")
-        lines.append(f"P2 剩余牌堆数量: {len(self.state.players['P2'].draw_pile)}")
+        lines.append(f"己方 总卡组: {s1.initial}")
+        lines.append(f"己方 已出: {s1.used}")
+        lines.append(f"己方 手牌: {s1.hand}")
+        lines.append(f"己方 未抽到: {undrawn_self}")
+        lines.append(f"对手 总卡组数量: {len(s2.initial)}")
+        lines.append(f"对手 手牌数量: {len(self.state.players[self.enemy_player].hand)}")
+        lines.append(f"对手 已出: {s2.used}")
+        lines.append(f"对手 未抽到数量: {len(self.state.players[self.enemy_player].draw_pile)}")
         return "\n".join(lines)
 
     def _cursor_card_index(self) -> Optional[int]:
@@ -595,10 +901,10 @@ class TerminalGamepadUI:
         return y * 2 + x
 
     def _cursor_is_special_button(self) -> bool:
-        return self.cursor == (0, 2)
+        return self.cursor == (1, 2)
 
     def _cursor_is_pass_button(self) -> bool:
-        return self.cursor == (1, 2)
+        return self.cursor == (0, 2)
 
     def _enter_place_phase(self, card: Card_Single, use_sp_attack: bool) -> None:
         self.selected_card = card
@@ -615,46 +921,68 @@ class TerminalGamepadUI:
     def _on_turn_resolved(self, payload: dict) -> None:
         self.last_turn_p1_action = payload.get("p1_action") if isinstance(payload, dict) else None
         self.last_turn_p2_action = payload.get("p2_action") if isinstance(payload, dict) else None
-
-    def _commit_action(self) -> bool:
-        assert self.selected_card is not None
-        action = Action(
-            player="P1",
-            card_number=self.selected_card.Number,
-            pass_turn=False,
-            use_sp_attack=self.use_sp_attack,
-            rotation=self.rotation,
-            x=self.anchor[0] + self.view_x0,
-            y=self.anchor[1] + self.view_y0,
-        )
-        ok, reason, payload = step(self.state, action)
-        if not ok:
-            self.last_message = f"提交失败: {reason}"
-            return False
-        if reason == "TURN_RESOLVED" and isinstance(payload, dict):
-            self._on_turn_resolved(payload)
         self.phase = PHASE_CARD_GRID
+        self.cursor = (0, 0)
+        self.pick_index = 0
+        self.pick_pool = []
         self.selected_card = None
         self.use_sp_attack = False
         self.rotation = 0
-        self.last_message = f"回合动作已确认: {reason}"
+        self.submitted_action = None
+        self.submitted_card = None
+
+    def _commit_action(self) -> bool:
+        assert self.selected_card is not None
+        submitting_card = self.selected_card
+        ex, ey = self._anchor_to_engine_xy(card=submitting_card, engine_rotation=self._engine_rotation_for_card(submitting_card))
+        action = Action(
+            player=self.local_player,
+            card_number=submitting_card.Number,
+            pass_turn=False,
+            use_sp_attack=self.use_sp_attack,
+            rotation=self._engine_rotation_for_card(submitting_card),
+            x=ex,
+            y=ey,
+        )
+        ok, reason, payload = self.submit_action_fn(self.state, action)
+        if not ok:
+            self.last_message = f"提交失败: {reason}"
+            return False
+        self.submitted_action = action
+        self.submitted_card = submitting_card
+        if reason == "TURN_RESOLVED" and isinstance(payload, dict):
+            self._on_turn_resolved(payload)
+        else:
+            self.phase = PHASE_WAITING_RESOLVE
+            self.selected_card = None
+            self.pick_pool = []
+            self.pick_index = 0
+            self.last_message = "已提交动作，等待对手..."
+        self.last_message = f"回合动作已确认: {reason}" if reason == "TURN_RESOLVED" else "已提交动作，等待对手..."
         return True
 
     def _commit_pass(self, card: Card_Single) -> bool:
-        action = Action(player="P1", card_number=card.Number, pass_turn=True)
-        ok, reason, payload = step(self.state, action)
+        action = Action(player=self.local_player, card_number=card.Number, pass_turn=True)
+        ok, reason, payload = self.submit_action_fn(self.state, action)
         if not ok:
             self.last_message = f"跳过失败: {reason}"
             return False
+        self.submitted_action = action
+        self.submitted_card = card
         if reason == "TURN_RESOLVED" and isinstance(payload, dict):
             self._on_turn_resolved(payload)
-        self.phase = PHASE_CARD_GRID
-        self.last_message = f"跳过已确认: {reason}"
+            self.last_message = f"跳过已确认: {reason}"
+        else:
+            self.phase = PHASE_WAITING_RESOLVE
+            self.pick_pool = []
+            self.pick_index = 0
+            self.selected_card = None
+            self.last_message = "已提交跳过，等待对手..."
         return True
 
     def _commit_surrender(self) -> bool:
-        action = Action(player="P1", surrender=True)
-        ok, reason, payload = step(self.state, action)
+        action = Action(player=self.local_player, surrender=True)
+        ok, reason, payload = self.submit_action_fn(self.state, action)
         if not ok:
             self.last_message = f"投降失败: {reason}"
             return False
@@ -668,6 +996,12 @@ class TerminalGamepadUI:
         if key == "=":
             key = "+"
         if not key:
+            return None
+
+        if self.phase == PHASE_WAITING_RESOLVE:
+            if key == "L":
+                return self.render_deck_page()
+            self.last_message = "已提交动作，等待双方结算"
             return None
 
         if key == "+" and self.phase != PHASE_SURRENDER_CONFIRM:
@@ -714,7 +1048,7 @@ class TerminalGamepadUI:
                 self.last_message = "卡牌选择阶段仅支持 方向键/A/L"
                 return None
 
-            p1 = self.state.players["P1"]
+            p1 = self.state.players[self.local_player]
             if self._cursor_is_special_button():
                 affordable = [c for c in p1.hand if c.SpecialCost <= p1.sp and self._has_any_place_for_card(c, use_sp_attack=True)]
                 if not affordable:
@@ -790,26 +1124,26 @@ class TerminalGamepadUI:
                     cur_of = _logical_overflow_for_anchor(
                         self.selected_card,
                         self.anchor,
-                        self.rotation,
+                        self._engine_rotation_for_card(self.selected_card),
                         self.logical_w,
                         self.logical_h,
                         self.view_x0,
                         self.view_y0,
+                        self._uses_flipped_view(),
                     )
                     new_of = _logical_overflow_for_anchor(
                         self.selected_card,
                         cand,
-                        self.rotation,
+                        self._engine_rotation_for_card(self.selected_card),
                         self.logical_w,
                         self.logical_h,
                         self.view_x0,
                         self.view_y0,
+                        self._uses_flipped_view(),
                     )
+                    local_side = self._local_overflow_side_for_key(key)
                     blocked = (
-                        (key == "LEFT" and new_of["left"] > cur_of["left"]) or
-                        (key == "RIGHT" and new_of["right"] > cur_of["right"]) or
-                        (key == "UP" and new_of["top"] > cur_of["top"]) or
-                        (key == "DOWN" and new_of["bottom"] > cur_of["bottom"])
+                        new_of[local_side] > cur_of[local_side]
                     )
                     if not blocked:
                         self.anchor = cand

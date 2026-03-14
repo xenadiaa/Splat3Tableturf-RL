@@ -20,8 +20,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.engine.env_core import init_state
+from src.engine.env_core import init_state, step
 from src.engine.loaders import load_map
+from src.strategy import load_strategy_config
+from src.strategy.registry import choose_action_from_strategy_id
 from src.utils.deck_utils import (
     deck_display_name,
     load_deck_cards_by_rowid,
@@ -382,6 +384,13 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
     popup: str | None = None
 
     while True:
+        cfg = load_strategy_config()
+        p1_auto = cfg["auto_battle"]["p1"]
+        if p1_auto.get("enabled") and "P1" not in state.pending_actions and not state.done:
+            auto_action = choose_action_from_strategy_id(state, "P1", str(p1_auto["strategy_id"]))
+            ok, reason, _payload = step(state, auto_action)
+            if ok:
+                popup = f"自动出牌: {reason}"
         _clear()
         print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  +=投降")
         print(ui.render())
@@ -430,6 +439,14 @@ def _run_game_line_input(args: argparse.Namespace, conf: Dict[str, object]) -> i
     ui = TerminalGamepadUI(state)
     print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  +=投降")
     while not state.done:
+        cfg = load_strategy_config()
+        p1_auto = cfg["auto_battle"]["p1"]
+        if p1_auto.get("enabled") and "P1" not in state.pending_actions:
+            auto_action = choose_action_from_strategy_id(state, "P1", str(p1_auto["strategy_id"]))
+            ok, reason, payload = step(state, auto_action)
+            if ok:
+                print(f"\n自动出牌: {reason} {payload}")
+                continue
         print("\n" + "=" * 80)
         print(ui.render())
         raw = input("输入按键: ").strip()

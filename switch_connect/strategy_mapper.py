@@ -6,7 +6,7 @@ from typing import Dict, Optional
 from src.engine.env_core import GameState, PlayerState, _score_bot_action, legal_actions
 from src.engine.loaders import load_map
 from src.utils.common_utils import create_card_from_id
-from switch_connect.vision_capture.state_types import ObservedState
+from vision_capture.state_types import ObservedState
 
 
 DEFAULT_STYLE_BY_MAP: Dict[str, str] = {

@@ -1,0 +1,16 @@
+{
+  "map_id": "Zigzag",
+  "map_name": "雷霆车站",
+  "npc_rowid": "MiniGame_GearShopHead",
+  "npc_name": "GearShopHead",
+  "npc_level": 2,
+  "p1_deck": "player:雷霆车站",
+  "p2_deck": "MiniGame_GearShopHead",
+  "bot_style": "balanced",
+  "bot_level": "high",
+  "eval_episodes": 20,
+  "win_rate": 0.0,
+  "draw_rate": 0.0,
+  "loss_rate": 1.0,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/Zigzag"
+}

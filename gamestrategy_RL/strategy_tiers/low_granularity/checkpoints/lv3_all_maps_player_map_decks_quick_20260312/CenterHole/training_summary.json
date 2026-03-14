@@ -1,0 +1,25 @@
+{
+  "utc": "2026-03-12T12:21:08Z",
+  "run_name": "train_CenterHole_vs_MiniGame_GearShopClothes_Fsodr",
+  "total_updates": 1,
+  "total_steps_seen": 256,
+  "total_elapsed_sec": 125.28790497779846,
+  "final_recent_mean_ep_reward": -4.65,
+  "final_recent_win_rate": 0.047619047619047616,
+  "episodes_finished": 21,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/CenterHole",
+  "run_config": {
+    "mode": "train_all_maps_vs_lv3_npc",
+    "map_id": "CenterHole",
+    "map_name": "轻飘湖",
+    "p1_deck": "player:轻飘湖",
+    "p2_deck": "MiniGame_GearShopClothes_Fsodr",
+    "bot_style": "balanced",
+    "bot_level": "high",
+    "npc_rowid": "MiniGame_GearShopClothes_Fsodr",
+    "npc_name": "GearShopClothes_Fsodr",
+    "npc_level": 2,
+    "seed": 51,
+    "resume_checkpoint": ""
+  }
+}

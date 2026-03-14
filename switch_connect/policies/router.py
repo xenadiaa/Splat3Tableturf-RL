@@ -4,7 +4,7 @@ from typing import Optional
 
 from switch_connect.policies.engine_policy import choose_action_engine
 from switch_connect.policies.nn_policy import choose_action_nn_command, choose_action_nn_module
-from switch_connect.vision_capture.state_types import ObservedState
+from vision_capture.state_types import ObservedState
 
 
 def choose_action(

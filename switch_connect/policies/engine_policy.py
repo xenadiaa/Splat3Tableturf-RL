@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 from switch_connect.strategy_mapper import choose_action_from_observation
-from switch_connect.vision_capture.state_types import ObservedState
+from vision_capture.state_types import ObservedState
 
 
 def choose_action_engine(

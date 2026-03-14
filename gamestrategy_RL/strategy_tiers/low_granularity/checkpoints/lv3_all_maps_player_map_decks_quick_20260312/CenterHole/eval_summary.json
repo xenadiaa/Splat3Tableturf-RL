@@ -1,0 +1,16 @@
+{
+  "map_id": "CenterHole",
+  "map_name": "轻飘湖",
+  "npc_rowid": "MiniGame_GearShopClothes_Fsodr",
+  "npc_name": "GearShopClothes_Fsodr",
+  "npc_level": 2,
+  "p1_deck": "player:轻飘湖",
+  "p2_deck": "MiniGame_GearShopClothes_Fsodr",
+  "bot_style": "balanced",
+  "bot_level": "high",
+  "eval_episodes": 20,
+  "win_rate": 0.1,
+  "draw_rate": 0.0,
+  "loss_rate": 0.9,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/CenterHole"
+}

@@ -1,0 +1,25 @@
+{
+  "utc": "2026-03-12T12:08:32Z",
+  "run_name": "train_WDiamond_vs_MiniGame_JudgeJr",
+  "total_updates": 1,
+  "total_steps_seen": 256,
+  "total_elapsed_sec": 52.04414987564087,
+  "final_recent_mean_ep_reward": -6.175,
+  "final_recent_win_rate": 0.0,
+  "episodes_finished": 21,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/WDiamond",
+  "run_config": {
+    "mode": "train_all_maps_vs_lv3_npc",
+    "map_id": "WDiamond",
+    "map_name": "双子岛",
+    "p1_deck": "player:双子岛",
+    "p2_deck": "MiniGame_JudgeJr",
+    "bot_style": "balanced",
+    "bot_level": "high",
+    "npc_rowid": "MiniGame_JudgeJr",
+    "npc_name": "JudgeJr",
+    "npc_level": 2,
+    "seed": 43,
+    "resume_checkpoint": ""
+  }
+}

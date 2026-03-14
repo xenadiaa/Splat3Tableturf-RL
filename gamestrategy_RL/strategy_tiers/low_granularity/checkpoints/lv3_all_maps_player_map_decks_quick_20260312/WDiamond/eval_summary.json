@@ -1,0 +1,16 @@
+{
+  "map_id": "WDiamond",
+  "map_name": "双子岛",
+  "npc_rowid": "MiniGame_JudgeJr",
+  "npc_name": "JudgeJr",
+  "npc_level": 2,
+  "p1_deck": "player:双子岛",
+  "p2_deck": "MiniGame_JudgeJr",
+  "bot_style": "balanced",
+  "bot_level": "high",
+  "eval_episodes": 20,
+  "win_rate": 0.4,
+  "draw_rate": 0.05,
+  "loss_rate": 0.55,
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/lv3_all_maps_player_map_decks_quick_20260312/WDiamond"
+}

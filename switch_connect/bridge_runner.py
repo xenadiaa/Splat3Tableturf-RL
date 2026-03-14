@@ -20,7 +20,7 @@ from switch_connect.virtual_gamepad.input_mapper import compile_action_to_remote
 from switch_connect.virtual_gamepad.serial_controller import SerialRemoteController
 from switch_connect.virtual_gamepad.device_discovery import list_serial_port_labels, parse_device_from_label
 from switch_connect.ui.terminal_select import choose_with_arrows
-from switch_connect.vision_capture.state_types import ObservedState
+from vision_capture.state_types import ObservedState
 
 
 def _parse_args() -> argparse.Namespace:
