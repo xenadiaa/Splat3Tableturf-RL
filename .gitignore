@@ -26,3 +26,5 @@
 /autocontroller_rebuild_for_RL/__pycache__
 /tableturf_sim/src/strategy/__pycache__
 /tableturf_sim/src/view/__pycache__
+**/__pycache__/
+*.pyc
