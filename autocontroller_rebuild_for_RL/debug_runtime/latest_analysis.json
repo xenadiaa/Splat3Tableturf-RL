@@ -1,0 +1,28 @@
+{
+  "kind": "playable_poll",
+  "playable_result": {
+    "playable": false,
+    "roi_abs": [
+      20,
+      111,
+      262,
+      159
+    ],
+    "gray_ratio": 0.0,
+    "dark_text_ratio": 1.0,
+    "mean_bgr": [
+      54.1634499975995,
+      20.219045561476786,
+      26.37034903259878
+    ],
+    "banner_bbox_abs": [],
+    "banner_rect_ratio": 0.0,
+    "frame_shape": [
+      1080,
+      1920,
+      3
+    ],
+    "p1_sp": 0
+  },
+  "p1_sp": 0
+}

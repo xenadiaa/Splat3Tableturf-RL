@@ -1,2 +1,0 @@
-event,utc,update,total_updates,steps_seen,policy_loss,value_loss,entropy,mean_ep_reward,win_rate,elapsed_sec,component_breakthrough,component_compression,component_fortify,component_sp_setup,component_sp_attack
-update,2026-03-14T17:58:48Z,1,1,16,0.00031366944313049316,1.6981361508369446,4.053482413291931,2.608034432226634,0.0,2.693594217300415,0.0,0.735625,0.0,0.0,0.0023750000000000004

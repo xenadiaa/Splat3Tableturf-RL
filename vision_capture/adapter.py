@@ -5,10 +5,11 @@ import os
 import re
 import select
 import subprocess
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -57,6 +58,27 @@ def list_avfoundation_video_devices() -> List[str]:
         if m:
             names.append(m.group(1).strip())
     return names
+
+
+def list_avfoundation_video_device_rows() -> List[Dict[str, str]]:
+    cmd = ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""]
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    text = (proc.stderr or "") + (proc.stdout or "")
+    rows: List[Dict[str, str]] = []
+    in_video = False
+    for line in text.splitlines():
+        if "AVFoundation video devices" in line:
+            in_video = True
+            continue
+        if "AVFoundation audio devices" in line:
+            in_video = False
+            continue
+        if not in_video:
+            continue
+        m = re.search(r"\[(\d+)\]\s+(.+)$", line.strip())
+        if m:
+            rows.append({"index": m.group(1).strip(), "name": m.group(2).strip()})
+    return rows
 
 
 def is_usb_capture_device_name(name: str) -> bool:
@@ -109,17 +131,35 @@ class FFmpegCaptureSource:
         width: int = 1920,
         height: int = 1080,
         fps: int = 30,
+        pixel_format: str = "",
         strict_usb_only: bool = True,
     ):
         self.device_name = device_name
         self.width = width
         self.height = height
         self.fps = fps
+        self.pixel_format = pixel_format
         self.strict_usb_only = strict_usb_only
         self._proc: Optional[subprocess.Popen] = None
         self._frame_bytes = self.width * self.height * 3
         self._rx_buffer = bytearray()
         self.last_error: Optional[str] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stop_reader = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_ts: float = 0.0
+        self._active_capture_spec: Optional[Dict[str, object]] = None
+
+    def _resolve_video_input_name(self) -> str:
+        name = str(self.device_name or "").strip()
+        if name.isdigit():
+            return f"{name}:none"
+        rows = list_avfoundation_video_device_rows()
+        for row in rows:
+            if row["name"] == name:
+                return f"{row['index']}:none"
+        return f"{name}:none"
 
     def start(self) -> None:
         if self._proc is not None:
@@ -127,7 +167,14 @@ class FFmpegCaptureSource:
         if self.strict_usb_only and not is_usb_capture_device_name(self.device_name):
             self.last_error = f"DEVICE_REJECTED_NOT_USB_CAPTURE:{self.device_name}"
             raise ValueError(self.last_error)
-        inp = f"{self.device_name}:none"
+        inp = self._resolve_video_input_name()
+        self._active_capture_spec = {
+            "input": inp,
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "pixel_format": self.pixel_format,
+        }
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -148,6 +195,8 @@ class FFmpegCaptureSource:
             "rawvideo",
             "pipe:1",
         ]
+        if self.pixel_format:
+            cmd[7:7] = ["-pixel_format", self.pixel_format]
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -159,6 +208,24 @@ class FFmpegCaptureSource:
             os.set_blocking(self._proc.stdout.fileno(), False)
         if self._proc.stderr is not None:
             os.set_blocking(self._proc.stderr.fileno(), False)
+        self._stop_reader.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, name="ffmpeg-capture-reader", daemon=True)
+        self._reader_thread.start()
+
+    def restart_with(self, width: int, height: int, pixel_format: str) -> None:
+        self.stop()
+        self.width = int(width)
+        self.height = int(height)
+        self.pixel_format = str(pixel_format)
+        self._frame_bytes = self.width * self.height * 3
+        self._rx_buffer = bytearray()
+        self.start()
+
+    @property
+    def active_capture_spec(self) -> Optional[Dict[str, object]]:
+        if self._active_capture_spec is None:
+            return None
+        return dict(self._active_capture_spec)
 
     def _stderr_tail(self, max_bytes: int = 4096) -> str:
         if self._proc is None or self._proc.stderr is None:
@@ -198,59 +265,100 @@ class FFmpegCaptureSource:
         del self._rx_buffer[: self._frame_bytes]
         return np.frombuffer(frame_bytes, dtype=np.uint8).reshape((self.height, self.width, 3))
 
+    def _reader_loop(self) -> None:
+        while not self._stop_reader.is_set():
+            proc = self._proc
+            if proc is None:
+                return
+            got = self._read_from_pipe_once(0.5)
+            if not got:
+                proc = self._proc
+                if proc is None:
+                    return
+                rc = proc.poll()
+                if rc is not None:
+                    tail = self._stderr_tail()
+                    self.last_error = f"FFMPEG_EXITED({rc}) {tail}".strip()
+                    return
+                continue
+            while True:
+                frame = self._pop_frame()
+                if frame is None:
+                    break
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+                    self._latest_frame_ts = time.monotonic()
+                    self.last_error = None
+
     def read(self, timeout_seconds: float = 5.0) -> Optional[np.ndarray]:
         if self._proc is None:
             self.start()
-        assert self._proc is not None
         deadline = time.monotonic() + max(0.1, timeout_seconds)
         while True:
-            frame = self._pop_frame()
+            with self._frame_lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            if frame is not None:
+                return frame
+            if time.monotonic() >= deadline:
+                self.last_error = f"FRAME_TIMEOUT({timeout_seconds}s)"
+                return None
+            time.sleep(0.02)
+
+    def read_next(self, after_ts: float = 0.0, timeout_seconds: float = 5.0) -> Optional[np.ndarray]:
+        if self._proc is None:
+            self.start()
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        while True:
+            with self._frame_lock:
+                frame_ts = self._latest_frame_ts
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            if frame is not None and frame_ts > after_ts:
+                self.last_error = None
+                return frame
+            if time.monotonic() >= deadline:
+                self.last_error = f"FRAME_TIMEOUT({timeout_seconds}s)"
+                return None
+            time.sleep(0.02)
+
+    @property
+    def latest_frame_ts(self) -> float:
+        with self._frame_lock:
+            return float(self._latest_frame_ts)
+
+    def read_with_fallbacks(
+        self,
+        timeout_seconds: float = 5.0,
+        fallback_specs: Optional[List[Dict[str, object]]] = None,
+    ) -> Optional[np.ndarray]:
+        frame = self.read(timeout_seconds=timeout_seconds)
+        if frame is not None:
+            return frame
+        specs = fallback_specs or []
+        for spec in specs:
+            self.restart_with(
+                width=int(spec.get("width", self.width)),
+                height=int(spec.get("height", self.height)),
+                pixel_format=str(spec.get("pixel_format", self.pixel_format)),
+            )
+            frame = self.read(timeout_seconds=timeout_seconds)
             if frame is not None:
                 self.last_error = None
                 return frame
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.last_error = f"FRAME_TIMEOUT({timeout_seconds}s)"
-                return None
-            if not self._read_from_pipe_once(remaining):
-                rc = self._proc.poll()
-                tail = self._stderr_tail()
-                if rc is None and remaining > 0:
-                    # No new bytes yet; continue polling until timeout.
-                    continue
-                if rc is None:
-                    self.last_error = "NO_DATA_FROM_CAPTURE_SOURCE"
-                else:
-                    self.last_error = f"FFMPEG_EXITED({rc}) {tail}".strip()
-                return None
+        return None
 
     def read_latest(self, timeout_seconds: float = 5.0, drain_ms: int = 50) -> Optional[np.ndarray]:
-        """
-        Return the freshest frame by draining buffered stale frames.
-        """
-        frame = self.read(timeout_seconds=timeout_seconds)
-        if frame is None:
-            return None
-        latest = frame
-
-        drain_deadline = time.monotonic() + max(0.0, drain_ms / 1000.0)
-        while time.monotonic() < drain_deadline:
-            got = self._read_from_pipe_once(0.0)
-            if not got:
-                break
-            while True:
-                newer = self._pop_frame()
-                if newer is None:
-                    break
-                latest = newer
-        self.last_error = None
-        return latest
+        del drain_ms
+        return self.read(timeout_seconds=timeout_seconds)
 
     def stop(self) -> None:
         if self._proc is None:
             return
         proc = self._proc
         self._proc = None
+        self._stop_reader.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
         try:
             proc.terminate()
         except Exception:
@@ -287,3 +395,6 @@ class FFmpegCaptureSource:
                 proc.stderr.close()
             except Exception:
                 pass
+        with self._frame_lock:
+            self._latest_frame = None
+            self._latest_frame_ts = 0.0

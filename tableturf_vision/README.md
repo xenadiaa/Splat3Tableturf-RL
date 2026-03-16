@@ -28,4 +28,14 @@ SP detection:
 - use `tableturf_vision.sp_detector.get_sp_count_frame(...)` or
   `tableturf_vision.sp_detector.get_sp_count_image_path(...)`
 
+Map-state detection:
+- reference images: `tableturf_vision/参照基础/<地图名>.png`
+- point-confirmation images: `tableturf_vision/参照基础_坐标点确定/<地图名>.png`
+- the current implementation extracts pure-green circle coordinates for all 15 maps
+- labels supported per point: `p1_fill`, `p2_fill`, `p1_special`, `p2_special`, `conflict`, `transparent`
+- use `tableturf_vision.map_state_detector.detect_map_state(...)` or
+  `tableturf_vision.map_state_detector.detect_map_state_image_path(...)`
+- use `tableturf_vision/map_state_detector.py --print-grid` to view a terminal map-structure preview
+- use `tableturf_vision/map_state_menu.py` for an interactive map-selection menu
+
 This package intentionally excludes device capture and controller output.

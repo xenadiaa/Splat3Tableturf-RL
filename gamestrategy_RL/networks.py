@@ -71,4 +71,3 @@ class PolicyValueNet(nn.Module):
         logits = self.action_head(torch.cat([expanded_state, action_features], dim=-1)).squeeze(-1)
         value = self.value_head(state_emb).squeeze(-1)
         return logits, value
-

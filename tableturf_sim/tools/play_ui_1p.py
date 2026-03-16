@@ -50,6 +50,7 @@ LEVEL_TO_BOT_LEVEL = {
     1: "mid",
     2: "high",
 }
+MANUAL_AUTO_STRATEGY_ID = "default:aggressive:high"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CSI_ARROW_RE = re.compile(r"^(?:\[|O)(?:[0-9;]*)([ABCD])")
 _KEY_BUFFER: deque[str] = deque()
@@ -386,13 +387,15 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
     while True:
         cfg = load_strategy_config()
         p1_auto = cfg["auto_battle"]["p1"]
-        if p1_auto.get("enabled") and "P1" not in state.pending_actions and not state.done:
-            auto_action = choose_action_from_strategy_id(state, "P1", str(p1_auto["strategy_id"]))
-            ok, reason, _payload = step(state, auto_action)
-            if ok:
-                popup = f"自动出牌: {reason}"
+        p1_ready = "P1" not in state.pending_actions and not state.done
+        p1_nn_strategy_id = str(p1_auto.get("strategy_id", ""))
+        p1_nn_ready = bool(p1_auto.get("enabled")) and p1_ready and p1_nn_strategy_id.startswith("nn:")
         _clear()
-        print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  +=投降")
+        print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  m激进一步  n神经网络一步  +=投降")
+        if p1_ready:
+            print(f"自动对战: 按 m 执行一步策略 ({MANUAL_AUTO_STRATEGY_ID})")
+        if p1_nn_ready:
+            print(f"神经网络: 按 n 执行一步策略 ({p1_nn_strategy_id})")
         print(ui.render())
         if popup:
             print("\n" + "-" * 32)
@@ -407,6 +410,23 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
             popup = None
             if state.done:
                 return 0
+            continue
+
+        if p1_ready and k == "m":
+            try:
+                auto_action = choose_action_from_strategy_id(state, "P1", MANUAL_AUTO_STRATEGY_ID)
+                ok, reason, _payload = step(state, auto_action)
+                popup = f"自动出牌: {reason}" if ok else f"自动出牌失败: {reason}"
+            except Exception as exc:
+                popup = f"自动策略加载失败: {exc}"
+            continue
+        if p1_nn_ready and k == "n":
+            try:
+                auto_action = choose_action_from_strategy_id(state, "P1", p1_nn_strategy_id)
+                ok, reason, _payload = step(state, auto_action)
+                popup = f"神经网络出牌: {reason}" if ok else f"神经网络出牌失败: {reason}"
+            except Exception as exc:
+                popup = f"神经网络策略加载失败: {exc}"
             continue
 
         out = ui.handle_key(k)
@@ -437,20 +457,38 @@ def _run_game_line_input(args: argparse.Namespace, conf: Dict[str, object]) -> i
     )
 
     ui = TerminalGamepadUI(state)
-    print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  +=投降")
+    print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  m自动一步  +=投降")
     while not state.done:
         cfg = load_strategy_config()
         p1_auto = cfg["auto_battle"]["p1"]
-        if p1_auto.get("enabled") and "P1" not in state.pending_actions:
-            auto_action = choose_action_from_strategy_id(state, "P1", str(p1_auto["strategy_id"]))
-            ok, reason, payload = step(state, auto_action)
-            if ok:
-                print(f"\n自动出牌: {reason} {payload}")
-                continue
+        p1_ready = "P1" not in state.pending_actions
+        p1_nn_strategy_id = str(p1_auto.get("strategy_id", ""))
+        p1_nn_ready = bool(p1_auto.get("enabled")) and p1_ready and p1_nn_strategy_id.startswith("nn:")
         print("\n" + "=" * 80)
+        print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  m激进一步  n神经网络一步  +=投降")
+        if p1_ready:
+            print(f"自动对战: 按 m 执行一步策略 ({MANUAL_AUTO_STRATEGY_ID})")
+        if p1_nn_ready:
+            print(f"神经网络: 按 n 执行一步策略 ({p1_nn_strategy_id})")
         print(ui.render())
         raw = input("输入按键: ").strip()
         if not raw:
+            continue
+        if p1_ready and raw == "m":
+            try:
+                auto_action = choose_action_from_strategy_id(state, "P1", MANUAL_AUTO_STRATEGY_ID)
+                ok, reason, payload = step(state, auto_action)
+                print(f"\n自动出牌{'成功' if ok else '失败'}: {reason} {payload}")
+            except Exception as exc:
+                print(f"\n自动策略加载失败: {exc}")
+            continue
+        if p1_nn_ready and raw == "n":
+            try:
+                auto_action = choose_action_from_strategy_id(state, "P1", p1_nn_strategy_id)
+                ok, reason, payload = step(state, auto_action)
+                print(f"\n神经网络出牌{'成功' if ok else '失败'}: {reason} {payload}")
+            except Exception as exc:
+                print(f"\n神经网络策略加载失败: {exc}")
             continue
         out = ui.handle_key(raw)
         if out:

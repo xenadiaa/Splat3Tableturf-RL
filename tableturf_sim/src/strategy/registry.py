@@ -98,23 +98,33 @@ def choose_action_from_strategy_id(state, player: str, strategy_id: str) -> Acti
         return Action(player=player, card_number=ps.hand[0].Number, pass_turn=True)
 
     if row["kind"] == "nn":
-        from . import nn_loader
+        from . import nn_loader, strategic_nn_loader
 
-        payload = nn_loader.choose_action(
-            state=state,
-            player=player,
-            legal_actions=[{
-                "player": a.player,
-                "card_number": a.card_number,
-                "surrender": a.surrender,
-                "pass_turn": a.pass_turn,
-                "use_sp_attack": a.use_sp_attack,
-                "rotation": a.rotation,
-                "x": a.x,
-                "y": a.y,
-            } for a in actions],
-            context={"checkpoint_file": str(row["path"])},
-        )
+        legal_payload = [{
+            "player": a.player,
+            "card_number": a.card_number,
+            "surrender": a.surrender,
+            "pass_turn": a.pass_turn,
+            "use_sp_attack": a.use_sp_attack,
+            "rotation": a.rotation,
+            "x": a.x,
+            "y": a.y,
+        } for a in actions]
+        checkpoint_file = str(row["path"])
+        if strategic_nn_loader.is_strategic_checkpoint(checkpoint_file):
+            payload = strategic_nn_loader.choose_action(
+                state=state,
+                player=player,
+                legal_actions=legal_payload,
+                context={"checkpoint_file": checkpoint_file},
+            )
+        else:
+            payload = nn_loader.choose_action(
+                state=state,
+                player=player,
+                legal_actions=legal_payload,
+                context={"checkpoint_file": checkpoint_file},
+            )
         for a in actions:
             if (
                 a.card_number == payload.get("card_number")

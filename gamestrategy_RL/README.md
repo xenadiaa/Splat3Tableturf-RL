@@ -87,3 +87,35 @@ Example:
 ```bash
 python -m gamestrategy_RL.train_strategic --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high
 ```
+
+## 2P Self-Play PPO
+
+Shared-policy 2P PPO training is available separately:
+
+- `selfplay_env.py`
+- `selfplay_ppo_trainer.py`
+- `train_selfplay.py`
+
+Example:
+
+```bash
+python -m gamestrategy_RL.train_selfplay --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori
+```
+
+Dual-policy 2P PPO is also available:
+
+```bash
+python -m gamestrategy_RL.train_selfplay_dual --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori
+```
+
+Score-first reward PPO is available separately:
+
+```bash
+python -m gamestrategy_RL.train_score_reward --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high
+```
+
+Aggressive-opening + basic PPO is available separately:
+
+```bash
+python -m gamestrategy_RL.train_opening_aggressive --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --opening-turns 3 --bot-style aggressive --bot-level high
+```

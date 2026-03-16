@@ -6,8 +6,6 @@ from pathlib import Path
 import sys
 from typing import Dict, List, Tuple
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -71,9 +69,9 @@ def _compute_scores(game_map) -> Tuple[int, int]:
     return p1, p2
 
 
-def _encode_state(state, player: str) -> Tuple[np.ndarray, np.ndarray]:
+def _encode_state(state, player: str) -> Tuple[List[List[List[float]]], List[float]]:
     game_map = state.map
-    obs = np.zeros((6, game_map.height, game_map.width), dtype=np.float32)
+    obs = [[[0.0 for _ in range(game_map.width)] for _ in range(game_map.height)] for _ in range(6)]
     is_p1_agent = player == "P1"
     for y in range(game_map.height):
         for x in range(game_map.width):
@@ -92,21 +90,18 @@ def _encode_state(state, player: str) -> Tuple[np.ndarray, np.ndarray]:
     opp = state.players["P2" if player == "P1" else "P1"]
     own_score = p1_score if is_p1_agent else p2_score
     opp_score = p2_score if is_p1_agent else p1_score
-    scalar = np.array(
-        [
-            state.turn / max(1, state.max_turns),
-            own.sp / 20.0,
-            opp.sp / 20.0,
-            (own_score - opp_score) / 100.0,
-            len(own.draw_pile) / 15.0,
-            len(opp.draw_pile) / 15.0,
-        ],
-        dtype=np.float32,
-    )
+    scalar = [
+        state.turn / max(1, state.max_turns),
+        own.sp / 20.0,
+        opp.sp / 20.0,
+        (own_score - opp_score) / 100.0,
+        len(own.draw_pile) / 15.0,
+        len(opp.draw_pile) / 15.0,
+    ]
     return obs, scalar
 
 
-def _encode_actions(state, player: str, legal_actions: List[dict]) -> np.ndarray:
+def _encode_actions(state, player: str, legal_actions: List[dict]) -> List[List[float]]:
     ps = state.players[player]
     hand = ps.hand
     hand_index = {card.Number: idx for idx, card in enumerate(hand)}
@@ -123,27 +118,24 @@ def _encode_actions(state, player: str, legal_actions: List[dict]) -> np.ndarray
         y = action.get("y")
         cell_count, sp_count = _card_cell_stats(card, rotation)
         feats.append(
-            np.array(
-                [
-                    hand_index[card.Number] / 3.0,
-                    1.0 if bool(action.get("pass_turn", False)) else 0.0,
-                    1.0 if bool(action.get("use_sp_attack", False)) else 0.0,
-                    rotation / 3.0,
-                    (float(x) / w) if x is not None else 0.0,
-                    (float(y) / h) if y is not None else 0.0,
-                    card.CardPoint / 20.0,
-                    card.SpecialCost / 10.0,
-                    cell_count / 64.0,
-                    sp_count / 64.0,
-                    ps.sp / 20.0,
-                    state.turn / max(1, state.max_turns),
-                ],
-                dtype=np.float32,
-            )
+            [
+                hand_index[card.Number] / 3.0,
+                1.0 if bool(action.get("pass_turn", False)) else 0.0,
+                1.0 if bool(action.get("use_sp_attack", False)) else 0.0,
+                rotation / 3.0,
+                (float(x) / w) if x is not None else 0.0,
+                (float(y) / h) if y is not None else 0.0,
+                card.CardPoint / 20.0,
+                card.SpecialCost / 10.0,
+                cell_count / 64.0,
+                sp_count / 64.0,
+                ps.sp / 20.0,
+                state.turn / max(1, state.max_turns),
+            ]
         )
     if not feats:
-        return np.zeros((1, 12), dtype=np.float32)
-    return np.stack(feats, axis=0)
+        return [[0.0] * 12]
+    return feats
 
 
 def choose_action(state, player: str, legal_actions: List[dict], context: Dict[str, object]) -> Dict[str, object]:
