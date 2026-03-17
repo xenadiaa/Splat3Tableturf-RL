@@ -59,6 +59,11 @@ class MissingInterfaceError(RuntimeError):
         super().__init__(f"Missing required interface fields: {joined}")
 
 
+def _unique_debug_image_path(out_dir: Path, prefix: str, idx: int) -> Path:
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return out_dir / f"{prefix}_{ts}_{idx:05d}.png"
+
+
 def _load_callable(ref: str) -> Callable[..., Any]:
     if ":" not in ref:
         raise ValueError(f"callable ref must be module:function, got: {ref}")
@@ -467,13 +472,18 @@ def _resolve_checkpoint_from_entry(entry: Dict[str, Any]) -> Tuple[Path, str]:
     for key in ("checkpoint_file", "checkpoint", "pt"):
         value = str(entry.get(key, "")).strip()
         if value:
-            return _resolve_repo_path(value), key
+            resolved = _resolve_repo_path(value)
+            if not resolved.exists():
+                raise FileNotFoundError(f"checkpoint file not found: {resolved}")
+            return resolved, key
 
     for key in ("training_summary", "eval_summary"):
         value = str(entry.get(key, "")).strip()
         if not value:
             continue
         summary_path = _resolve_repo_path(value)
+        if not summary_path.exists():
+            raise FileNotFoundError(f"summary file not found: {summary_path}")
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
         save_dir = str(payload.get("save_dir", "")).strip()
         if save_dir:
@@ -483,7 +493,10 @@ def _resolve_checkpoint_from_entry(entry: Dict[str, Any]) -> Tuple[Path, str]:
     for key in ("checkpoint_dir", "save_dir", "dir"):
         value = str(entry.get(key, "")).strip()
         if value:
-            return _latest_checkpoint_in_dir(_resolve_repo_path(value)), key
+            resolved_dir = _resolve_repo_path(value)
+            if not resolved_dir.exists():
+                raise FileNotFoundError(f"checkpoint dir not found: {resolved_dir}")
+            return _latest_checkpoint_in_dir(resolved_dir), key
 
     raise ValueError(f"ppo entry missing checkpoint path fields: {entry}")
 
@@ -496,6 +509,8 @@ def _resolve_policy_entry(raw: Any, source: str) -> ResolvedStrategy:
 
     mode = str(raw.get("mode", "") or raw.get("type", "") or "").strip().lower()
     strategy_id = str(raw.get("strategy_id", "")).strip()
+    fallback_strategy_id = str(raw.get("fallback_strategy_id", "")).strip()
+    fallback_label = str(raw.get("fallback_label", "")).strip()
     if strategy_id:
         label = str(raw.get("label", "") or strategy_id)
         return ResolvedStrategy(mode="strategy_id", label=label, strategy_id=strategy_id, source=source)
@@ -503,7 +518,17 @@ def _resolve_policy_entry(raw: Any, source: str) -> ResolvedStrategy:
     if mode in {"ppo", "checkpoint", "nn", "strategic_ppo", "strategic", "strategic_checkpoint"} or any(
         str(raw.get(k, "")).strip() for k in ("checkpoint_file", "checkpoint", "pt", "training_summary", "eval_summary", "checkpoint_dir", "save_dir", "dir")
     ):
-        checkpoint_file, path_kind = _resolve_checkpoint_from_entry(raw)
+        try:
+            checkpoint_file, path_kind = _resolve_checkpoint_from_entry(raw)
+        except FileNotFoundError:
+            if fallback_strategy_id:
+                return ResolvedStrategy(
+                    mode="strategy_id",
+                    label=fallback_label or fallback_strategy_id,
+                    strategy_id=fallback_strategy_id,
+                    source=f"{source}:fallback_missing_checkpoint",
+                )
+            raise
         label = str(raw.get("label", "") or f"ppo:{checkpoint_file.name}")
         resolved_mode = "ppo_checkpoint"
         checkpoint_name = checkpoint_file.name.lower()
@@ -1697,6 +1722,7 @@ class _FrameVisionPipeline:
         self._debug_dir.mkdir(parents=True, exist_ok=True)
         self.last_frame_path = ""
         self.last_analysis_path = ""
+        self._playable_shot_index = 0
 
     def close(self) -> None:
         self._capture.stop()
@@ -1757,12 +1783,21 @@ class _FrameVisionPipeline:
         self.last_frame_path = str(latest_png)
         self.last_analysis_path = str(latest_json)
 
+    def _save_playable_capture(self, frame) -> None:
+        if not self._config.save_debug_frames:
+            return
+        self._playable_shot_index += 1
+        path = _unique_debug_image_path(self._debug_dir, "capture", self._playable_shot_index)
+        cv2.imwrite(str(path), frame)
+
     def detect_playable(self) -> Dict[str, Any]:
         frame = self._read_latest_frame()
         result = detect_playable_banner(frame)
         self.last_sp_count = int(get_sp_count_frame(frame))
         result["frame_shape"] = [int(frame.shape[0]), int(frame.shape[1]), int(frame.shape[2])]
         result["p1_sp"] = int(self.last_sp_count)
+        if result.get("playable"):
+            self._save_playable_capture(frame)
         self._save_debug_snapshot(
             frame,
             {
@@ -1778,6 +1813,8 @@ class _FrameVisionPipeline:
         playable_result = detect_playable_banner(frame)
         lose_result = detect_lose_banner(frame)
         self.last_sp_count = int(get_sp_count_frame(frame))
+        if playable_result.get("playable"):
+            self._save_playable_capture(frame)
         self._save_debug_snapshot(
             frame,
             {

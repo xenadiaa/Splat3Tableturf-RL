@@ -28,3 +28,4 @@
 /tableturf_sim/src/view/__pycache__
 **/__pycache__/
 *.pyc
+/autocontroller_rebuild_for_RL/debug_runtime

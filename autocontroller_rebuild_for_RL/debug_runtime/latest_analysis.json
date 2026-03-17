@@ -1,5 +1,5 @@
 {
-  "kind": "playable_poll",
+  "kind": "wait_poll",
   "playable_result": {
     "playable": false,
     "roi_abs": [
@@ -9,20 +9,26 @@
       159
     ],
     "gray_ratio": 0.0,
-    "dark_text_ratio": 1.0,
+    "dark_text_ratio": 0.9997781918197143,
     "mean_bgr": [
-      54.1634499975995,
-      20.219045561476786,
-      26.37034903259878
+      44.40681261702434,
+      31.217293196984972,
+      33.244250804167265
     ],
     "banner_bbox_abs": [],
-    "banner_rect_ratio": 0.0,
-    "frame_shape": [
-      1080,
-      1920,
-      3
+    "banner_rect_ratio": 0.0
+  },
+  "lose_result": {
+    "lose": false,
+    "roi_abs": [
+      20,
+      111,
+      262,
+      159
     ],
-    "p1_sp": 0
+    "purple_ratio": 0.10202122041384608,
+    "match_score": 0.38490867614746094,
+    "mask_iou": 0.2917067803603356
   },
   "p1_sp": 0
 }

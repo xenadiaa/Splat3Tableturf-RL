@@ -53,18 +53,65 @@ def _compute_scores(game_map) -> Tuple[int, int]:
 
 
 def _guess_local_ip() -> str:
+    candidates: List[str] = []
+    try:
+        hostnames = [socket.gethostname(), socket.getfqdn(), "localhost"]
+        for host in hostnames:
+            try:
+                infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            for info in infos:
+                ip = str(info[4][0])
+                if ip not in candidates:
+                    candidates.append(ip)
+    except OSError:
+        pass
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("8.8.8.8", 80))
-        return str(sock.getsockname()[0])
+        ip = str(sock.getsockname()[0])
+        if ip not in candidates:
+            candidates.append(ip)
     except OSError:
-        return "127.0.0.1"
+        pass
     finally:
         sock.close()
+
+    def _ip_rank(ip: str) -> Tuple[int, str]:
+        if ip.startswith("192."):
+            return (0, ip)
+        if ip.startswith("10."):
+            return (1, ip)
+        parts = ip.split(".")
+        if len(parts) == 4 and parts[0] == "172":
+            try:
+                second = int(parts[1])
+            except ValueError:
+                second = -1
+            if 16 <= second <= 31:
+                return (2, ip)
+        if ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("198.18."):
+            return (9, ip)
+        return (3, ip)
+
+    valid = [ip for ip in candidates if "." in ip and not ip.startswith("127.") and not ip.startswith("169.254.") and not ip.startswith("198.18.")]
+    if valid:
+        valid.sort(key=_ip_rank)
+        return valid[0]
+    if candidates:
+        candidates.sort(key=_ip_rank)
+        return candidates[0]
+    return "127.0.0.1"
 
 
 def _send_json_line(sock: socket.socket, payload: dict) -> None:
     sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def _is_valid_deck_ids(deck_ids: List[int]) -> bool:
+    return len(deck_ids) == 15 and len(set(deck_ids)) == 15
 
 
 class _JsonLineReader:
@@ -118,6 +165,8 @@ class Minimal2PService:
         discovery_thread.start()
         accept_thread.start()
         print(f"2P service running on {self.bind_host}:{SERVICE_TCP_PORT}")
+        print(f"LAN host IP: {self.host_ip}")
+        print(f"Windows/simple client direct connect: {self.host_ip}:{SERVICE_TCP_PORT}")
         print("等待客户端连接...")
         while not self._stop.is_set():
             self._process_messages()
@@ -191,7 +240,17 @@ class Minimal2PService:
                 break
             msg_type = str(msg.get("type", ""))
             if msg_type == "ping":
-                _send_json_line(client.sock, {"type": "pong", "service": True, "room_active": bool(self.room)})
+                _send_json_line(
+                    client.sock,
+                    {
+                        "type": "pong",
+                        "service": True,
+                        "room_active": bool(self.room),
+                        "room": self.room or {},
+                        "host": self.host_ip,
+                        "tcp_port": SERVICE_TCP_PORT,
+                    },
+                )
                 continue
             if msg_type == "create_room":
                 self._handle_create_room(client, msg)
@@ -224,9 +283,13 @@ class Minimal2PService:
             map_name = load_map(map_id).name
         except Exception:
             map_name = map_id
+        deck_ids = list(msg.get("deck_ids", []))
+        if not _is_valid_deck_ids(deck_ids):
+            _send_json_line(client.sock, {"type": "error", "message": "卡组必须为15张且不能有重复编号"})
+            return
         client.role = "P1"
         client.name = str(msg.get("player_name", "P1"))
-        client.deck_ids = list(msg.get("deck_ids", []))
+        client.deck_ids = deck_ids
         client.deck_name = str(msg.get("deck_name", ""))
         self.room = {
             "room_id": uuid4().hex[:8],
@@ -248,9 +311,13 @@ class Minimal2PService:
         if str(msg.get("room_id", "")) and str(msg.get("room_id")) != str(self.room["room_id"]):
             _send_json_line(client.sock, {"type": "error", "message": "房间ID不匹配"})
             return
+        deck_ids = list(msg.get("deck_ids", []))
+        if not _is_valid_deck_ids(deck_ids):
+            _send_json_line(client.sock, {"type": "error", "message": "卡组必须为15张且不能有重复编号"})
+            return
         client.role = "P2"
         client.name = str(msg.get("player_name", "P2"))
-        client.deck_ids = list(msg.get("deck_ids", []))
+        client.deck_ids = deck_ids
         client.deck_name = str(msg.get("deck_name", ""))
         self._start_match()
 
@@ -260,19 +327,31 @@ class Minimal2PService:
         if p1 is None or p2 is None:
             return
         seed = int(time.time() * 1000) & 0x7FFFFFFF
-        self.state = init_state(
-            map_id=str(self.room["map_id"]),
-            p1_deck_ids=list(p1.deck_ids),
-            p2_deck_ids=list(p2.deck_ids),
-            seed=seed,
-            mode="2P",
-            p1_player_id=f"P1_{uuid4().hex[:6]}",
-            p2_player_id=f"P2_{uuid4().hex[:6]}",
-            p1_player_name=p1.name,
-            p2_player_name=p2.name,
-            p1_deck_name=p1.deck_name,
-            p2_deck_name=p2.deck_name,
-        )
+        try:
+            self.state = init_state(
+                map_id=str(self.room["map_id"]),
+                p1_deck_ids=list(p1.deck_ids),
+                p2_deck_ids=list(p2.deck_ids),
+                seed=seed,
+                mode="2P",
+                p1_player_id=f"P1_{uuid4().hex[:6]}",
+                p2_player_id=f"P2_{uuid4().hex[:6]}",
+                p1_player_name=p1.name,
+                p2_player_name=p2.name,
+                p1_deck_name=p1.deck_name,
+                p2_deck_name=p2.deck_name,
+            )
+        except Exception as exc:
+            _send_json_line(p1.sock, {"type": "error", "message": f"开局失败: {exc}"})
+            _send_json_line(p2.sock, {"type": "error", "message": f"开局失败: {exc}"})
+            p2.role = None
+            p2.deck_ids = []
+            p2.deck_name = ""
+            if self.room is not None:
+                self.room["status"] = "waiting_p2"
+            self.state = None
+            self.uis = {}
+            return
 
         def _submit(state, action):
             ok, reason, payload = step(state, action)
@@ -376,7 +455,13 @@ class Minimal2PService:
                 continue
             if role in self.state.pending_actions:
                 continue
-            action = choose_action_from_strategy_id(self.state, role, str(side_cfg["strategy_id"]))
+            try:
+                action = choose_action_from_strategy_id(self.state, role, str(side_cfg["strategy_id"]))
+            except Exception as exc:
+                print(f"[auto_battle disabled] role={role} strategy={side_cfg.get('strategy_id')} error={exc}")
+                side_cfg["enabled"] = False
+                save_strategy_config(cfg)
+                continue
             ok, reason, payload = self.uis[role].submit_action_fn(self.state, action)
             if ok and reason == "TURN_RESOLVED" and isinstance(payload, dict):
                 for ui in self.uis.values():

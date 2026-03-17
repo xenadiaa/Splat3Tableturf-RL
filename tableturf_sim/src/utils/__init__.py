@@ -6,7 +6,6 @@ from .common_utils import (
     create_deck_from_ids,
     validate_place_card_action,
 )
-from .action_infer_utils import infer_actions_from_map_transition
 from .deck_utils import (
     AI_STYLE_ZH,
     deck_display_name,
@@ -38,7 +37,6 @@ __all__ = [
     "create_deck_from_ids",
     "validate_place_card_action",
     "activate_special_points_and_gain_sp",
-    "infer_actions_from_map_transition",
     "AI_STYLE_ZH",
     "deck_display_name",
     "extract_npc_strategy",

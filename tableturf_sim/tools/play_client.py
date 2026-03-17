@@ -43,6 +43,17 @@ def _clear() -> None:
     sys.stdout.flush()
 
 
+def _redraw_frame(body: str, *, first_frame: bool) -> None:
+    if first_frame:
+        sys.stdout.write("\r\033[2J\033[H")
+    else:
+        sys.stdout.write("\r\033[H\033[J")
+    sys.stdout.write(body)
+    if not body.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _list_valid_player_decks() -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
     for i in range(DECK_MIN_INDEX, DECK_MAX_INDEX + 1):
@@ -416,6 +427,9 @@ def _session_loop(sock: socket.socket) -> int:
     done = False
     result: Optional[dict] = None
     player_role = ""
+    last_body = ""
+    first_frame = True
+    last_draw_ts = 0.0
     while True:
         try:
             for msg in _recv_one_message(sock, reader, timeout=0.02):
@@ -453,8 +467,13 @@ def _session_loop(sock: socket.socket) -> int:
             except OSError:
                 pass
             return 0
-        _clear()
-        print(screen)
+        body = screen + "\n"
+        now = time.monotonic()
+        if body != last_body and (now - last_draw_ts) >= 0.05:
+            _redraw_frame(body, first_frame=first_frame)
+            first_frame = False
+            last_body = body
+            last_draw_ts = now
         if done:
             try:
                 sock.close()
@@ -481,12 +500,17 @@ def _session_loop(sock: socket.socket) -> int:
             else:
                 reason_text = "原因: 正常结算"
             while True:
-                _clear()
-                print("[结算]")
-                print(verdict)
-                print(reason_text)
-                print(f"比分: 我方 {my_score} : 对手 {opp_score}")
-                print("按 z 返回主界面")
+                body = "\n".join(
+                    [
+                        "[结算]",
+                        verdict,
+                        reason_text,
+                        f"比分: 我方 {my_score} : 对手 {opp_score}",
+                        "按 z 返回主界面",
+                    ]
+                ) + "\n"
+                _redraw_frame(body, first_frame=first_frame)
+                first_frame = False
                 k = _read_key()
                 if k.lower() == "z":
                     return 0

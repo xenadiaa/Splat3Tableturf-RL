@@ -232,6 +232,18 @@ def _clear() -> None:
     sys.stdout.flush()
 
 
+def _redraw_frame(body: str, *, first_frame: bool) -> None:
+    if first_frame:
+        sys.stdout.write("\r\033[2J\033[H")
+    else:
+        # Move to top-left and clear previous drawn region.
+        sys.stdout.write("\r\033[H\033[J")
+    sys.stdout.write(body)
+    if not body.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _menu_select_raw(title: str, items: List[str], hint: str, start_idx: int = 0) -> int:
     idx = max(0, min(start_idx, len(items) - 1)) if items else 0
     while True:
@@ -383,6 +395,9 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
 
     ui = TerminalGamepadUI(state)
     popup: str | None = None
+    last_body = ""
+    first_frame = True
+    last_draw_ts = 0.0
 
     while True:
         cfg = load_strategy_config()
@@ -390,17 +405,21 @@ def _run_game_raw(args: argparse.Namespace, conf: Dict[str, object]) -> int:
         p1_ready = "P1" not in state.pending_actions and not state.done
         p1_nn_strategy_id = str(p1_auto.get("strategy_id", ""))
         p1_nn_ready = bool(p1_auto.get("enabled")) and p1_ready and p1_nn_strategy_id.startswith("nn:")
-        _clear()
-        print("键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  m激进一步  n神经网络一步  +=投降")
+        lines = ["键位: 方向键移动  z确认  x取消  a逆时针  s顺时针  q牌组  m激进一步  n神经网络一步  +=投降"]
         if p1_ready:
-            print(f"自动对战: 按 m 执行一步策略 ({MANUAL_AUTO_STRATEGY_ID})")
+            lines.append(f"自动对战: 按 m 执行一步策略 ({MANUAL_AUTO_STRATEGY_ID})")
         if p1_nn_ready:
-            print(f"神经网络: 按 n 执行一步策略 ({p1_nn_strategy_id})")
-        print(ui.render())
+            lines.append(f"神经网络: 按 n 执行一步策略 ({p1_nn_strategy_id})")
+        lines.append(ui.render())
         if popup:
-            print("\n" + "-" * 32)
-            print(popup)
-            print("(按任意键继续)")
+            lines.extend(["", "-" * 32, popup, "(按任意键继续)"])
+        body = "\n".join(lines) + "\n"
+        now = time.monotonic()
+        if body != last_body and (now - last_draw_ts) >= 0.05:
+            _redraw_frame(body, first_frame=first_frame)
+            first_frame = False
+            last_body = body
+            last_draw_ts = now
 
         if state.done and popup is None:
             popup = f"游戏结束\nwinner={state.winner}\nlog={state.log_path}"

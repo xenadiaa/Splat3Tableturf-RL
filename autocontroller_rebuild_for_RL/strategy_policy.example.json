@@ -28,7 +28,9 @@
     "正方广场": {
       "mode": "ppo",
       "checkpoint_file": "gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
-      "label": "正方广场-PPO"
+      "label": "正方广场-PPO",
+      "fallback_strategy_id": "default:aggressive:high",
+      "fallback_label": "正方广场-激进(缺失PPO回退)"
     },
     "正直大道": {
       "mode": "default",
@@ -103,7 +105,9 @@
     "Square": {
       "mode": "ppo",
       "checkpoint_file": "gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
-      "label": "Square-PPO"
+      "label": "Square-PPO",
+      "fallback_strategy_id": "default:aggressive:high",
+      "fallback_label": "Square-激进(缺失PPO回退)"
     },
     "Rectangle": {
       "mode": "default",
