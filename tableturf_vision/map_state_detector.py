@@ -250,6 +250,21 @@ def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float]]:
         )
     if 80 <= h <= 102 and s >= 90 and v >= 180:
         scores["p2_special"] = 1.0 + (v / 255.0)
+    if (
+        86 <= h <= 94
+        and 8 <= s <= 45
+        and v >= 245
+        and b >= 245
+        and g >= 245
+        and 210 <= r <= 242
+        and (b - r) >= 10
+        and (g - r) >= 10
+    ):
+        # Activated enemy special can wash out into a bright cyan-white.
+        scores["p2_special"] = max(
+            scores["p2_special"],
+            1.12 + (v / 255.0),
+        )
     if s <= 45 and v >= 150:
         scores["conflict"] = 1.0 + (v / 255.0)
 
