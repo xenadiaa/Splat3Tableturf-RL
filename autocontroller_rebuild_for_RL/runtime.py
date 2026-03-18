@@ -1641,7 +1641,6 @@ class AutoControllerRuntime:
                 self._set_status(phase="executing_action")
                 self._push_event("开始执行手柄按键序列：执行过程中不进行 playable 检测。")
                 self.controller.run_steps(steps)
-                self.vision.remember_executed_action(action, observed_state)
                 if self.turn_index < self.config.max_turns:
                     self._wait_for_next_turn_playable()
                 self.turn_index += 1
@@ -1713,7 +1712,6 @@ class _FrameVisionPipeline:
         self._map_id: Optional[str] = None
         self._map_name: Optional[str] = None
         self._map_tracker: Optional[MapStateTracker] = None
-        self._pending_action_correction: Optional[Dict[str, int]] = None
         self.last_sp_count = 0
         debug_dir = Path(config.debug_frame_dir)
         if not debug_dir.is_absolute():
@@ -1733,24 +1731,6 @@ class _FrameVisionPipeline:
         self._map_id = None
         self._map_name = None
         self._map_tracker = None
-        self._pending_action_correction = None
-
-    def remember_executed_action(self, action: Any, obs: Optional[ObservedState] = None) -> None:
-        if bool(getattr(action, "pass_turn", False)) or bool(getattr(action, "surrender", False)):
-            self._pending_action_correction = None
-            return
-        if getattr(action, "card_number", None) is None or getattr(action, "x", None) is None or getattr(action, "y", None) is None:
-            self._pending_action_correction = None
-            return
-        map_id = str(obs.map_id) if obs is not None else str(self._map_id or "")
-        map_grid = obs.map_grid if obs is not None else None
-        target_x, target_y = _engine_xy_to_ui_xy(int(action.x), int(action.y), map_id, map_grid)
-        self._pending_action_correction = {
-            "card_number": int(action.card_number),
-            "rotation": int(action.rotation),
-            "x": int(target_x),
-            "y": int(target_y),
-        }
 
     def _read_latest_frame(self):
         fallback_specs = [
@@ -1934,18 +1914,7 @@ class _FrameVisionPipeline:
 
         self.last_sp_count = int(get_sp_count_frame(frame))
         raw_map_state_result = detect_map_state(frame, self._map_name)
-        if self._pending_action_correction is not None:
-            correction = dict(self._pending_action_correction)
-            map_state_result = self._map_tracker.update_frame_with_action(
-                frame,
-                card_number=int(correction["card_number"]),
-                rotation=int(correction["rotation"]),
-                x=int(correction["x"]),
-                y=int(correction["y"]),
-            )
-            self._pending_action_correction = None
-        else:
-            map_state_result = self._map_tracker.update_frame(frame)
+        map_state_result = self._map_tracker.update_frame(frame)
         board_labels_raw = _map_state_to_board_labels(self._map_id, map_state_result)
         board_labels = _pad_board_labels_to_engine_dims(self._map_id, board_labels_raw)
         engine_map_grid = _extract_board_grid(board_labels)
@@ -1964,7 +1933,6 @@ class _FrameVisionPipeline:
             "sp": {
                 "p1_sp": int(self.last_sp_count),
             },
-            "pending_action_correction": correction if 'correction' in locals() else None,
         }
         self._save_debug_snapshot(frame, analysis_result)
 

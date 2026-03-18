@@ -591,7 +591,6 @@ def main() -> int:
                 return 0
 
             controller.run_steps(steps)
-            vision.remember_executed_action(action, observed_state)
             _print_block(
                 "本步结果",
                 {

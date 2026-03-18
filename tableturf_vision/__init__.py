@@ -18,8 +18,6 @@ from tableturf_vision.sp_detector import (
 from tableturf_vision.map_state_detector import (
     MAP_NAMES,
     MapStateTracker,
-    apply_p1_special_persistence,
-    apply_current_action_special_correction,
     detect_map_state,
     detect_map_state_image_path,
     load_all_map_reference_points,

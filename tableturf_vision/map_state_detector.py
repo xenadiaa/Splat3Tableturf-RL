@@ -332,31 +332,11 @@ def _recount_labels(cells: List[Dict]) -> Dict[str, int]:
 
 
 def apply_p1_special_persistence(result: Dict, persisted_positions: Set[CellPos] | None = None) -> Dict:
-    persisted: Set[CellPos] = set(persisted_positions or set())
-    out_cells: List[Dict] = []
-
-    for cell in result["cells"]:
-        out_cell = dict(cell)
-        pos = (int(out_cell["json_row"]), int(out_cell["json_col"]))
-        label = str(out_cell["label"])
-
-        if label == "p1_special":
-            persisted.add(pos)
-        elif label in {"conflict", "p2_special"}:
-            persisted.discard(pos)
-        elif label == "p1_fill" and pos in persisted:
-            out_cell["label"] = "p1_special"
-
-        out_cells.append(out_cell)
-
-    out = dict(result)
-    out["cells"] = out_cells
-    out["counts"] = _recount_labels(out_cells)
-    out["persisted_p1_special_positions"] = [
-        {"json_row": row, "json_col": col}
-        for row, col in sorted(persisted)
-    ]
-    return out
+    # Deprecated:
+    # The older "persisted special positions" workaround is intentionally disabled.
+    # Special/fill recognition now relies on direct vision classification plus
+    # current-action correction only, so we pass the result through unchanged.
+    return result
 
 
 def _placed_card_special_positions(card_number: int, rotation: int, x: int, y: int) -> Set[CellPos]:
@@ -377,26 +357,10 @@ def apply_current_action_special_correction(
     x: int,
     y: int,
 ) -> Dict:
-    special_positions = _placed_card_special_positions(card_number, rotation, x, y)
-    if not special_positions:
-        return result
-
-    out_cells: List[Dict] = []
-    for cell in result["cells"]:
-        out_cell = dict(cell)
-        pos = (int(out_cell["json_row"]), int(out_cell["json_col"]))
-        if pos in special_positions and str(out_cell["label"]) == "p1_fill":
-            out_cell["label"] = "p1_special"
-        out_cells.append(out_cell)
-
-    out = dict(result)
-    out["cells"] = out_cells
-    out["counts"] = _recount_labels(out_cells)
-    out["current_action_p1_special_positions"] = [
-        {"json_row": row, "json_col": col}
-        for row, col in sorted(special_positions)
-    ]
-    return out
+    # Deprecated:
+    # Current-action special correction is intentionally disabled because the
+    # latest vision pipeline can distinguish special vs fill directly.
+    return result
 
 
 class MapStateTracker:
@@ -404,18 +368,13 @@ class MapStateTracker:
         if map_name not in MAP_NAMES:
             raise ValueError(f"unsupported map: {map_name}")
         self.map_name = map_name
-        self.persisted_p1_special_positions: Set[CellPos] = set()
 
     def reset(self) -> None:
-        self.persisted_p1_special_positions.clear()
+        # Deprecated: no persisted special-position state is kept anymore.
+        return None
 
     def update_frame(self, frame_bgr: np.ndarray) -> Dict:
         result = detect_map_state(frame_bgr, self.map_name)
-        result = apply_p1_special_persistence(result, self.persisted_p1_special_positions)
-        self.persisted_p1_special_positions = {
-            (int(item["json_row"]), int(item["json_col"]))
-            for item in result["persisted_p1_special_positions"]
-        }
         return result
 
     def update_image_path(self, image_path: Path) -> Dict:
@@ -435,12 +394,6 @@ class MapStateTracker:
         y: int,
     ) -> Dict:
         result = detect_map_state(frame_bgr, self.map_name)
-        result = apply_current_action_special_correction(result, card_number, rotation, x, y)
-        result = apply_p1_special_persistence(result, self.persisted_p1_special_positions)
-        self.persisted_p1_special_positions = {
-            (int(item["json_row"]), int(item["json_col"]))
-            for item in result["persisted_p1_special_positions"]
-        }
         return result
 
     def update_image_path_with_action(
