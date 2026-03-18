@@ -233,6 +233,21 @@ def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float]]:
         scores["p2_fill"] = 1.0 + (s / 255.0) + min(0.35, (b - g) / 255.0)
     if 12 <= h <= 27 and s >= 140 and v >= 150:
         scores["p1_special"] = 1.0 + (v / 255.0)
+    if (
+        29 <= h <= 30
+        and s >= 235
+        and v >= 245
+        and b >= 10
+        and g >= 245
+        and r >= 250
+        and abs(g - r) <= 8
+    ):
+        # Activated own special can shift into the yellow fill hue band.
+        # Keep this rule narrow so ordinary fill cells are not broadly affected.
+        scores["p1_special"] = max(
+            scores["p1_special"],
+            1.15 + (v / 255.0) + 0.1,
+        )
     if 80 <= h <= 102 and s >= 90 and v >= 180:
         scores["p2_special"] = 1.0 + (v / 255.0)
     if s <= 45 and v >= 150:
