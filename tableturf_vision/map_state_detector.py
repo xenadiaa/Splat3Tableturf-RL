@@ -198,10 +198,31 @@ def _sample_patch_mean_bgr(frame_bgr: np.ndarray, cx: float, cy: float, radius: 
     patch = frame_bgr[y0:y1, x0:x1]
     if patch.size == 0:
         return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    return patch.reshape(-1, 3).mean(axis=0).astype(np.float32)
+    ph, pw = patch.shape[:2]
+    # Use a vertical sliding gradient: strongest at the top edge, linearly
+    # down to 0.3 at the midline, then continue decaying toward the bottom.
+    # This keeps the tile body dominant while strongly suppressing rising
+    # effects from the lower edge.
+    row_idx = np.arange(ph, dtype=np.float32)
+    if ph == 1:
+        weights_1d = np.array([1.0], dtype=np.float32)
+    else:
+        mid = max(1.0, (ph - 1) / 2.0)
+        top_to_mid = np.clip(row_idx / mid, 0.0, 1.0)
+        bot_span = max(1.0, (ph - 1) - mid)
+        mid_to_bot = np.clip((row_idx - mid) / bot_span, 0.0, 1.0)
+        weights_1d = np.where(
+            row_idx <= mid,
+            1.0 - 0.7 * top_to_mid,
+            0.3 - 0.22 * mid_to_bot,
+        ).astype(np.float32)
+    row_weights = weights_1d.reshape(ph, 1, 1)
+    weighted_patch = patch.astype(np.float32) * row_weights
+    mean_bgr = weighted_patch.sum(axis=(0, 1)) / (row_weights.sum() * float(pw))
+    return mean_bgr.astype(np.float32)
 
 
-def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float]]:
+def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float], bool]:
     hsv = cv2.cvtColor(np.uint8([[mean_bgr.astype(np.uint8)]]), cv2.COLOR_BGR2HSV)[0, 0]
     h, s, v = int(hsv[0]), int(hsv[1]), int(hsv[2])
     b, g, r = [float(x) for x in mean_bgr.tolist()]
@@ -214,6 +235,12 @@ def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float]]:
         "conflict": 0.0,
         "transparent": 0.0,
     }
+
+    # Transparent board cells are very dark patterned tiles.
+    # Recognize them explicitly so that any other uncaptured color state can be
+    # treated conservatively as conflict/error instead of a playable empty cell.
+    if v <= 52 or (v <= 72 and max(b, g, r) <= 78):
+        scores["transparent"] = 2.0 + ((72 - min(v, 72)) / 255.0)
 
     if 28 <= h <= 42 and s >= 150 and v >= 180:
         scores["p1_fill"] = 1.0 + (v / 255.0)
@@ -268,12 +295,14 @@ def _classify_cell(mean_bgr: np.ndarray) -> tuple[str, Dict[str, float]]:
     if s <= 45 and v >= 150:
         scores["conflict"] = 1.0 + (v / 255.0)
 
+    is_error = False
     if max(scores.values()) <= 0.0:
-        scores["transparent"] = 1.0
+        scores["conflict"] = 0.95
+        is_error = True
 
     priority = ["p1_fill", "p2_fill", "p1_special", "p2_special", "conflict", "transparent"]
     label = max(priority, key=lambda name: (scores[name], -priority.index(name)))
-    return label, scores
+    return label, scores, is_error
 
 
 def detect_map_state(frame_bgr: np.ndarray, map_name: str) -> Dict:
@@ -289,28 +318,41 @@ def detect_map_state(frame_bgr: np.ndarray, map_name: str) -> Dict:
         "conflict": 0,
         "transparent": 0,
     }
+    error_cells: List[Dict] = []
 
     for idx, p in enumerate(ref_points, start=1):
         mean_bgr = _sample_patch_mean_bgr(frame_bgr, p["center"][0], p["center"][1], p["radius"])
-        label, scores = _classify_cell(mean_bgr)
+        label, scores, is_error = _classify_cell(mean_bgr)
         counts[label] += 1
-        cells.append(
-            {
-                "index": idx,
-                "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
-                "radius": round(float(p["radius"]), 2),
-                "json_row": int(p["json_row"]),
-                "json_col": int(p["json_col"]),
-                "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
-                "label": label,
-                "scores": {k: round(float(v), 4) for k, v in scores.items()},
-            }
-        )
+        cell = {
+            "index": idx,
+            "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
+            "radius": round(float(p["radius"]), 2),
+            "json_row": int(p["json_row"]),
+            "json_col": int(p["json_col"]),
+            "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
+            "label": label,
+            "scores": {k: round(float(v), 4) for k, v in scores.items()},
+            "is_error": bool(is_error),
+        }
+        cells.append(cell)
+        if is_error:
+            error_cells.append(
+                {
+                    "index": idx,
+                    "json_row": int(p["json_row"]),
+                    "json_col": int(p["json_col"]),
+                    "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
+                    "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
+                }
+            )
 
     return {
         "map_name": map_name,
         "reference_point_count": len(cells),
         "counts": counts,
+        "error_count": len(error_cells),
+        "error_cells": error_cells,
         "cells": cells,
     }
 

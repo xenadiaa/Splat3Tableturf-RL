@@ -1682,6 +1682,7 @@ class AutoControllerRuntime:
         self._non_playable_seen_since: Optional[float] = None
         self._wait_a_enabled = True
         self._wait_silent_logged = False
+        self._force_wait_a_reactivation = False
         self._closed = False
         self._paused = threading.Event()
         self._stop_requested = threading.Event()
@@ -1893,8 +1894,12 @@ class AutoControllerRuntime:
     def resume(self) -> None:
         if self._paused.is_set():
             self._paused.clear()
+            self._run_resume_reactivation_sequence()
+            self._wait_a_enabled = True
+            self._wait_silent_logged = False
+            self._force_wait_a_reactivation = True
             self._set_status(status="running")
-            self._push_event("resumed_by_user")
+            self._push_event("resumed_by_user，已重新进入按 A 等待与 playable 检测状态。")
 
     def adjust_turn_index(self, delta: int) -> None:
         if delta == 0:
@@ -1928,6 +1933,13 @@ class AutoControllerRuntime:
         self.controller.send_smart_sequence_csv("DRIGHT,120")
         time.sleep(2.0)
         self.controller.send_smart_sequence_csv("A,120")
+
+    def _run_resume_reactivation_sequence(self) -> None:
+        self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。")
+        for idx in range(3):
+            self.controller.send_smart_sequence_csv("R,120")
+            if idx < 2:
+                time.sleep(1.0)
 
     def _finalize_previous_battle_as_not_win(self, reason: str) -> None:
         if not self._pending_result_check:
@@ -2047,6 +2059,9 @@ class AutoControllerRuntime:
             self._check_playable_state_timeout(False, "wait_until_playable")
             if self._wait_a_enabled:
                 self._wait_silent_logged = False
+                if self._force_wait_a_reactivation:
+                    next_wait_a_ts = 0.0
+                    self._force_wait_a_reactivation = False
                 now = time.monotonic()
                 if now >= next_wait_a_ts:
                     self.controller.run_steps(wait_a_step)

@@ -117,28 +117,41 @@ def analyze_settlement_map_state(frame_bgr: np.ndarray, map_name: str) -> Dict:
         "conflict": 0,
         "transparent": 0,
     }
+    error_cells: List[Dict] = []
 
     for idx, p in enumerate(ref_points, start=1):
         mean_bgr = _sample_patch_mean_bgr(frame_bgr, p["center"][0], p["center"][1], p["radius"])
-        label, scores = _classify_cell(mean_bgr)
+        label, scores, is_error = _classify_cell(mean_bgr)
         counts[label] += 1
-        cells.append(
-            {
-                "index": idx,
-                "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
-                "radius": round(float(p["radius"]), 2),
-                "json_row": int(p["json_row"]),
-                "json_col": int(p["json_col"]),
-                "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
-                "label": label,
-                "scores": {k: round(float(v), 4) for k, v in scores.items()},
-            }
-        )
+        cell = {
+            "index": idx,
+            "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
+            "radius": round(float(p["radius"]), 2),
+            "json_row": int(p["json_row"]),
+            "json_col": int(p["json_col"]),
+            "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
+            "label": label,
+            "scores": {k: round(float(v), 4) for k, v in scores.items()},
+            "is_error": bool(is_error),
+        }
+        cells.append(cell)
+        if is_error:
+            error_cells.append(
+                {
+                    "index": idx,
+                    "json_row": int(p["json_row"]),
+                    "json_col": int(p["json_col"]),
+                    "center": [round(float(p["center"][0]), 2), round(float(p["center"][1]), 2)],
+                    "mean_bgr": [round(float(v), 2) for v in mean_bgr.tolist()],
+                }
+            )
 
     return {
         "map_name": map_name,
         "reference_point_count": len(cells),
         "counts": counts,
+        "error_count": len(error_cells),
+        "error_cells": error_cells,
         "cells": cells,
     }
 

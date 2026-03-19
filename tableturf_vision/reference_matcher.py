@@ -65,7 +65,7 @@ def compare_masks(obs: np.ndarray, tmpl: np.ndarray) -> Dict:
 
 
 def _is_board_like(mean_bgr: np.ndarray) -> bool:
-    label, _ = _classify_cell(mean_bgr)
+    label, _, _ = _classify_cell(mean_bgr)
     if label != "transparent":
         return True
     b, g, r = [float(x) for x in mean_bgr.tolist()]
