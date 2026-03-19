@@ -23,6 +23,8 @@ PLAYABLE_BANNER_ROI_NORM = (
     PLAYABLE_BANNER_ROI_ABS[3] / PLAYABLE_BANNER_REF_SIZE[1],
 )
 LOSE_TEMPLATE_IMAGE = REPO_ROOT / "tableturf_vision" / "参照基础" / "Player_Win.png"
+WIN_TEMPLATE_IMAGE = REPO_ROOT / "tableturf_vision" / "参照基础" / "Player_Lose.png"
+DRAW_TEMPLATE_IMAGE = REPO_ROOT / "tableturf_vision" / "参照基础" / "Player_Draw.png"
 
 
 def _scale_roi(img_shape: Tuple[int, int, int], roi_norm: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
@@ -47,6 +49,11 @@ def _purple_text_mask(roi_bgr: np.ndarray) -> np.ndarray:
     return cv2.inRange(hsv, np.array([110, 60, 80]), np.array([165, 255, 255]))
 
 
+def _white_text_mask(roi_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, np.array([0, 0, 220]), np.array([180, 40, 255]))
+
+
 @lru_cache(maxsize=1)
 def _load_lose_template() -> Dict:
     frame = cv2.imread(str(LOSE_TEMPLATE_IMAGE))
@@ -59,6 +66,36 @@ def _load_lose_template() -> Dict:
         "roi_shape": [int(h), int(w)],
         "mask": mask,
         "purple_ratio": float((mask > 0).mean()),
+    }
+
+
+@lru_cache(maxsize=1)
+def _load_win_template() -> Dict:
+    frame = cv2.imread(str(WIN_TEMPLATE_IMAGE))
+    if frame is None:
+        raise ValueError(f"cannot read win template image: {WIN_TEMPLATE_IMAGE}")
+    x, y, w, h = get_playable_banner_roi_abs(frame.shape)
+    roi = frame[y : y + h, x : x + w]
+    mask = _purple_text_mask(roi)
+    return {
+        "roi_shape": [int(h), int(w)],
+        "mask": mask,
+        "purple_ratio": float((mask > 0).mean()),
+    }
+
+
+@lru_cache(maxsize=1)
+def _load_draw_template() -> Dict:
+    frame = cv2.imread(str(DRAW_TEMPLATE_IMAGE))
+    if frame is None:
+        raise ValueError(f"cannot read draw template image: {DRAW_TEMPLATE_IMAGE}")
+    x, y, w, h = get_playable_banner_roi_abs(frame.shape)
+    roi = frame[y : y + h, x : x + w]
+    mask = _white_text_mask(roi)
+    return {
+        "roi_shape": [int(h), int(w)],
+        "mask": mask,
+        "white_ratio": float((mask > 0).mean()),
     }
 
 
@@ -138,6 +175,62 @@ def detect_lose_banner(frame_bgr: np.ndarray) -> Dict:
     }
 
 
+def detect_win_banner(frame_bgr: np.ndarray) -> Dict:
+    tmpl = _load_win_template()
+    x, y, w, h = get_playable_banner_roi_abs(frame_bgr.shape)
+    roi = frame_bgr[y : y + h, x : x + w]
+    roi_resized = cv2.resize(
+        roi,
+        (int(tmpl["roi_shape"][1]), int(tmpl["roi_shape"][0])),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    mask = _purple_text_mask(roi_resized)
+    template_mask = tmpl["mask"]
+    match_score = float(
+        cv2.matchTemplate(mask.astype(np.float32), template_mask.astype(np.float32), cv2.TM_CCOEFF_NORMED)[0, 0]
+    )
+    purple_ratio = float((mask > 0).mean())
+    intersect = float(np.logical_and(mask > 0, template_mask > 0).sum())
+    union = float(np.logical_or(mask > 0, template_mask > 0).sum())
+    iou = intersect / union if union > 0 else 0.0
+    is_present = bool(match_score >= 0.4 and purple_ratio >= 0.1 and iou >= 0.3)
+    return {
+        "win": is_present,
+        "roi_abs": [int(x), int(y), int(w), int(h)],
+        "purple_ratio": purple_ratio,
+        "match_score": match_score,
+        "mask_iou": iou,
+    }
+
+
+def detect_draw_banner(frame_bgr: np.ndarray) -> Dict:
+    tmpl = _load_draw_template()
+    x, y, w, h = get_playable_banner_roi_abs(frame_bgr.shape)
+    roi = frame_bgr[y : y + h, x : x + w]
+    roi_resized = cv2.resize(
+        roi,
+        (int(tmpl["roi_shape"][1]), int(tmpl["roi_shape"][0])),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    mask = _white_text_mask(roi_resized)
+    template_mask = tmpl["mask"]
+    match_score = float(
+        cv2.matchTemplate(mask.astype(np.float32), template_mask.astype(np.float32), cv2.TM_CCOEFF_NORMED)[0, 0]
+    )
+    white_ratio = float((mask > 0).mean())
+    intersect = float(np.logical_and(mask > 0, template_mask > 0).sum())
+    union = float(np.logical_or(mask > 0, template_mask > 0).sum())
+    iou = intersect / union if union > 0 else 0.0
+    is_present = bool(match_score >= 0.72 and white_ratio >= 0.025 and iou >= 0.45)
+    return {
+        "draw": is_present,
+        "roi_abs": [int(x), int(y), int(w), int(h)],
+        "white_ratio": white_ratio,
+        "match_score": match_score,
+        "mask_iou": iou,
+    }
+
+
 def is_playable_frame(frame_bgr: np.ndarray) -> bool:
     return bool(detect_playable_banner(frame_bgr)["playable"])
 
@@ -158,6 +251,28 @@ def is_lose_image_path(image_path: Path) -> bool:
     if frame is None:
         raise ValueError(f"cannot read image: {image_path}")
     return is_lose_frame(frame)
+
+
+def is_win_frame(frame_bgr: np.ndarray) -> bool:
+    return bool(detect_win_banner(frame_bgr)["win"])
+
+
+def is_win_image_path(image_path: Path) -> bool:
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise ValueError(f"cannot read image: {image_path}")
+    return is_win_frame(frame)
+
+
+def is_draw_frame(frame_bgr: np.ndarray) -> bool:
+    return bool(detect_draw_banner(frame_bgr)["draw"])
+
+
+def is_draw_image_path(image_path: Path) -> bool:
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise ValueError(f"cannot read image: {image_path}")
+    return is_draw_frame(frame)
 
 
 def _resolve_image(image: str, input_dir: str) -> Path:

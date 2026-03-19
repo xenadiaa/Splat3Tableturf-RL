@@ -29,3 +29,6 @@
 **/__pycache__/
 *.pyc
 /autocontroller_rebuild_for_RL/debug_runtime
+/autocontroller_rebuild_for_RL/replays
+.DS_Store
+*.swp

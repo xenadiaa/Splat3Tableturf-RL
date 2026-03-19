@@ -5,6 +5,7 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +48,8 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "frame_api_host": "127.0.0.1",
     "frame_api_port": 8765,
     "frame_jpeg_quality": 90,
+    "out_dir": "vision_capture/debug",
+    "prefix": "capture",
 }
 
 
@@ -106,6 +109,12 @@ def _build_profiles(spec: str) -> List[Dict[str, object]]:
     if spec:
         return [_profile_from_spec(spec)]
     return [dict(profile) for profile in CAPTURE_PROFILES]
+
+
+def _unique_image_path(out_dir: Path, prefix: str, idx: int) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return out_dir / f"{prefix}_{ts}_{idx:05d}.png"
+
 
 def _resolve_video_index(device_name: str) -> Optional[int]:
     name = str(device_name or "").strip()
@@ -237,12 +246,19 @@ def _make_handler(state: FrameState):
     return Handler
 
 
-def _overlay_status(frame: np.ndarray, profile_label: str, device_name: str, api_url: str) -> None:
+def _overlay_status(
+    frame: np.ndarray,
+    profile_label: str,
+    device_name: str,
+    api_url: str,
+    saved_count: int,
+) -> None:
     lines = [
         f"Device: {device_name}",
         f"Capture: {profile_label}",
         f"API: {api_url}/frame.jpg",
-        "Keys: q/ESC quit",
+        f"Saved: {saved_count}",
+        "Keys: Enter save PNG, Esc/close window/Ctrl+C quit",
     ]
     for idx, text in enumerate(lines):
         y = 30 + idx * 28
@@ -296,6 +312,11 @@ def main() -> int:
         args.port = int(cfg.get("frame_api_port", DEFAULT_CONFIG["frame_api_port"]))
     if args.jpeg_quality is None:
         args.jpeg_quality = int(cfg.get("frame_jpeg_quality", DEFAULT_CONFIG["frame_jpeg_quality"]))
+    out_dir = Path(str(cfg.get("out_dir", DEFAULT_CONFIG["out_dir"])))
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = str(cfg.get("prefix", DEFAULT_CONFIG["prefix"]))
 
     device_name = _resolve_device(args)
     if not device_name:
@@ -327,7 +348,9 @@ def main() -> int:
     print(f"Streaming: {active_profile['label']}")
     print(f"Frame API: {api_url}/frame.jpg")
     print(f"Health API: {api_url}/health")
+    print(f"Screenshot output: {out_dir}")
     last_frame_ts = time.monotonic()
+    saved_count = 0
 
     try:
         cv2.namedWindow(args.window_title, cv2.WINDOW_NORMAL)
@@ -351,11 +374,18 @@ def main() -> int:
             if state.frame is None:
                 continue
             display_frame = state.frame.copy()
-            _overlay_status(display_frame, str(active_profile["label"]), device_name, api_url)
+            _overlay_status(display_frame, str(active_profile["label"]), device_name, api_url, saved_count)
             cv2.imshow(args.window_title, display_frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q"), ord("Q")):
+            if cv2.getWindowProperty(args.window_title, cv2.WND_PROP_VISIBLE) < 1:
                 break
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                break
+            if key in (10, 13):
+                saved_count += 1
+                path = _unique_image_path(out_dir, prefix, saved_count)
+                cv2.imwrite(str(path), state.frame)
+                print(f"[saved] {path}")
     finally:
         server.shutdown()
         server.server_close()

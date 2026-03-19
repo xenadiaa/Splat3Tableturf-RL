@@ -1,0 +1,80 @@
+{
+  "format": "map_battle_stats_v1",
+  "maps": {
+    "加速高速公路": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "双子岛": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "小巧竞技场": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "扭转河": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "正方广场": {
+      "Battles": 321,
+      "Wins": 87,
+      "Errors": 16
+    },
+    "正直大道": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "清脆饼干": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "漆黑深林": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "罚分花园": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "轻飘湖": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "酷似大道": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "钢骨建筑": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "间隔墙": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "雷霆车站": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    },
+    "面具屋": {
+      "Battles": 0,
+      "Wins": 0,
+      "Errors": 0
+    }
+  }
+}

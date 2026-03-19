@@ -573,6 +573,100 @@ def _suppress_sp_attack_in_early_mid(actions: List[Action], turn: int) -> List[A
     return normal_actions or actions
 
 
+def _card_has_special(card: Card_Single) -> bool:
+    return any(cell == 2 for row in card.square_2d_0 for cell in row)
+
+
+def _is_no_special_12(card: Card_Single) -> bool:
+    return card.CardPoint == 12 and not _card_has_special(card)
+
+
+def _aggressive_low_point_threshold() -> int:
+    return 6
+
+
+def _choose_aggressive_reserved_card(ps: PlayerState) -> Optional[Card_Single]:
+    deck_cards = [create_card_from_id(cid) for cid in ps.deck_ids]
+    deck_targets = [c for c in deck_cards if _is_no_special_12(c)]
+    if len(deck_targets) < 2:
+        return None
+    hand_targets = [c for c in ps.hand if _is_no_special_12(c)]
+    if not hand_targets:
+        return None
+    # Prefer keeping the 3-SP finisher in hand for the last turn.
+    hand_targets.sort(key=lambda c: (abs(c.SpecialCost - 3), c.SpecialCost, c.Number))
+    return hand_targets[0]
+
+
+def _filter_aggressive_actions(state: GameState, player: str, actions: List[Action]) -> List[Action]:
+    ps = state.players[player]
+    filtered = list(actions)
+    reserved = _choose_aggressive_reserved_card(ps)
+
+    # Keep at least one 12-point no-special card in hand until the last two turns.
+    if state.turn < state.max_turns - 1 and reserved is not None:
+        reserve_ids = {c.Number for c in ps.hand if _is_no_special_12(c)}
+        if len(reserve_ids) <= 1:
+            kept = [a for a in filtered if a.pass_turn or a.card_number not in reserve_ids]
+        else:
+            kept = [a for a in filtered if a.pass_turn or a.card_number != reserved.Number]
+        if kept:
+            filtered = kept
+
+    # Bank SP until the final two turns. Before that, only spend the surplus above 3 SP,
+    # and skip 1-SP attacks entirely.
+    if state.turn < state.max_turns - 1:
+        normal_or_pass = [a for a in filtered if a.pass_turn or not a.use_sp_attack]
+        sp_ok: List[Action] = []
+        if ps.sp > 3:
+            for a in filtered:
+                if a.pass_turn or not a.use_sp_attack:
+                    continue
+                card = _find_card_in_hand(ps, a.card_number)
+                if card is None:
+                    continue
+                if card.CardPoint <= _aggressive_low_point_threshold():
+                    continue
+                if card.SpecialCost <= 1:
+                    continue
+                if ps.sp - card.SpecialCost >= 3:
+                    sp_ok.append(a)
+        filtered = normal_or_pass + sp_ok
+
+    # Small cards should be used to set up/activate special points through normal placement,
+    # not SP attacks, whenever they can be placed normally.
+    normal_cards = {a.card_number for a in filtered if not a.pass_turn and not a.use_sp_attack}
+    kept = []
+    for a in filtered:
+        if a.pass_turn or not a.use_sp_attack:
+            kept.append(a)
+            continue
+        card = _find_card_in_hand(ps, a.card_number)
+        if card is None:
+            kept.append(a)
+            continue
+        if card.CardPoint <= _aggressive_low_point_threshold() and a.card_number in normal_cards:
+            continue
+        kept.append(a)
+    filtered = kept
+    return filtered or actions
+
+
+def _project_score_swing(state: GameState, player: str, action: Action, cells: List[Tuple[int, int, int]]) -> float:
+    own_bit = int(Map_PointBit.IsP1) if player == "P1" else int(Map_PointBit.IsP2)
+    opp_bit = int(Map_PointBit.IsP2) if player == "P1" else int(Map_PointBit.IsP1)
+    swing = 0.0
+    for x, y, _cell_type in cells:
+        m = int(state.map.get_point(x, y))
+        had_own = (m & own_bit) != 0
+        had_opp = (m & opp_bit) != 0
+        if had_opp and not had_own:
+            swing += 2.0
+        elif not had_own and not had_opp:
+            swing += 1.0
+    return swing
+
+
 def _neighbors8(x: int, y: int) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
     for dy in (-1, 0, 1):
@@ -646,23 +740,50 @@ def _sp_setup_potential(state: GameState, player: str, cells: List[Tuple[int, in
             if (m & int(Map_PointBit.IsSupplySp)) != 0:
                 continue
             blocked = True
-            newly_filled = 0
             for nx, ny in _neighbors8(x, y):
                 if not (0 <= nx < state.map.width and 0 <= ny < state.map.height):
                     continue
                 nm = int(state.map.get_point(nx, ny))
                 if (nx, ny) in placed:
-                    newly_filled += 1
                     continue
                 if (nm & int(Map_PointBit.IsValid)) == 0:
-                    blocked = False
-                    break
+                    continue
                 if (nm & (int(Map_PointBit.IsP1) | int(Map_PointBit.IsP2))) == 0:
                     blocked = False
                     break
             if blocked:
-                gain += 1.0 + 0.35 * newly_filled
+                gain += 1.0
     return gain
+
+
+def _sp_activation_counts(state: GameState, player: str, cells: List[Tuple[int, int, int]]) -> int:
+    own_bit = int(Map_PointBit.IsP1) if player == "P1" else int(Map_PointBit.IsP2)
+    placed = {(x, y) for x, y, _ in cells}
+    activated = 0
+    for y in range(state.map.height):
+        for x in range(state.map.width):
+            m = int(state.map.get_point(x, y))
+            if (m & own_bit) == 0 or (m & int(Map_PointBit.IsSp)) == 0:
+                continue
+            if (m & int(Map_PointBit.IsSupplySp)) != 0:
+                continue
+            empty_neighbors_before = 0
+            empty_neighbors_after = 0
+            for nx, ny in _neighbors8(x, y):
+                if not (0 <= nx < state.map.width and 0 <= ny < state.map.height):
+                    continue
+                nm = int(state.map.get_point(nx, ny))
+                if (nm & int(Map_PointBit.IsValid)) == 0:
+                    continue
+                occupied_before = (nm & (int(Map_PointBit.IsP1) | int(Map_PointBit.IsP2))) != 0
+                occupied_after = occupied_before or ((nx, ny) in placed)
+                if not occupied_before:
+                    empty_neighbors_before += 1
+                if not occupied_after:
+                    empty_neighbors_after += 1
+            if empty_neighbors_before > 0 and empty_neighbors_after == 0:
+                activated += 1
+    return activated
 
 
 def _score_bot_action(
@@ -716,13 +837,17 @@ def _score_bot_action(
         metrics = _aggressive_action_metrics(state, player, action, cells)
         normal_exists = bool(aggressive_ctx.get("normal_exists", True)) if aggressive_ctx else True
         sp_setup_gain = _sp_setup_potential(state, player, cells)
+        sp_activated = _sp_activation_counts(state, player, cells)
+        reserved_no_special12 = bool(aggressive_ctx.get("reserved_no_special12", False)) if aggressive_ctx else False
         if is_final_turn:
-            # Final turn: prioritize dumping the biggest card possible, and prefer
-            # high-point SP attacks over ordinary placement when available.
-            score = (5.0 * lvl) * point + (1.2 * lvl) * span + 0.3 * special_count
+            # Final turn: maximize immediate score swing first, then use point/SP traits as tie-breakers.
+            swing = _project_score_swing(state, player, action, cells)
+            score = (12.0 * lvl) * swing + (3.5 * lvl) * point + (1.0 * lvl) * span + 0.3 * special_count
             score += 1.5 * metrics["touch_enemy"] + 1.2 * metrics["surround_enemy"]
             if action.use_sp_attack:
-                score += (3.0 * lvl) + (2.5 * lvl) * metrics["sp_enemy_cover"] - 0.05 * sp_cost
+                score += (4.0 * lvl) + (4.0 * lvl) * metrics["sp_enemy_cover"] - 0.05 * sp_cost
+                if reserved_no_special12 and point == 12 and special_count == 0 and ps.sp >= 3:
+                    score += (16.0 * lvl) + (8.0 * lvl) * metrics["sp_enemy_cover"]
             else:
                 score += 0.4 * adv
             return score
@@ -732,9 +857,9 @@ def _score_bot_action(
         score += (2.8 * lvl) * metrics["surround_enemy"]
         score += 0.25 * special_count
         if point <= 4:
-            score += (2.8 * lvl) * sp_setup_gain
-        elif point <= 6:
-            score += (1.4 * lvl) * sp_setup_gain
+            score += (10.0 * lvl) * sp_activated + (2.0 * lvl) * sp_setup_gain
+        elif point <= _aggressive_low_point_threshold():
+            score += (6.0 * lvl) * sp_activated + (1.4 * lvl) * sp_setup_gain
         if metrics["touch_enemy"] <= 0:
             score += 1.7 * metrics["own_fill_hole"]
         if action.use_sp_attack:
@@ -771,8 +896,12 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
 
     filtered_actions = actions
     if state.bot_config.style in ("aggressive", "balanced", "conservative"):
-        filtered_actions = _highest_point_actions(actions, ps)
-        filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
+        if state.bot_config.style == "aggressive":
+            filtered_actions = _filter_aggressive_actions(state, player, actions)
+            filtered_actions = _highest_point_actions(filtered_actions, ps)
+        else:
+            filtered_actions = _highest_point_actions(actions, ps)
+            filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
 
     nn_pick, nn_reason = _choose_bot_action_from_nn(state, player, filtered_actions)
     if nn_pick is not None:
@@ -800,6 +929,14 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
     if state.bot_config.style == "aggressive":
         aggressive_ctx = {
             "normal_exists": any((not a.pass_turn) and (not a.use_sp_attack) for a in filtered_actions),
+            "reserved_no_special12": any(
+                (
+                    (card := _find_card_in_hand(ps, a.card_number)) is not None
+                    and _is_no_special_12(card)
+                )
+                for a in filtered_actions
+                if not a.pass_turn and a.use_sp_attack
+            ),
         }
 
     scored: List[Tuple[float, Action]] = []
@@ -852,13 +989,25 @@ def choose_default_strategy_action(state: GameState, player: str, style: str, le
 
     filtered_actions = actions
     if style in ("aggressive", "balanced", "conservative"):
-        filtered_actions = _highest_point_actions(actions, ps)
-        filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
+        if style == "aggressive":
+            filtered_actions = _filter_aggressive_actions(state, player, actions)
+            filtered_actions = _highest_point_actions(filtered_actions, ps)
+        else:
+            filtered_actions = _highest_point_actions(actions, ps)
+            filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
 
     aggressive_ctx = None
     if style == "aggressive":
         aggressive_ctx = {
             "normal_exists": any((not a.pass_turn) and (not a.use_sp_attack) for a in filtered_actions),
+            "reserved_no_special12": any(
+                (
+                    (card := _find_card_in_hand(ps, a.card_number)) is not None
+                    and _is_no_special_12(card)
+                )
+                for a in filtered_actions
+                if not a.pass_turn and a.use_sp_attack
+            ),
         }
 
     scored: List[Tuple[float, Action]] = []
