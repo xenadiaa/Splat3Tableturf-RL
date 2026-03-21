@@ -7,6 +7,7 @@ import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,7 +36,7 @@ from switch_connect.virtual_gamepad.device_discovery import list_serial_port_lab
 from switch_connect.virtual_gamepad.input_mapper import BIT_A, BIT_DPAD_DOWN, BIT_DPAD_LEFT, BIT_DPAD_RIGHT, BIT_DPAD_UP, BIT_X, BIT_Y, RemoteStep
 from switch_connect.virtual_gamepad.serial_controller import SerialRemoteController
 from tableturf_vision.hand_card_detector import SLOT_NAMES as HAND_CARD_SLOT_NAMES, detect_hand_cards
-from tableturf_vision.map_state_detector import MapStateTracker, detect_map_state
+from tableturf_vision.map_state_detector import MapStateTracker, detect_map_state, detect_map_state_from_frames
 from tableturf_vision.mapper_preview import _match_card
 from tableturf_vision.playable_detector import detect_draw_banner, detect_lose_banner, detect_playable_banner, detect_win_banner
 from tableturf_vision.reference_matcher import detect_map_from_frame, load_map_info, map_name_cn_to_id
@@ -59,6 +60,10 @@ class MissingInterfaceError(RuntimeError):
         self.missing_fields = list(missing_fields)
         joined = ", ".join(self.missing_fields)
         super().__init__(f"Missing required interface fields: {joined}")
+
+
+class TargetWinGoalReached(RuntimeError):
+    """Raised when the temporary/session target win count has been reached."""
 
 
 def _unique_debug_image_path(out_dir: Path, prefix: str, idx: int) -> Path:
@@ -636,23 +641,30 @@ class HttpJpegCaptureSource:
     def read_latest(self, timeout_seconds: float = 5.0, drain_ms: int = 0) -> Optional[np.ndarray]:
         del drain_ms
         req = urllib.request.Request(self.frame_api_url, headers={"Cache-Control": "no-cache"})
-        try:
-            with urllib.request.urlopen(req, timeout=max(0.5, timeout_seconds)) as resp:
-                payload = resp.read()
-        except Exception as exc:
-            self.last_error = f"HTTP_FRAME_FETCH_FAILED:{exc}"
-            return None
-        try:
-            self._cache_path.write_bytes(payload)
-        except Exception as exc:
-            self.last_error = f"HTTP_FRAME_SAVE_FAILED:{exc}"
-            return None
-        frame = cv2.imread(str(self._cache_path), cv2.IMREAD_COLOR)
-        if frame is None or frame.size == 0:
-            self.last_error = "HTTP_FRAME_DECODE_FAILED"
-            return None
-        self.last_error = None
-        return frame
+        deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+        last_error = "HTTP_FRAME_FETCH_FAILED:unknown"
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(req, timeout=min(1.0, max(0.3, float(timeout_seconds)))) as resp:
+                    payload = resp.read()
+            except Exception as exc:
+                last_error = f"HTTP_FRAME_FETCH_FAILED:{exc}"
+                time.sleep(0.15)
+                continue
+            try:
+                self._cache_path.write_bytes(payload)
+            except Exception as exc:
+                self.last_error = f"HTTP_FRAME_SAVE_FAILED:{exc}"
+                return None
+            frame = cv2.imread(str(self._cache_path), cv2.IMREAD_COLOR)
+            if frame is None or frame.size == 0:
+                last_error = "HTTP_FRAME_DECODE_FAILED"
+                time.sleep(0.1)
+                continue
+            self.last_error = None
+            return frame
+        self.last_error = last_error
+        return None
 
     def read_with_fallbacks(
         self,
@@ -975,7 +987,7 @@ def _base_load_model(checkpoint_file: str):
     if ckpt in _BASE_MODEL_CACHE:
         return _BASE_MODEL_CACHE[ckpt], torch
 
-    from gamestrategy_RL.networks import PolicyValueNet
+    from GST_RL.networks import PolicyValueNet
 
     model = PolicyValueNet(map_channels=6, scalar_dim=6, action_feature_dim=12)
     obj = torch.load(ckpt, map_location="cpu")
@@ -1101,7 +1113,7 @@ def _strategic_load_model(checkpoint_file: str):
     if ckpt in _STRATEGIC_MODEL_CACHE:
         return _STRATEGIC_MODEL_CACHE[ckpt], torch
 
-    from gamestrategy_RL.strategic_networks import StrategicPolicyValueNet
+    from GST_RL.strategic_networks import StrategicPolicyValueNet
 
     model = StrategicPolicyValueNet(map_channels=6, scalar_dim=14, action_feature_dim=12)
     obj = torch.load(ckpt, map_location="cpu")
@@ -1461,12 +1473,32 @@ def resolve_strategy(
     defaults = policy.get("default")
     source_base = str(config.policy_config_json or "")
 
+    def _embedded_fallback(source_suffix: str) -> ResolvedStrategy:
+        strategy_id = resolve_strategy_id(config, map_id=map_id, map_name=map_name) or "default:aggressive:high"
+        return ResolvedStrategy(
+            mode="strategy_id",
+            label=strategy_id,
+            strategy_id=strategy_id,
+            source=f"{source_base}:{source_suffix}:embedded_fallback",
+        )
+
     for key in (str(map_id or ""), str(map_name or "")):
         if key and key in maps:
-            return _resolve_policy_entry(maps[key], f"{source_base}:{key}")
+            try:
+                return _resolve_policy_entry(maps[key], f"{source_base}:{key}")
+            except (FileNotFoundError, ValueError):
+                if defaults is not None:
+                    try:
+                        return _resolve_policy_entry(defaults, f"{source_base}:default_after_{key}_fallback")
+                    except (FileNotFoundError, ValueError):
+                        return _embedded_fallback(f"{key}_fallback")
+                return _embedded_fallback(f"{key}_fallback")
 
     if defaults is not None:
-        return _resolve_policy_entry(defaults, f"{source_base}:default")
+        try:
+            return _resolve_policy_entry(defaults, f"{source_base}:default")
+        except (FileNotFoundError, ValueError):
+            return _embedded_fallback("default_fallback")
 
     strategy_id = resolve_strategy_id(config, map_id=map_id, map_name=map_name)
     return ResolvedStrategy(mode="strategy_id", label=strategy_id, strategy_id=strategy_id, source="embedded_config")
@@ -1556,10 +1588,15 @@ class TerminalDebugUI:
         self._stdin_fd: Optional[int] = None
         self._stdin_old_attrs = None
         self._interactive = False
+        self._first_frame = True
+        self._last_render_line_count = 0
 
     def start(self) -> None:
         if not self._runtime.config.debug_ui_enabled:
             return
+        self._stop.clear()
+        self._first_frame = True
+        self._last_render_line_count = 0
         self._interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
         if self._interactive:
             import termios
@@ -1582,7 +1619,10 @@ class TerminalDebugUI:
                 termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_old_attrs)
         if self._interactive:
             with contextlib.suppress(Exception):
-                sys.stdout.write("\x1b[2J\x1b[H")
+                if self._last_render_line_count > 0:
+                    sys.stdout.write(f"\r\033[{self._last_render_line_count}F\033[J")
+                else:
+                    sys.stdout.write("\r\033[2J\033[H")
                 sys.stdout.flush()
 
     def _poll_key(self) -> None:
@@ -1609,39 +1649,63 @@ class TerminalDebugUI:
 
     def _render(self) -> None:
         state = self._runtime.debug_snapshot()
+        term_size = shutil.get_terminal_size((120, 32))
+        width = max(40, int(term_size.columns))
+        height = max(12, int(term_size.lines))
+        if self._runtime.config.continuous_run:
+            wins_text = str(state["wins"])
+        else:
+            wins_text = f"{state['wins']}/{max(1, int(self._runtime.config.target_win_count))}"
+
+        def _fit(text: str) -> str:
+            s = str(text)
+            if len(s) <= width:
+                return s
+            if width <= 3:
+                return s[:width]
+            return s[: width - 3] + "..."
+
         lines = [
             "Tableturf AutoController Debug",
             "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1",
             "",
-            f"status: {state['status']}",
-            f"phase: {state['phase']}",
-            f"turn: {state['turn']}",
-            f"map: {state['map_id']}",
-            f"wins: {state['wins']}",
-            f"battles: {state['battles']}",
-            f"pending result: {state['pending_result_check']}",
-            f"playable: {state['playable']}",
-            f"hand: {state['hand']}",
-            f"sp: {state['p1_sp']}",
-            f"action: {state['last_action']}",
-            f"strategy: {state['strategy_id']}",
-            f"strategy source: {state['strategy_source']}",
-            f"serial: {state['serial_port']}",
-            f"frame: {state['last_frame_path']}",
-            f"analysis: {state['last_analysis_path']}",
-            f"last error: {state['last_error']}",
-            f"updated: {state['updated_at']}",
+            _fit(f"status: {state['status']}"),
+            _fit(f"phase: {state['phase']}"),
+            _fit(f"turn: {state['turn']}"),
+            _fit(f"map: {state['map_id']}"),
+            _fit(f"wins: {wins_text}"),
+            _fit(f"battles: {state['battles']}"),
+            _fit(f"pending result: {state['pending_result_check']}"),
+            _fit(f"playable: {state['playable']}"),
+            _fit(f"hand: {state['hand']}"),
+            _fit(f"sp: {state['p1_sp']}"),
+            _fit(f"action: {state['last_action']}"),
+            _fit(f"strategy: {state['strategy_id']}"),
+            _fit(f"strategy source: {state['strategy_source']}"),
+            _fit(f"serial: {state['serial_port']}"),
+            _fit(f"frame: {state['last_frame_path']}"),
+            _fit(f"analysis: {state['last_analysis_path']}"),
+            _fit(f"last error: {state['last_error']}"),
+            _fit(f"updated: {state['updated_at']}"),
             "",
             "recent events:",
         ]
-        for item in state["events"]:
-            lines.append(f"  {item}")
-        if self._interactive:
-            sys.stdout.write("\x1b[2J\x1b[H" + "\n".join(lines) + "\n")
-            sys.stdout.flush()
+        reserved = len(lines)
+        event_slots = max(1, height - reserved - 1)
+        for item in list(state["events"])[-event_slots:]:
+            lines.append(_fit(f"  {item}"))
+        lines = lines[: max(1, height - 1)]
+        body = "\n".join(lines)
+        if self._first_frame:
+            sys.stdout.write("\r\033[2J\033[H")
+            self._first_frame = False
         else:
-            sys.stdout.write("\n".join(lines) + "\n")
-            sys.stdout.flush()
+            sys.stdout.write(f"\r\033[{max(1, self._last_render_line_count)}F\033[J")
+        sys.stdout.write(body)
+        if not body.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._last_render_line_count = max(1, body.count("\n") + 1)
 
     def _run(self) -> None:
         last_render = 0.0
@@ -1680,6 +1744,7 @@ class AutoControllerRuntime:
         self._last_progress_ts = time.monotonic()
         self._playable_seen_since: Optional[float] = None
         self._non_playable_seen_since: Optional[float] = None
+        self._pause_started_ts: Optional[float] = None
         self._wait_a_enabled = True
         self._wait_silent_logged = False
         self._force_wait_a_reactivation = False
@@ -1887,19 +1952,31 @@ class AutoControllerRuntime:
         if self._paused.is_set():
             self.resume()
         else:
+            self._pause_started_ts = time.monotonic()
             self._paused.set()
             self._set_status(status="paused")
             self._push_event("paused_by_user")
 
     def resume(self) -> None:
         if self._paused.is_set():
+            paused_for = 0.0
+            if self._pause_started_ts is not None:
+                paused_for = max(0.0, time.monotonic() - self._pause_started_ts)
+                self._last_progress_ts += paused_for
+                if self._playable_seen_since is not None:
+                    self._playable_seen_since += paused_for
+                if self._non_playable_seen_since is not None:
+                    self._non_playable_seen_since += paused_for
+            self._pause_started_ts = None
             self._paused.clear()
             self._run_resume_reactivation_sequence()
             self._wait_a_enabled = True
             self._wait_silent_logged = False
             self._force_wait_a_reactivation = True
             self._set_status(status="running")
-            self._push_event("resumed_by_user，已重新进入按 A 等待与 playable 检测状态。")
+            self._push_event(
+                f"resumed_by_user，已重新进入按 A 等待与 playable 检测状态。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。"
+            )
 
     def adjust_turn_index(self, delta: int) -> None:
         if delta == 0:
@@ -1925,6 +2002,59 @@ class AutoControllerRuntime:
         self.controller.send_smart_sequence_csv("HOME,100")
         time.sleep(0.3)
         self.request_stop(reason)
+
+    def _prompt_next_target_after_goal_reached(self) -> bool:
+        reached = int(self.win_count)
+        should_restart_ui = False
+        self._logger.write(f"已达成本次目标胜场：{reached}。等待用户选择是否继续对战。")
+        self._push_event(f"已达成目标胜场 {reached}。等待用户选择是否继续。")
+        self._set_status(status="paused", phase="target_reached", last_error="", wins=reached)
+        self._debug_ui.stop()
+        try:
+            choice = choose_with_arrows(
+                ["继续对战", "结束返回终端"],
+                title=f"已达成目标胜场：{reached}。是否继续对战？",
+                footer="使用 ↑/↓ 选择，回车确认。",
+            )
+            if choice != "继续对战":
+                self._logger.write(f"用户选择结束本次自动对战。已达成胜场：{reached}。")
+                self._set_status(status="stopped", phase="stopped")
+                return False
+
+            self.vision.ensure_capture_ready()
+            while True:
+                raw = input("请输入新的目标胜场（0 表示无限循环；正整数表示接下来还需再赢多少局）: ").strip()
+                if raw == "":
+                    print("请输入 0 或正整数。")
+                    continue
+                try:
+                    value = int(raw)
+                except ValueError:
+                    print(f"无效输入：{raw}，请输入 0 或正整数。")
+                    continue
+                if value < 0:
+                    print("目标胜场不能为负数。")
+                    continue
+                if value == 0:
+                    self.config.continuous_run = True
+                    self._logger.write(f"用户选择继续对战，并切换为无限循环模式。当前累计胜场={reached}。")
+                    self._push_event("用户选择继续对战，后续改为无限循环。")
+                else:
+                    self.config.continuous_run = False
+                    self.config.target_win_count = reached + value
+                    self._logger.write(
+                        f"用户选择继续对战，并设置新的目标：还需再赢 {value} 局；"
+                        f"新的累计停止胜场={self.config.target_win_count}。"
+                    )
+                    self._push_event(
+                        f"用户选择继续对战，新的目标为再赢 {value} 局（累计 {self.config.target_win_count} 胜停止）。"
+                    )
+                self._set_status(status="running", phase="idle", last_error="")
+                should_restart_ui = True
+                return True
+        finally:
+            if should_restart_ui and not self._closed:
+                self._debug_ui.start()
 
     def _run_surrender_sequence(self) -> None:
         self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 2 秒，最后按 A。")
@@ -1978,7 +2108,7 @@ class AutoControllerRuntime:
             self._current_battle_map_name = ""
             self._current_battle_stats_recorded = False
             if (not self.config.continuous_run) and self.win_count >= max(1, int(self.config.target_win_count)):
-                self._press_home_and_stop("target_win_count_reached")
+                raise TargetWinGoalReached("target_win_count_reached")
             return
         if bool(win_result.get("win")):
             settlement_map_state = self._analyze_settlement_result(frame)
@@ -2139,6 +2269,8 @@ class AutoControllerRuntime:
             self._wait_silent_logged = False
             self._logger.write(f"12 回合结束，进入结算检查阶段。当前累计局数={self.battle_count}，累计胜场={self.win_count}。")
             self._set_status(phase="battle_complete", battles=self.battle_count)
+        except TargetWinGoalReached:
+            raise
         except RuntimeError as exc:
             if str(exc) in {"BATTLE_PROGRESS_TIMEOUT_SURRENDER", "WAIT_PLAYABLE_TIMEOUT_SURRENDER"}:
                 if self._current_battle_stats_recorded and self._current_battle_map_name:
@@ -2166,7 +2298,11 @@ class AutoControllerRuntime:
         try:
             while True:
                 self._ensure_not_stopped()
-                self.play_one_battle()
+                try:
+                    self.play_one_battle()
+                except TargetWinGoalReached:
+                    if not self._prompt_next_target_after_goal_reached():
+                        break
         except KeyboardInterrupt:
             self._push_event("runtime_stopped")
             self._set_status(status="stopped", phase="stopped")
@@ -2225,6 +2361,10 @@ class _FrameVisionPipeline:
         self._map_id = None
         self._map_name = None
         self._map_tracker = None
+
+    def ensure_capture_ready(self) -> None:
+        if self._frame_api_launcher is not None:
+            self._frame_api_launcher.ensure_started()
 
     def _read_latest_frame(self):
         fallback_specs = [
@@ -2367,6 +2507,13 @@ class _FrameVisionPipeline:
         chosen["stability_best_score"] = float(ranked[0]["best_score"])
         return chosen
 
+    def _collect_recent_frames(self, first_frame, sample_count: int = 5, poll_interval_seconds: float = 0.08) -> List[np.ndarray]:
+        frames = [first_frame]
+        while len(frames) < max(1, int(sample_count)):
+            time.sleep(max(0.01, float(poll_interval_seconds)))
+            frames.append(self._read_latest_frame())
+        return frames
+
     def _supplemental_state(self, frame, analysis_result: Dict[str, Any], turn_index: int) -> SupplementalState:
         if self._supplemental_provider is not None:
             payload = self._supplemental_provider(
@@ -2431,7 +2578,8 @@ class _FrameVisionPipeline:
         self.last_sp_count = int(get_sp_count_frame(frame))
         self.last_enemy_sp_count = int(get_enemy_sp_count_frame(frame))
         raw_map_state_result = detect_map_state(frame, self._map_name)
-        map_state_result = self._map_tracker.update_frame(frame)
+        state_frames = self._collect_recent_frames(frame, sample_count=5, poll_interval_seconds=0.08)
+        map_state_result = self._map_tracker.update_frames(state_frames)
         board_labels_raw = _map_state_to_board_labels(self._map_id, map_state_result)
         board_labels = _pad_board_labels_to_engine_dims(self._map_id, board_labels_raw)
         engine_map_grid = _extract_board_grid(board_labels)
@@ -2440,6 +2588,7 @@ class _FrameVisionPipeline:
             "map_match": map_match or {"map_id": self._map_id, "map_name_zh": self._map_name},
             "raw_map_state": raw_map_state_result,
             "map_state": map_state_result,
+            "map_state_frame_count": len(state_frames),
             "board": {
                 "raw_labels": board_labels_raw,
                 "labels": board_labels,

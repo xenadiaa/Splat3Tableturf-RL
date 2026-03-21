@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import threading
@@ -11,6 +12,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import numpy as np
@@ -179,17 +181,22 @@ class FrameState:
     frame_count: int = 0
     last_error: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
+    condition: threading.Condition = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.condition = threading.Condition(self.lock)
 
     def update_frame(self, frame: np.ndarray) -> None:
         ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
         if not ok:
             return
-        with self.lock:
+        with self.condition:
             self.frame = frame.copy()
             self.jpeg_bytes = encoded.tobytes()
             self.last_frame_ts = time.time()
             self.frame_count += 1
             self.last_error = ""
+            self.condition.notify_all()
 
     def snapshot_jpeg(self) -> Optional[bytes]:
         with self.lock:
@@ -206,14 +213,78 @@ class FrameState:
                 "last_error": self.last_error,
             }
 
+    def collect_future_frames(self, offsets: List[int], timeout_seconds: float) -> List[np.ndarray]:
+        targets = sorted(int(v) for v in offsets if int(v) >= 0)
+        if not targets:
+            return []
+
+        with self.condition:
+            if self.frame is None:
+                deadline = time.monotonic() + max(0.1, timeout_seconds)
+                while self.frame is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"FRAME_WAIT_TIMEOUT({timeout_seconds}s)")
+                    self.condition.wait(timeout=min(0.2, remaining))
+
+            base_frame_id = self.frame_count
+            captured: Dict[int, np.ndarray] = {}
+            if 0 in targets and self.frame is not None:
+                captured[0] = self.frame.copy()
+
+            deadline = time.monotonic() + max(0.1, timeout_seconds)
+            while any(offset not in captured for offset in targets):
+                current_frame = None if self.frame is None else self.frame.copy()
+                current_frame_id = self.frame_count
+                for offset in targets:
+                    if offset in captured:
+                        continue
+                    if current_frame is not None and current_frame_id >= base_frame_id + offset:
+                        captured[offset] = current_frame.copy()
+
+                if all(offset in captured for offset in targets):
+                    break
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"FRAME_WAIT_TIMEOUT({timeout_seconds}s)")
+                self.condition.wait(timeout=min(0.2, remaining))
+
+        images: List[np.ndarray] = []
+        for offset in targets:
+            images.append(captured[offset].copy())
+        return images
+
+    def collect_future_jpegs(self, offsets: List[int], timeout_seconds: float) -> List[bytes]:
+        images = self.collect_future_frames(offsets=offsets, timeout_seconds=timeout_seconds)
+        out: List[bytes] = []
+        for frame in images:
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if not ok:
+                raise RuntimeError("JPEG_ENCODE_FAILED")
+            out.append(encoded.tobytes())
+        return out
+
 
 def _make_handler(state: FrameState):
+    def _run_batch_worker(offsets: List[int], timeout_seconds: float, result: Dict[str, object], done: threading.Event) -> None:
+        try:
+            images = state.collect_future_jpegs(offsets=offsets, timeout_seconds=timeout_seconds)
+            result["images"] = [base64.b64encode(encoded).decode("ascii") for encoded in images]
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            done.set()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
             return
 
         def do_GET(self) -> None:
-            if self.path in {"/health", "/healthz"}:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+
+            if parsed.path in {"/health", "/healthz"}:
                 body = json.dumps(state.snapshot_metadata(), ensure_ascii=False).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -221,7 +292,7 @@ def _make_handler(state: FrameState):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path in {"/frame.jpg", "/frame.jpeg"}:
+            if parsed.path in {"/frame.jpg", "/frame.jpeg"}:
                 body = state.snapshot_jpeg()
                 if body is None:
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "No frame available yet")
@@ -233,7 +304,7 @@ def _make_handler(state: FrameState):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path == "/frame.json":
+            if parsed.path == "/frame.json":
                 body = json.dumps(state.snapshot_metadata(), ensure_ascii=False).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -241,9 +312,93 @@ def _make_handler(state: FrameState):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            self.send_error(HTTPStatus.NOT_FOUND, "Supported paths: /health, /frame.jpg, /frame.json")
+            if parsed.path == "/batch_frames":
+                offsets_param = query.get("offsets", [""])[0].strip()
+                count_param = query.get("count", [""])[0].strip()
+                step_param = query.get("step", ["1"])[0].strip()
+                timeout_param = query.get("timeout", ["3.0"])[0].strip()
+
+                try:
+                    timeout_seconds = float(timeout_param)
+                except ValueError:
+                    self.send_error(HTTPStatus.BAD_REQUEST, "timeout must be a number")
+                    return
+
+                if offsets_param:
+                    try:
+                        offsets = [int(part.strip()) for part in offsets_param.split(",") if part.strip()]
+                    except ValueError:
+                        self.send_error(HTTPStatus.BAD_REQUEST, "offsets must be comma-separated integers")
+                        return
+                elif count_param:
+                    try:
+                        count = int(count_param)
+                        step = int(step_param)
+                    except ValueError:
+                        self.send_error(HTTPStatus.BAD_REQUEST, "count and step must be integers")
+                        return
+                    if count <= 0 or step < 0:
+                        self.send_error(HTTPStatus.BAD_REQUEST, "count must be > 0 and step must be >= 0")
+                        return
+                    offsets = [idx * step for idx in range(count)]
+                else:
+                    self.send_error(HTTPStatus.BAD_REQUEST, "use offsets=0,3,6 or count=6&step=1")
+                    return
+
+                result: Dict[str, object] = {"images": []}
+                done = threading.Event()
+                worker = threading.Thread(
+                    target=_run_batch_worker,
+                    args=(offsets, timeout_seconds, result, done),
+                    name="batch-frame-worker",
+                    daemon=True,
+                )
+                worker.start()
+                done.wait(timeout=max(0.1, timeout_seconds) + 1.0)
+                worker.join(timeout=0.1)
+
+                if "error" in result:
+                    body = json.dumps({"images": [], "error": str(result["error"])}, ensure_ascii=False).encode("utf-8")
+                    self.send_response(HTTPStatus.REQUEST_TIMEOUT)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                body = json.dumps(
+                    {"images": result["images"]},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "Supported paths: /health, /frame.jpg, /frame.json, /batch_frames")
 
     return Handler
+
+
+def _save_burst_frames_worker(
+    state: FrameState,
+    out_dir: Path,
+    prefix: str,
+    start_idx: int,
+    count: int,
+    timeout_seconds: float,
+) -> None:
+    try:
+        frames = state.collect_future_frames(offsets=list(range(count)), timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        print(f"[burst-error] {exc}")
+        return
+
+    for offset, frame in enumerate(frames):
+        path = _unique_image_path(out_dir, prefix, start_idx + offset)
+        cv2.imwrite(str(path), frame)
+        print(f"[saved] {path}")
 
 
 def _overlay_status(
@@ -258,7 +413,7 @@ def _overlay_status(
         f"Capture: {profile_label}",
         f"API: {api_url}/frame.jpg",
         f"Saved: {saved_count}",
-        "Keys: Enter save PNG, Esc/close window/Ctrl+C quit",
+        "Keys: Enter save PNG, Shift+Enter/B burst 30 PNG, Esc/close window/Ctrl+C quit",
     ]
     for idx, text in enumerate(lines):
         y = 30 + idx * 28
@@ -351,6 +506,7 @@ def main() -> int:
     print(f"Screenshot output: {out_dir}")
     last_frame_ts = time.monotonic()
     saved_count = 0
+    burst_timeout_seconds = max(3.0, 30.0 / max(1, args.fps) + 2.0)
 
     try:
         cv2.namedWindow(args.window_title, cv2.WINDOW_NORMAL)
@@ -378,14 +534,30 @@ def main() -> int:
             cv2.imshow(args.window_title, display_frame)
             if cv2.getWindowProperty(args.window_title, cv2.WND_PROP_VISIBLE) < 1:
                 break
-            key = cv2.waitKey(1) & 0xFF
+            key_ex = cv2.waitKeyEx(1)
+            key = key_ex & 0xFF
             if key == 27:
                 break
+            shift_enter = (key_ex not in (10, 13)) and ((key_ex & 0xFF) in (10, 13))
+            burst_key = key in (ord("b"), ord("B")) or shift_enter
+            if burst_key:
+                start_idx = saved_count + 1
+                saved_count += 30
+                worker = threading.Thread(
+                    target=_save_burst_frames_worker,
+                    args=(state, out_dir, prefix, start_idx, 30, burst_timeout_seconds),
+                    name="burst-save-worker",
+                    daemon=True,
+                )
+                worker.start()
+                print("[burst] saving next 30 frames")
+                continue
             if key in (10, 13):
                 saved_count += 1
                 path = _unique_image_path(out_dir, prefix, saved_count)
                 cv2.imwrite(str(path), state.frame)
                 print(f"[saved] {path}")
+                continue
     finally:
         server.shutdown()
         server.server_close()

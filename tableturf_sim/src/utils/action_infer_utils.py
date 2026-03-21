@@ -538,3 +538,200 @@ def infer_actions_from_map_transition(
         "match_count": len(matches),
         "matches": matches,
     }
+
+
+def infer_other_action_from_known_action(
+    map_id: str,
+    before_grid: List[List[int]],
+    after_grid: List[List[int]],
+    known_player: str,
+    known_action: Dict[str, object],
+    p1_deck: Optional[List[int]] = None,
+    p2_deck: Optional[List[int]] = None,
+    p1_hand: Optional[List[int]] = None,
+    p2_hand: Optional[List[int]] = None,
+    p1_sp: Optional[int] = None,
+    p2_sp: Optional[int] = None,
+    turn: int = 1,
+) -> Dict[str, object]:
+    """
+    Infer the opponent action from a known one-side action plus before/after map snapshots.
+
+    Stub interface for future implementation.
+    Current behavior:
+    - exposes a stable public API
+    - always returns a single fallback candidate: opponent pass
+    """
+    if known_player not in ("P1", "P2"):
+        raise ValueError("known_player must be P1 or P2")
+    other_player = "P2" if known_player == "P1" else "P1"
+    return {
+        "ok": True,
+        "implemented": False,
+        "mode": "infer_other_action_from_known_action",
+        "map_id": map_id,
+        "turn": int(turn),
+        "known_player": known_player,
+        "known_action": dict(known_action),
+        "other_player": other_player,
+        "candidates": [
+            asdict(Action(player=other_player, card_number=None, pass_turn=True)),
+        ],
+        "message": "stub only; currently returns opponent pass_turn",
+    }
+
+
+def infer_map_from_known_actions(
+    map_id: str,
+    before_grid: List[List[int]],
+    after_grid: List[List[int]],
+    p1_action: Optional[Dict[str, object]] = None,
+    p2_action: Optional[Dict[str, object]] = None,
+    p1_deck: Optional[List[int]] = None,
+    p2_deck: Optional[List[int]] = None,
+    p1_hand: Optional[List[int]] = None,
+    p2_hand: Optional[List[int]] = None,
+    p1_sp: Optional[int] = None,
+    p2_sp: Optional[int] = None,
+    turn: int = 1,
+) -> Dict[str, object]:
+    """
+    Infer/validate map transition from known actions.
+
+    Stub interface for future implementation.
+    Current behavior:
+    - exposes a stable public API
+    - returns the provided before/after grids unchanged
+    """
+    return {
+        "ok": True,
+        "implemented": False,
+        "mode": "infer_map_from_known_actions",
+        "map_id": map_id,
+        "turn": int(turn),
+        "p1_action": dict(p1_action or {}),
+        "p2_action": dict(p2_action or {}),
+        "before_grid": before_grid,
+        "after_grid": after_grid,
+        "message": "stub only; currently echoes provided before/after grids",
+    }
+
+
+def infer(
+    mode: str,
+    map_id: str,
+    before_grid: Optional[List[List[int]]] = None,
+    after_grid: Optional[List[List[int]]] = None,
+    p1_deck: Optional[List[int]] = None,
+    p2_deck: Optional[List[int]] = None,
+    p1_hand: Optional[List[int]] = None,
+    p2_hand: Optional[List[int]] = None,
+    p1_sp: Optional[int] = None,
+    p2_sp: Optional[int] = None,
+    turn: int = 1,
+    max_results: int = 128,
+    known_player: Optional[str] = None,
+    known_action: Optional[Dict[str, object]] = None,
+    p1_action: Optional[Dict[str, object]] = None,
+    p2_action: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """
+    Unified inference entry with explicit mode enum.
+
+    Supported modes:
+    - map_to_both_actions
+    - map_plus_one_action_to_other
+    - both_actions_to_map
+    """
+    if mode == "map_to_both_actions":
+        if before_grid is None or after_grid is None:
+            raise ValueError("before_grid and after_grid are required for mode map_to_both_actions")
+        return infer_actions_from_map_transition(
+            map_id=map_id,
+            before_grid=before_grid,
+            after_grid=after_grid,
+            p1_deck=p1_deck,
+            p2_deck=p2_deck,
+            p1_hand=p1_hand,
+            p2_hand=p2_hand,
+            p1_sp=p1_sp,
+            p2_sp=p2_sp,
+            turn=turn,
+            max_results=max_results,
+        )
+    if mode == "map_plus_one_action_to_other":
+        if before_grid is None or after_grid is None:
+            raise ValueError("before_grid and after_grid are required for mode map_plus_one_action_to_other")
+        if not known_player:
+            raise ValueError("known_player is required for mode map_plus_one_action_to_other")
+        return infer_other_action_from_known_action(
+            map_id=map_id,
+            before_grid=before_grid,
+            after_grid=after_grid,
+            known_player=known_player,
+            known_action=dict(known_action or {}),
+            p1_deck=p1_deck,
+            p2_deck=p2_deck,
+            p1_hand=p1_hand,
+            p2_hand=p2_hand,
+            p1_sp=p1_sp,
+            p2_sp=p2_sp,
+            turn=turn,
+        )
+    if mode == "both_actions_to_map":
+        if before_grid is None:
+            raise ValueError("before_grid is required for mode both_actions_to_map")
+        return infer_map_from_known_actions(
+            map_id=map_id,
+            before_grid=before_grid,
+            after_grid=after_grid or before_grid,
+            p1_action=p1_action,
+            p2_action=p2_action,
+            p1_deck=p1_deck,
+            p2_deck=p2_deck,
+            p1_hand=p1_hand,
+            p2_hand=p2_hand,
+            p1_sp=p1_sp,
+            p2_sp=p2_sp,
+            turn=turn,
+        )
+    raise ValueError(f"unsupported infer mode: {mode}")
+
+
+def infer_with_mode(
+    mode: str,
+    map_id: str,
+    before_grid: Optional[List[List[int]]] = None,
+    after_grid: Optional[List[List[int]]] = None,
+    p1_deck: Optional[List[int]] = None,
+    p2_deck: Optional[List[int]] = None,
+    p1_hand: Optional[List[int]] = None,
+    p2_hand: Optional[List[int]] = None,
+    p1_sp: Optional[int] = None,
+    p2_sp: Optional[int] = None,
+    turn: int = 1,
+    max_results: int = 128,
+    known_player: Optional[str] = None,
+    known_action: Optional[Dict[str, object]] = None,
+    p1_action: Optional[Dict[str, object]] = None,
+    p2_action: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    # Backward-compatible alias.
+    return infer(
+        mode=mode,
+        map_id=map_id,
+        before_grid=before_grid,
+        after_grid=after_grid,
+        p1_deck=p1_deck,
+        p2_deck=p2_deck,
+        p1_hand=p1_hand,
+        p2_hand=p2_hand,
+        p1_sp=p1_sp,
+        p2_sp=p2_sp,
+        turn=turn,
+        max_results=max_results,
+        known_player=known_player,
+        known_action=known_action,
+        p1_action=p1_action,
+        p2_action=p2_action,
+    )

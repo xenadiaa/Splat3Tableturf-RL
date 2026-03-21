@@ -7,7 +7,7 @@
   "final_recent_mean_ep_reward": 2.8335,
   "final_recent_win_rate": 0.04,
   "episodes_finished": 341,
-  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/score_reward_square_aori_4096_20260316",
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/GST_RL/strategy_tiers/low_granularity/checkpoints/score_reward_square_aori_4096_20260316",
   "run_config": {
     "map_id": "Square",
     "p1_deck": "player:正方广场",

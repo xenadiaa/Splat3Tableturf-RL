@@ -55,13 +55,15 @@ def choose_with_arrows(
         while True:
             _clear_screen()
             width = shutil.get_terminal_size((80, 24)).columns
-            print(title[:width])
+            for line in str(title).splitlines() or [""]:
+                print(line[:width])
             print("-" * min(width, 80))
             for i, opt in enumerate(options):
                 marker = ">" if i == idx else " "
                 print(f"{marker} {opt}")
             print()
-            print(footer[:width])
+            for line in str(footer).splitlines() or [""]:
+                print(line[:width])
 
             key = _read_key()
             if key == "up":
@@ -74,4 +76,3 @@ def choose_with_arrows(
             elif key == "ctrl_c":
                 _clear_screen()
                 return None
-

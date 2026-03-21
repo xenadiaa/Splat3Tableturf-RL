@@ -4,9 +4,12 @@ import argparse
 import glob
 import json
 import sys
+import time
+import urllib.request
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -18,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 MAP_REFERENCE_DIR = REPO_ROOT / "tableturf_vision" / "参照基础"
 MAP_COORD_DIR = REPO_ROOT / "tableturf_vision" / "参照基础_坐标点确定"
+MAP_STATE_ERROR_DIR = REPO_ROOT / "tableturf_vision" / "error"
 MAP_NAMES = [
     "加速高速公路",
     "双子岛",
@@ -357,6 +361,411 @@ def detect_map_state(frame_bgr: np.ndarray, map_name: str) -> Dict:
     }
 
 
+def _cell_vote_key(cell: Dict) -> CellPos:
+    return (int(cell["json_row"]), int(cell["json_col"]))
+
+
+def _save_unknown_combo_debug_frame(
+    frame_bgr: np.ndarray,
+    map_name: str,
+    unknown_combos: List[Dict],
+    resolved_cells: Optional[Dict[CellPos, Dict[str, Any]]] = None,
+) -> Optional[str]:
+    try:
+        MAP_STATE_ERROR_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        stem = f"map_state_unknown_combo_{map_name}_{stamp}"
+        image_path = MAP_STATE_ERROR_DIR / f"{stem}.png"
+        meta_path = MAP_STATE_ERROR_DIR / f"{stem}.json"
+        doc_path = MAP_STATE_ERROR_DIR / f"{stem}.md"
+        cv2.imwrite(str(image_path), frame_bgr)
+        resolved_cells = resolved_cells or {}
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": stamp,
+                    "map_name": map_name,
+                    "unknown_combo_count": len(unknown_combos),
+                    "unknown_combos": unknown_combos,
+                    "image": str(image_path),
+                    "document": str(doc_path),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        lines = [
+            f"# Unknown Combo Record",
+            "",
+            f"- timestamp: `{stamp}`",
+            f"- map_name: `{map_name}`",
+            f"- image: `{image_path}`",
+            f"- combo_count: `{len(unknown_combos)}`",
+            "",
+            "## Cells",
+        ]
+        for idx, combo in enumerate(unknown_combos, start=1):
+            key = (int(combo["json_row"]), int(combo["json_col"]))
+            resolved = resolved_cells.get(key, {})
+            lines.extend(
+                [
+                    "",
+                    f"### {idx}. cell ({key[0]}, {key[1]})",
+                    f"- raw_labels: `{', '.join(combo.get('raw_labels', []))}`",
+                    f"- reduced_labels: `{', '.join(combo.get('reduced_labels', []))}`",
+                    f"- distribution: `{json.dumps(combo.get('distribution', {}), ensure_ascii=False)}`",
+                    f"- below_label: `{combo.get('below_label', '')}`",
+                    f"- final_label: `{resolved.get('label', '')}`",
+                    f"- vote_summary: `{json.dumps(resolved.get('vote_summary', {}), ensure_ascii=False)}`",
+                ]
+            )
+        doc_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return str(image_path)
+    except Exception:
+        return None
+
+
+def _resolve_downward_combo(
+    raw_labels: Set[str],
+    below_label: str,
+) -> Optional[str]:
+    if "p1_special" in raw_labels and "conflict" in raw_labels:
+        if below_label == "p1_special":
+            return "conflict"
+        if below_label == "p2_special":
+            return "p1_special"
+        if below_label == "conflict":
+            return "conflict"
+    return None
+
+
+def detect_map_state_from_frames(frames_bgr: List[np.ndarray], map_name: str) -> Dict:
+    if not frames_bgr:
+        raise ValueError("frames_bgr must not be empty")
+    frame_results = [detect_map_state(frame, map_name) for frame in frames_bgr]
+    cell_keys = [_cell_vote_key(cell) for cell in frame_results[0]["cells"]]
+    initial_cells: List[Dict] = []
+
+    for key in cell_keys:
+        samples = [next(cell for cell in result["cells"] if _cell_vote_key(cell) == key) for result in frame_results]
+        vote_count: Dict[str, int] = {}
+        score_sum: Dict[str, float] = {}
+        error_votes = 0
+        for sample in samples:
+            label = str(sample["label"])
+            vote_count[label] = vote_count.get(label, 0) + 1
+            score_sum[label] = score_sum.get(label, 0.0) + float(sample["scores"].get(label, 0.0) or 0.0)
+            if bool(sample.get("is_error")):
+                error_votes += 1
+
+        chosen_label = max(
+            vote_count.keys(),
+            key=lambda label: (
+                int(vote_count[label]),
+                float(score_sum.get(label, 0.0)),
+                -["p1_fill", "p2_fill", "p1_special", "p2_special", "conflict", "transparent"].index(label),
+            ),
+        )
+        chosen_sample = max(
+            samples,
+            key=lambda sample: (
+                str(sample["label"]) == chosen_label,
+                float(sample["scores"].get(chosen_label, 0.0) or 0.0),
+            ),
+        )
+        merged = {
+            "index": int(chosen_sample["index"]),
+            "center": list(chosen_sample["center"]),
+            "radius": float(chosen_sample["radius"]),
+            "json_row": int(chosen_sample["json_row"]),
+            "json_col": int(chosen_sample["json_col"]),
+            "mean_bgr": [
+                round(float(sum(float(sample["mean_bgr"][idx]) for sample in samples) / len(samples)), 2)
+                for idx in range(3)
+            ],
+            "label": chosen_label,
+            "scores": {k: round(float(sum(float(sample["scores"].get(k, 0.0) or 0.0) for sample in samples)), 4) for k in chosen_sample["scores"].keys()},
+            "is_error": bool(error_votes > (len(samples) // 2)),
+            "vote_summary": {
+                "label_votes": {k: int(v) for k, v in sorted(vote_count.items())},
+                "error_votes": int(error_votes),
+                "frame_count": len(samples),
+            },
+            "raw_labels": sorted(vote_count.keys()),
+        }
+        initial_cells.append(merged)
+
+    base_cell_map = {
+        (int(cell["json_row"]), int(cell["json_col"])): cell
+        for cell in initial_cells
+    }
+    working_cells: Dict[CellPos, Dict[str, Any]] = {
+        key: dict(value)
+        for key, value in base_cell_map.items()
+    }
+    known_combo_corrections: List[Dict] = []
+
+    # Phase 1: direct reductions that do not depend on lower-neighbor state.
+    for key in cell_keys:
+        cell = dict(working_cells[key])
+        raw_labels = set(str(label) for label in cell.get("raw_labels", []))
+        reduced_labels = set(raw_labels)
+        reductions: List[str] = []
+        if "p2_special" in reduced_labels and "conflict" in reduced_labels:
+            reduced_labels.discard("conflict")
+            reductions.append("p2_special + conflict => p2_special")
+        if "p2_fill" in reduced_labels and "conflict" in reduced_labels:
+            reduced_labels.discard("conflict")
+            reductions.append("p2_fill + conflict => p2_fill")
+        if "p1_fill" in reduced_labels and "conflict" in reduced_labels:
+            reduced_labels.discard("conflict")
+            reductions.append("p1_fill + conflict => p1_fill")
+        if "p1_fill" in reduced_labels and "p1_special" in reduced_labels:
+            reduced_labels.discard("p1_fill")
+            reductions.append("p1_fill + p1_special => p1_special")
+        cell["reduced_labels"] = sorted(reduced_labels)
+        if len(reduced_labels) == 1:
+            cell["label"] = next(iter(reduced_labels))
+            cell["is_error"] = False
+        if reductions:
+            cell["postprocess_rule"] = " | ".join(reductions)
+            known_combo_corrections.append(
+                {
+                    "json_row": int(cell["json_row"]),
+                    "json_col": int(cell["json_col"]),
+                    "raw_labels": sorted(raw_labels),
+                    "resolved_label": str(cell["label"]),
+                    "rule": str(cell["postprocess_rule"]),
+                    "phase": "direct",
+                }
+            )
+        working_cells[key] = cell
+
+    # Phase 2: recursive reductions that depend on the lower neighbor being uniquely resolved.
+    max_passes = 25
+    passes_used = 0
+    reached_recursion_limit = False
+    for pass_idx in range(max_passes):
+        passes_used = pass_idx + 1
+        changed = False
+        for key in cell_keys:
+            cell = dict(working_cells[key])
+            reduced_labels = set(str(label) for label in cell.get("reduced_labels", cell.get("raw_labels", [])))
+            if not ("p1_special" in reduced_labels and "conflict" in reduced_labels):
+                continue
+            below = working_cells.get((int(cell["json_row"]) + 1, int(cell["json_col"])))
+            if below is None:
+                continue
+            below_reduced = set(str(label) for label in below.get("reduced_labels", below.get("raw_labels", [])))
+            if len(below_reduced) != 1:
+                continue
+            below_label = next(iter(below_reduced))
+            downward = _resolve_downward_combo(reduced_labels, below_label)
+            if downward is None:
+                continue
+            new_reduced = {downward}
+            if set(str(x) for x in cell.get("reduced_labels", [])) == new_reduced and str(cell.get("label")) == downward:
+                continue
+            cell["reduced_labels"] = sorted(new_reduced)
+            cell["label"] = downward
+            cell["is_error"] = False
+            rule = f"p1_special + conflict => {downward} (below={below_label})"
+            old_rule = str(cell.get("postprocess_rule", "")).strip()
+            cell["postprocess_rule"] = f"{old_rule} | {rule}".strip(" |")
+            known_combo_corrections.append(
+                {
+                    "json_row": int(cell["json_row"]),
+                    "json_col": int(cell["json_col"]),
+                    "raw_labels": sorted(set(str(label) for label in cell.get("raw_labels", []))),
+                    "resolved_label": downward,
+                    "rule": rule,
+                    "phase": f"downward_pass_{pass_idx + 1}",
+                }
+            )
+            working_cells[key] = cell
+            changed = True
+        if not changed:
+            break
+    else:
+        reached_recursion_limit = True
+
+    merged_cells: List[Dict] = []
+    unknown_combos: List[Dict] = []
+    for key in cell_keys:
+        cell = dict(working_cells[key])
+        raw_labels = set(str(label) for label in cell.get("raw_labels", []))
+        reduced_labels = set(str(label) for label in cell.get("reduced_labels", cell.get("raw_labels", [])))
+        if len(reduced_labels) >= 2:
+            below = working_cells.get((int(cell["json_row"]) + 1, int(cell["json_col"])))
+            below_reduced = sorted(set(str(label) for label in below.get("reduced_labels", below.get("raw_labels", [])))) if below is not None else []
+            unknown_combos.append(
+                {
+                    "json_row": int(cell["json_row"]),
+                    "json_col": int(cell["json_col"]),
+                    "raw_labels": sorted(raw_labels),
+                    "reduced_labels": sorted(reduced_labels),
+                    "distribution": dict(cell["vote_summary"]["label_votes"]),
+                    "below_reduced_labels": below_reduced,
+                    "final_label": str(cell.get("label", "")),
+                }
+            )
+        merged_cells.append(cell)
+
+    all_cells_resolved = len(unknown_combos) == 0
+
+    counts = _recount_labels(merged_cells)
+    error_cells: List[Dict] = []
+    for cell in merged_cells:
+        if bool(cell.get("is_error")):
+            error_cells.append(
+                {
+                    "index": int(cell["index"]),
+                    "json_row": int(cell["json_row"]),
+                    "json_col": int(cell["json_col"]),
+                    "center": list(cell["center"]),
+                    "mean_bgr": list(cell["mean_bgr"]),
+                }
+            )
+
+    unknown_combo_debug_image = None
+    unknown_combo_debug_document = None
+    if unknown_combos:
+        resolved_cells = {
+            (int(cell["json_row"]), int(cell["json_col"])): cell
+            for cell in merged_cells
+        }
+        unknown_combo_debug_image = _save_unknown_combo_debug_frame(
+            frames_bgr[0],
+            map_name,
+            unknown_combos,
+            resolved_cells=resolved_cells,
+        )
+        if unknown_combo_debug_image:
+            unknown_combo_debug_document = str(Path(unknown_combo_debug_image).with_suffix(".md"))
+
+    return {
+        "map_name": map_name,
+        "reference_point_count": len(merged_cells),
+        "counts": counts,
+        "error_count": len(error_cells),
+        "error_cells": error_cells,
+        "cells": merged_cells,
+        "frame_count_used": len(frames_bgr),
+        "frame_results": frame_results,
+        "postprocess_passes_used": passes_used,
+        "postprocess_max_passes": max_passes,
+        "postprocess_reached_recursion_limit": reached_recursion_limit,
+        "postprocess_all_cells_resolved": all_cells_resolved,
+        "postprocess_known_combo_corrections": known_combo_corrections,
+        "unknown_combo_count": len(unknown_combos),
+        "unknown_combos": unknown_combos,
+        "unknown_combo_debug_image": unknown_combo_debug_image,
+        "unknown_combo_debug_document": unknown_combo_debug_document,
+    }
+
+
+def _frame_json_url_from_frame_url(frame_url: str) -> str:
+    base = str(frame_url).strip()
+    if base.endswith("/frame.jpg"):
+        return base[:-10] + "/frame.json"
+    if base.endswith("/frame.jpeg"):
+        return base[:-11] + "/frame.json"
+    if base.endswith("/frame.json"):
+        return base
+    return base.rstrip("/") + "/frame.json"
+
+
+def _fetch_json(url: str, timeout_seconds: float) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=max(0.3, float(timeout_seconds))) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_frame(url: str, timeout_seconds: float) -> np.ndarray:
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=max(0.3, float(timeout_seconds))) as resp:
+        payload = resp.read()
+    buf = np.frombuffer(payload, dtype=np.uint8)
+    frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if frame is None or frame.size == 0:
+        raise ValueError(f"cannot decode frame from {url}")
+    return frame
+
+
+def collect_rotating_frames_from_frame_api(
+    frame_url: str = "http://127.0.0.1:8765/frame.jpg",
+    frame_json_url: str = "",
+    sample_count: int = 5,
+    poll_interval_seconds: float = 0.08,
+    timeout_seconds: float = 3.0,
+) -> Dict[str, Any]:
+    if sample_count <= 0:
+        raise ValueError("sample_count must be > 0")
+    json_url = str(frame_json_url or _frame_json_url_from_frame_url(frame_url))
+    deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+    seen_keys: Set[Tuple[int, float]] = set()
+    frames: List[np.ndarray] = []
+    metadata_list: List[Dict[str, Any]] = []
+    last_metadata: Optional[Dict[str, Any]] = None
+
+    while len(frames) < sample_count and time.monotonic() < deadline:
+        metadata = _fetch_json(json_url, timeout_seconds=min(1.0, timeout_seconds))
+        last_metadata = metadata
+        key = (
+            int(metadata.get("frame_count", 0) or 0),
+            float(metadata.get("last_frame_ts", 0.0) or 0.0),
+        )
+        if key in seen_keys or key == (0, 0.0):
+            time.sleep(max(0.01, float(poll_interval_seconds)))
+            continue
+        frame = _fetch_frame(frame_url, timeout_seconds=min(1.0, timeout_seconds))
+        seen_keys.add(key)
+        frames.append(frame)
+        metadata_list.append(metadata)
+        if len(frames) < sample_count:
+            time.sleep(max(0.01, float(poll_interval_seconds)))
+
+    if not frames:
+        raise ValueError(f"no rotating frames collected from {frame_url}")
+
+    return {
+        "frames": frames,
+        "metadata": metadata_list,
+        "frame_count_collected": len(frames),
+        "requested_sample_count": int(sample_count),
+        "last_metadata": last_metadata or {},
+        "frame_url": frame_url,
+        "frame_json_url": json_url,
+    }
+
+
+def detect_map_state_from_frame_api(
+    map_name: str,
+    frame_url: str = "http://127.0.0.1:8765/frame.jpg",
+    frame_json_url: str = "",
+    sample_count: int = 5,
+    poll_interval_seconds: float = 0.08,
+    timeout_seconds: float = 3.0,
+) -> Dict:
+    collected = collect_rotating_frames_from_frame_api(
+        frame_url=frame_url,
+        frame_json_url=frame_json_url,
+        sample_count=sample_count,
+        poll_interval_seconds=poll_interval_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    result = detect_map_state_from_frames(collected["frames"], map_name)
+    result["frame_api"] = {
+        "frame_url": collected["frame_url"],
+        "frame_json_url": collected["frame_json_url"],
+        "frame_count_collected": int(collected["frame_count_collected"]),
+        "requested_sample_count": int(collected["requested_sample_count"]),
+        "metadata": collected["metadata"],
+    }
+    return result
+
+
 def _recount_labels(cells: List[Dict]) -> Dict[str, int]:
     counts = {
         "p1_fill": 0,
@@ -419,12 +828,34 @@ class MapStateTracker:
         result = detect_map_state(frame_bgr, self.map_name)
         return result
 
+    def update_frames(self, frames_bgr: List[np.ndarray]) -> Dict:
+        result = detect_map_state_from_frames(frames_bgr, self.map_name)
+        return result
+
     def update_image_path(self, image_path: Path) -> Dict:
         frame = cv2.imread(str(image_path))
         if frame is None:
             raise ValueError(f"cannot read image: {image_path}")
         result = self.update_frame(frame)
         result["image"] = str(image_path)
+        return result
+
+    def update_frame_api(
+        self,
+        frame_url: str = "http://127.0.0.1:8765/frame.jpg",
+        frame_json_url: str = "",
+        sample_count: int = 5,
+        poll_interval_seconds: float = 0.08,
+        timeout_seconds: float = 3.0,
+    ) -> Dict:
+        result = detect_map_state_from_frame_api(
+            self.map_name,
+            frame_url=frame_url,
+            frame_json_url=frame_json_url,
+            sample_count=sample_count,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
+        )
         return result
 
     def update_frame_with_action(
@@ -524,6 +955,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--map-name", default="", help="Chinese map name")
     p.add_argument("--image", default="", help="image path; empty means latest capture image")
     p.add_argument("--input-dir", default="vision_capture/debug")
+    p.add_argument("--frame-url", default="", help="frame API jpg url; when set, use rotating-frame vote mode")
+    p.add_argument("--frame-json-url", default="", help="frame API metadata url; defaults to /frame.json")
+    p.add_argument("--sample-count", type=int, default=5, help="number of rotating frames to vote")
+    p.add_argument("--poll-interval", type=float, default=0.08, help="seconds between frame polling attempts")
+    p.add_argument("--timeout-seconds", type=float, default=3.0, help="frame collection timeout")
     p.add_argument("--json", action="store_true", help="print full JSON result")
     p.add_argument("--print-grid", action="store_true", help="print terminal map-structure preview")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color in --print-grid output")
@@ -570,12 +1006,25 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    image = _resolve_image(args.image, args.input_dir)
-    result = detect_map_state_image_path(image, args.map_name)
+    if args.frame_url:
+        result = detect_map_state_from_frame_api(
+            args.map_name,
+            frame_url=args.frame_url,
+            frame_json_url=args.frame_json_url,
+            sample_count=args.sample_count,
+            poll_interval_seconds=args.poll_interval,
+            timeout_seconds=args.timeout_seconds,
+        )
+    else:
+        image = _resolve_image(args.image, args.input_dir)
+        result = detect_map_state_image_path(image, args.map_name)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.print_grid:
-        print(f"Image: {result['image']}")
+        if "image" in result:
+            print(f"Image: {result['image']}")
+        elif "frame_api" in result:
+            print(f"Frame API: {result['frame_api']['frame_url']}")
         print(f"Map: {args.map_name}")
         print(f"Counts: {json.dumps(result['counts'], ensure_ascii=False)}")
         print("[Grid]")

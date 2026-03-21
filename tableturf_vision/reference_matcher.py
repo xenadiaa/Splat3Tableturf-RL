@@ -13,7 +13,6 @@ from tableturf_vision.map_state_detector import (
     MAP_NAMES,
     _classify_cell,
     _load_map_info,
-    _sample_patch_mean_bgr,
     load_map_reference_points,
 )
 from tableturf_vision.tableturf_mapper import _load_layout, _parse_board
@@ -65,7 +64,9 @@ def compare_masks(obs: np.ndarray, tmpl: np.ndarray) -> Dict:
 
 
 def _is_board_like(mean_bgr: np.ndarray) -> bool:
-    label, _, _ = _classify_cell(mean_bgr)
+    label, _, is_error = _classify_cell(mean_bgr)
+    if is_error:
+        return False
     if label != "transparent":
         return True
     b, g, r = [float(x) for x in mean_bgr.tolist()]
@@ -76,6 +77,18 @@ def _is_board_like(mean_bgr: np.ndarray) -> bool:
         and b >= g - 5
         and b >= r - 10
     )
+
+
+def _sample_patch_mean_bgr_for_map_match(frame_bgr: np.ndarray, cx: float, cy: float, radius: float) -> np.ndarray:
+    h, w = frame_bgr.shape[:2]
+    r = max(3, int(round(radius * 0.6)))
+    ix, iy = int(round(cx)), int(round(cy))
+    x0, x1 = max(0, ix - r), min(w, ix + r + 1)
+    y0, y1 = max(0, iy - r), min(h, iy + r + 1)
+    patch = frame_bgr[y0:y1, x0:x1]
+    if patch.size == 0:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    return patch.reshape(-1, 3).mean(axis=0).astype(np.float32)
 
 
 @lru_cache(maxsize=None)
@@ -184,7 +197,7 @@ def match_map_from_frame(frame_bgr: np.ndarray) -> Dict:
                 if col_idx not in geometry["col_x_norm"]:
                     continue
                 cx = geometry["col_x_norm"][col_idx] * float(w)
-                mean_bgr = _sample_patch_mean_bgr(frame_bgr, cx, cy, radius)
+                mean_bgr = _sample_patch_mean_bgr_for_map_match(frame_bgr, cx, cy, radius)
                 is_board = _is_board_like(mean_bgr)
                 expected_valid = int(cell_value) != 0
                 total += 1
@@ -210,14 +223,15 @@ def match_map_from_frame(frame_bgr: np.ndarray) -> Dict:
         better = False
         best_valid_hits = int(best.get("valid_hits", -1))
         best_valid_hit_ratio = float(best.get("valid_hit_ratio", -1.0))
-        if valid_hits > best_valid_hits:
+        best_score = float(best.get("score", -1.0))
+        if valid_hit_ratio > best_valid_hit_ratio:
             better = True
-        elif valid_hits == best_valid_hits and score > best["score"]:
+        elif abs(valid_hit_ratio - best_valid_hit_ratio) <= 1e-9 and score > best_score:
             better = True
         elif (
-            valid_hits == best_valid_hits
-            and abs(score - best["score"]) <= 1e-9
-            and valid_hit_ratio > best_valid_hit_ratio
+            abs(valid_hit_ratio - best_valid_hit_ratio) <= 1e-9
+            and abs(score - best_score) <= 1e-9
+            and valid_hits > best_valid_hits
         ):
             better = True
         if better:
@@ -239,7 +253,7 @@ def match_map_from_frame(frame_bgr: np.ndarray) -> Dict:
 
     best["candidate_details"] = sorted(
         candidate_rows,
-        key=lambda item: (item["valid_hits"], item["score"], item["valid_hit_ratio"]),
+        key=lambda item: (item["valid_hit_ratio"], item["score"], item["valid_hits"]),
         reverse=True,
     )
     return best

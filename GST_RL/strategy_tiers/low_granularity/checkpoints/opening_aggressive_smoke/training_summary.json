@@ -7,7 +7,7 @@
   "final_recent_mean_ep_reward": -3.29,
   "final_recent_win_rate": 0.0,
   "episodes_finished": 1,
-  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/opening_aggressive_smoke",
+  "save_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/GST_RL/strategy_tiers/low_granularity/checkpoints/opening_aggressive_smoke",
   "run_config": {
     "map_id": "Square",
     "p1_deck": "player:正方广场",

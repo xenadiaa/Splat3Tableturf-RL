@@ -1,10 +1,10 @@
 # Tableturf Strategy DQN
 
-`gamestrategy_DQN` 是一个独立的 DQN 工程目录，用于训练 Tableturf 单智能体策略。
+`GST_DQN` 是一个独立的 DQN 工程目录，用于训练 Tableturf 单智能体策略。
 
 ## 目录说明
 
-- `rl_env.py`: 复用 `gamestrategy_RL` 已验证过的环境封装
+- `rl_env.py`: 本目录下的单智能体环境封装
 - `networks.py`: DQN 状态编码器与动态动作 Q 网络
 - `dqn_trainer.py`: 经验回放、target network、训练日志与 checkpoint
 - `train.py`: 命令行训练入口
@@ -21,17 +21,17 @@
 在仓库根目录 `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL` 下运行：
 
 ```bash
-python -m gamestrategy_DQN.train --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high
+python -m GST_DQN.train --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high
 ```
 
 查看帮助：
 
 ```bash
-python -m gamestrategy_DQN.train --help
+python -m GST_DQN.train --help
 ```
 
 列出地图：
 
 ```bash
-python -m gamestrategy_DQN.train --list-maps
+python -m GST_DQN.train --list-maps
 ```

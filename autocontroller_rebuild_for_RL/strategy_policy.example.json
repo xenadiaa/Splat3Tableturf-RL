@@ -7,12 +7,12 @@
   "maps": {
     "加速高速公路": {
       "mode": "ppo",
-      "training_summary": "gamestrategy_RL/checkpoints_all_maps/ManySp/training_summary.json",
+      "training_summary": "GST_RL/checkpoints_all_maps/ManySp/training_summary.json",
       "label": "加速高速公路-PPO"
     },
     "双子岛": {
       "mode": "ppo",
-      "checkpoint_dir": "gamestrategy_RL/checkpoints_all_maps/WDiamond",
+      "checkpoint_dir": "GST_RL/checkpoints_all_maps/WDiamond",
       "label": "双子岛-PPO"
     },
     "小巧竞技场": {
@@ -27,7 +27,7 @@
     },
     "正方广场": {
       "mode": "ppo",
-      "checkpoint_file": "gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
+      "checkpoint_file": "GST_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
       "label": "正方广场-PPO",
       "fallback_strategy_id": "default:aggressive:high",
       "fallback_label": "正方广场-激进(缺失PPO回退)"
@@ -84,12 +84,12 @@
     },
     "ManySp": {
       "mode": "ppo",
-      "training_summary": "gamestrategy_RL/checkpoints_all_maps/ManySp/training_summary.json",
+      "training_summary": "GST_RL/checkpoints_all_maps/ManySp/training_summary.json",
       "label": "ManySp-PPO"
     },
     "WDiamond": {
       "mode": "ppo",
-      "checkpoint_dir": "gamestrategy_RL/checkpoints_all_maps/WDiamond",
+      "checkpoint_dir": "GST_RL/checkpoints_all_maps/WDiamond",
       "label": "WDiamond-PPO"
     },
     "SmallSquare": {
@@ -104,7 +104,7 @@
     },
     "Square": {
       "mode": "ppo",
-      "checkpoint_file": "gamestrategy_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
+      "checkpoint_file": "GST_RL/strategy_tiers/low_granularity/checkpoints/selfplay_2p_dual_square_player_square_vs_aori_deck_20260316/p1_ppo_u0064.pt",
       "label": "Square-PPO",
       "fallback_strategy_id": "default:aggressive:high",
       "fallback_label": "Square-激进(缺失PPO回退)"

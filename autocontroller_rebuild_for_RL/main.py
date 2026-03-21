@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from dataclasses import asdict
@@ -12,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from autocontroller_rebuild_for_RL.runtime import (
     AutoControllerRuntime,
+    FrameApiAutoLauncher,
     MissingInterfaceError,
     REPO_ROOT,
     load_config,
@@ -35,7 +37,48 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="print resolved config and exit",
     )
+    parser.add_argument(
+        "--target-wins",
+        type=int,
+        default=None,
+        help="temporary target wins for this run only; overrides config and stops after reaching it",
+    )
+    parser.add_argument(
+        "--tmp_win_target",
+        action="store_true",
+        help="prompt for a temporary target win count before starting; does not modify config file",
+    )
     return parser.parse_args()
+
+
+def _prompt_target_wins_if_needed(args: argparse.Namespace) -> int | None:
+    if not bool(getattr(args, "tmp_win_target", False)):
+        return None
+    if args.target_wins is not None:
+        return max(0, int(args.target_wins))
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        raw = input("本次临时目标胜场（直接回车表示按配置继续运行）: ").strip()
+    except EOFError:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        print(f"无效目标胜场输入：{raw}，将按配置继续运行。")
+        return None
+
+
+def _clear_terminal_for_runtime_ui() -> None:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    with contextlib.suppress(Exception):
+        # Startup cleanup should clear both the visible screen and the scrollback
+        # left by shell prompts / launch commands before the runtime UI begins.
+        sys.stdout.write("\r\033[3J\033[2J\033[H")
+        sys.stdout.flush()
 
 
 def main() -> int:
@@ -44,6 +87,21 @@ def main() -> int:
     if args.print_config:
         print(json.dumps(asdict(config), ensure_ascii=False, indent=2))
         return 0
+
+    prelaunch_frame_api = None
+    if bool(getattr(args, "tmp_win_target", False)) and str(config.frame_api_url or "").strip():
+        prelaunch_frame_api = FrameApiAutoLauncher(config)
+        prelaunch_frame_api.ensure_started()
+
+    override_target_wins = _prompt_target_wins_if_needed(args)
+    if override_target_wins is not None:
+        if int(override_target_wins) == 0:
+            config.continuous_run = True
+        else:
+            config.continuous_run = False
+            config.target_win_count = int(override_target_wins)
+
+    _clear_terminal_for_runtime_ui()
 
     runtime = AutoControllerRuntime(config)
     try:

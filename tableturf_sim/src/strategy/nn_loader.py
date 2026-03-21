@@ -26,7 +26,7 @@ def _load_model(checkpoint_file: str):
     if ckpt in _MODEL_CACHE:
         return _MODEL_CACHE[ckpt], torch
 
-    from gamestrategy_RL.networks import PolicyValueNet
+    from GST_RL.networks import PolicyValueNet
 
     model = PolicyValueNet(map_channels=6, scalar_dim=6, action_feature_dim=12)
     obj = torch.load(ckpt, map_location="cpu")

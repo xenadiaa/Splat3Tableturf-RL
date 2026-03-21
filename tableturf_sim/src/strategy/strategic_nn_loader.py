@@ -42,7 +42,7 @@ def is_strategic_checkpoint(checkpoint_file: str) -> bool:
 def _max_map_shape() -> Tuple[int, int]:
     global _MAX_SHAPE
     if _MAX_SHAPE is None:
-        from gamestrategy_RL.rl_env import _max_map_size_with_padding
+        from GST_RL.rl_env import _max_map_size_with_padding
 
         _MAX_SHAPE = _max_map_size_with_padding()
     return _MAX_SHAPE
@@ -54,7 +54,7 @@ def _load_model(checkpoint_file: str):
     if ckpt in _MODEL_CACHE:
         return _MODEL_CACHE[ckpt], torch
 
-    from gamestrategy_RL.strategic_networks import StrategicPolicyValueNet
+    from GST_RL.strategic_networks import StrategicPolicyValueNet
 
     model = StrategicPolicyValueNet(map_channels=6, scalar_dim=14, action_feature_dim=12)
     obj = torch.load(ckpt, map_location="cpu")

@@ -2,9 +2,9 @@
   "format": "map_battle_stats_v1",
   "maps": {
     "加速高速公路": {
-      "Battles": 0,
-      "Wins": 0,
-      "Errors": 0
+      "Battles": 69,
+      "Wins": 28,
+      "Errors": 1
     },
     "双子岛": {
       "Battles": 0,
@@ -12,14 +12,14 @@
       "Errors": 0
     },
     "小巧竞技场": {
-      "Battles": 0,
-      "Wins": 0,
-      "Errors": 0
+      "Battles": 231,
+      "Wins": 103,
+      "Errors": 14
     },
     "扭转河": {
-      "Battles": 0,
-      "Wins": 0,
-      "Errors": 0
+      "Battles": 343,
+      "Wins": 213,
+      "Errors": 4
     },
     "正方广场": {
       "Battles": 382,
@@ -32,13 +32,13 @@
       "Errors": 0
     },
     "清脆饼干": {
-      "Battles": 0,
-      "Wins": 0,
-      "Errors": 0
+      "Battles": 30,
+      "Wins": 13,
+      "Errors": 1
     },
     "漆黑深林": {
-      "Battles": 0,
-      "Wins": 0,
+      "Battles": 73,
+      "Wins": 29,
       "Errors": 0
     },
     "罚分花园": {
@@ -47,14 +47,14 @@
       "Errors": 0
     },
     "轻飘湖": {
-      "Battles": 0,
+      "Battles": 1,
       "Wins": 0,
       "Errors": 0
     },
     "酷似大道": {
-      "Battles": 0,
-      "Wins": 0,
-      "Errors": 0
+      "Battles": 58,
+      "Wins": 25,
+      "Errors": 1
     },
     "钢骨建筑": {
       "Battles": 0,
@@ -62,7 +62,7 @@
       "Errors": 0
     },
     "间隔墙": {
-      "Battles": 0,
+      "Battles": 2,
       "Wins": 0,
       "Errors": 0
     },
@@ -72,8 +72,8 @@
       "Errors": 0
     },
     "面具屋": {
-      "Battles": 0,
-      "Wins": 0,
+      "Battles": 63,
+      "Wins": 30,
       "Errors": 0
     }
   }

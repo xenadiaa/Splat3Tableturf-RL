@@ -265,8 +265,10 @@ def _to_owner_mask(player: str, cell_type: int) -> int:
 
 
 def _priority(card_point: int, is_special_cell: bool, use_sp_attack: bool) -> float:
-    # 与 compare_single_box_final_result 逻辑一致
-    return 30.0 + (0.5 if use_sp_attack else 0.0) - card_point + (30.0 if is_special_cell else 0.0)
+    # 地格归属只与卡牌点数、是否为 special 格有关，
+    # 与本次是否使用 SP 攻击无关。保留 use_sp_attack 参数仅为了兼容调用点。
+    _ = use_sp_attack
+    return 30.0 - card_point + (30.0 if is_special_cell else 0.0)
 
 
 def _resolve_contested_cell(
@@ -617,6 +619,7 @@ def _filter_aggressive_actions(state: GameState, player: str, actions: List[Acti
     # and skip 1-SP attacks entirely.
     if state.turn < state.max_turns - 1:
         normal_or_pass = [a for a in filtered if a.pass_turn or not a.use_sp_attack]
+        normal_cards = {a.card_number for a in filtered if not a.pass_turn and not a.use_sp_attack}
         sp_ok: List[Action] = []
         if ps.sp > 3:
             for a in filtered:
@@ -626,6 +629,12 @@ def _filter_aggressive_actions(state: GameState, player: str, actions: List[Acti
                 if card is None:
                     continue
                 if card.CardPoint <= _aggressive_low_point_threshold():
+                    cells = _action_cells(a, card)
+                    exc_value = _small_card_sp_exception_value(state, player, a, card, cells)
+                    if a.card_number in normal_cards or exc_value < 2.0:
+                        continue
+                    if ps.sp - card.SpecialCost >= 3:
+                        sp_ok.append(a)
                     continue
                 if card.SpecialCost <= 1:
                     continue
@@ -652,6 +661,24 @@ def _filter_aggressive_actions(state: GameState, player: str, actions: List[Acti
     return filtered or actions
 
 
+def _empty_neighbors_after_action(state: GameState, placed: set[Tuple[int, int]], x: int, y: int) -> Tuple[int, int]:
+    empty_neighbors_before = 0
+    empty_neighbors_after = 0
+    for nx, ny in _neighbors8(x, y):
+        if not (0 <= nx < state.map.width and 0 <= ny < state.map.height):
+            continue
+        nm = int(state.map.get_point(nx, ny))
+        if (nm & int(Map_PointBit.IsValid)) == 0:
+            continue
+        occupied_before = (nm & (int(Map_PointBit.IsP1) | int(Map_PointBit.IsP2))) != 0
+        occupied_after = occupied_before or ((nx, ny) in placed)
+        if not occupied_before:
+            empty_neighbors_before += 1
+        if not occupied_after:
+            empty_neighbors_after += 1
+    return empty_neighbors_before, empty_neighbors_after
+
+
 def _project_score_swing(state: GameState, player: str, action: Action, cells: List[Tuple[int, int, int]]) -> float:
     own_bit = int(Map_PointBit.IsP1) if player == "P1" else int(Map_PointBit.IsP2)
     opp_bit = int(Map_PointBit.IsP2) if player == "P1" else int(Map_PointBit.IsP1)
@@ -665,6 +692,70 @@ def _project_score_swing(state: GameState, player: str, action: Action, cells: L
         elif not had_own and not had_opp:
             swing += 1.0
     return swing
+
+
+def _maximize_sp_swing_actions(state: GameState, player: str, actions: List[Action]) -> List[Action]:
+    sp_actions = [a for a in actions if not a.pass_turn and a.use_sp_attack]
+    if not sp_actions:
+        return actions
+    ps = state.players[player]
+    best_swing = None
+    best_sp: List[Action] = []
+    for action in sp_actions:
+        card = _find_card_in_hand(ps, action.card_number)
+        if card is None:
+            continue
+        cells = _action_cells(action, card)
+        swing = _project_score_swing(state, player, action, cells)
+        if best_swing is None or swing > best_swing:
+            best_swing = swing
+            best_sp = [action]
+        elif swing == best_swing:
+            best_sp.append(action)
+    if best_swing is None:
+        return actions
+    non_sp = [a for a in actions if a.pass_turn or not a.use_sp_attack]
+    return non_sp + best_sp
+
+
+def _final_turn_actions(state: GameState, player: str, actions: List[Action]) -> List[Action]:
+    if state.turn < state.max_turns:
+        return actions
+    ps = state.players[player]
+    sp_actions = [a for a in actions if not a.pass_turn and a.use_sp_attack]
+    if sp_actions:
+        best_swing = None
+        best_sp: List[Action] = []
+        for action in sp_actions:
+            card = _find_card_in_hand(ps, action.card_number)
+            if card is None:
+                continue
+            swing = _project_score_swing(state, player, action, _action_cells(action, card))
+            if best_swing is None or swing > best_swing:
+                best_swing = swing
+                best_sp = [action]
+            elif swing == best_swing:
+                best_sp.append(action)
+        if best_swing is None:
+            return actions
+        normal_actions = [a for a in actions if not a.pass_turn and not a.use_sp_attack]
+        better_normals: List[Action] = []
+        for action in normal_actions:
+            card = _find_card_in_hand(ps, action.card_number)
+            if card is None:
+                continue
+            swing = _project_score_swing(state, player, action, _action_cells(action, card))
+            if swing > best_swing:
+                better_normals.append(action)
+        return (best_sp + better_normals) or actions
+
+    normal_actions = [a for a in actions if not a.pass_turn and not a.use_sp_attack]
+    if not normal_actions:
+        return actions
+    card_point_by_no = {c.Number: c.CardPoint for c in ps.hand}
+    max_point = max(card_point_by_no.get(a.card_number, -1) for a in normal_actions)
+    top = [a for a in normal_actions if card_point_by_no.get(a.card_number, -1) == max_point]
+    return top or actions
 
 
 def _neighbors8(x: int, y: int) -> List[Tuple[int, int]]:
@@ -767,23 +858,42 @@ def _sp_activation_counts(state: GameState, player: str, cells: List[Tuple[int, 
                 continue
             if (m & int(Map_PointBit.IsSupplySp)) != 0:
                 continue
-            empty_neighbors_before = 0
-            empty_neighbors_after = 0
-            for nx, ny in _neighbors8(x, y):
-                if not (0 <= nx < state.map.width and 0 <= ny < state.map.height):
-                    continue
-                nm = int(state.map.get_point(nx, ny))
-                if (nm & int(Map_PointBit.IsValid)) == 0:
-                    continue
-                occupied_before = (nm & (int(Map_PointBit.IsP1) | int(Map_PointBit.IsP2))) != 0
-                occupied_after = occupied_before or ((nx, ny) in placed)
-                if not occupied_before:
-                    empty_neighbors_before += 1
-                if not occupied_after:
-                    empty_neighbors_after += 1
+            empty_neighbors_before, empty_neighbors_after = _empty_neighbors_after_action(state, placed, x, y)
             if empty_neighbors_before > 0 and empty_neighbors_after == 0:
                 activated += 1
+    for x, y, cell_type in cells:
+        if cell_type != 2:
+            continue
+        empty_neighbors_before, empty_neighbors_after = _empty_neighbors_after_action(state, placed, x, y)
+        if empty_neighbors_before > 0 and empty_neighbors_after == 0:
+            activated += 1
     return activated
+
+
+def _new_special_fully_enclosed(state: GameState, cells: List[Tuple[int, int, int]]) -> int:
+    placed = {(x, y) for x, y, _ in cells}
+    enclosed = 0
+    for x, y, cell_type in cells:
+        if cell_type != 2:
+            continue
+        _before, after = _empty_neighbors_after_action(state, placed, x, y)
+        if after == 0:
+            enclosed += 1
+    return enclosed
+
+
+def _small_card_sp_exception_value(
+    state: GameState,
+    player: str,
+    action: Action,
+    card: Card_Single,
+    cells: List[Tuple[int, int, int]],
+) -> float:
+    metrics = _aggressive_action_metrics(state, player, action, cells)
+    activated = _sp_activation_counts(state, player, cells)
+    enclosed_new_special = _new_special_fully_enclosed(state, cells)
+    net_sp_gain = activated - card.SpecialCost
+    return (2.0 * net_sp_gain) + (metrics["sp_enemy_cover"] / 3.0) + (1.0 if enclosed_new_special > 0 else 0.0)
 
 
 def _score_bot_action(
@@ -794,9 +904,9 @@ def _score_bot_action(
     level: str,
     aggressive_ctx: Optional[Dict[str, object]] = None,
 ) -> float:
-    # Temporary policy routing: balanced/conservative share aggressive heuristic
-    # until their dedicated logic is rewritten.
-    if style in ("balanced", "conservative"):
+    # Temporary policy routing: conservative shares aggressive heuristic
+    # until its dedicated logic is rewritten.
+    if style == "conservative":
         style = "aggressive"
 
     ps = state.players[player]
@@ -857,9 +967,15 @@ def _score_bot_action(
         score += (2.8 * lvl) * metrics["surround_enemy"]
         score += 0.25 * special_count
         if point <= 4:
-            score += (10.0 * lvl) * sp_activated + (2.0 * lvl) * sp_setup_gain
+            score += (-3.2 * lvl) * adv
+            score += (-3.0 * lvl) * metrics["touch_enemy"]
+            score += (-2.0 * lvl) * metrics["surround_enemy"]
+            score += (12.0 * lvl) * sp_activated + (3.0 * lvl) * sp_setup_gain + 2.8 * metrics["own_fill_hole"]
         elif point <= _aggressive_low_point_threshold():
-            score += (6.0 * lvl) * sp_activated + (1.4 * lvl) * sp_setup_gain
+            score += (-1.8 * lvl) * adv
+            score += (-1.6 * lvl) * metrics["touch_enemy"]
+            score += (-0.8 * lvl) * metrics["surround_enemy"]
+            score += (8.0 * lvl) * sp_activated + (2.2 * lvl) * sp_setup_gain + 2.0 * metrics["own_fill_hole"]
         if metrics["touch_enemy"] <= 0:
             score += 1.7 * metrics["own_fill_hole"]
         if action.use_sp_attack:
@@ -869,21 +985,31 @@ def _score_bot_action(
                 score += (6.0 * lvl) * metrics["sp_enemy_cover"]
             else:
                 score += (1.0 * lvl) * metrics["sp_enemy_cover"]
-    elif style == "conservative":
-        # 偏向巩固本方半区，偏好高点数/special，谨慎用SP攻击
-        score = (-2.2 * lvl) * adv + 1.0 * point + 1.2 * special_count + 0.5 * span
-        score += 0.4 if not action.use_sp_attack else -0.6
-        score += 0.3 if ps.sp >= sp_cost + 2 else 0.0
     else:
-        # balanced：前期推进，中后期逐步转巩固
-        if turn_phase == "early":
-            w_adv = 2.8
-        elif turn_phase == "mid":
-            w_adv = 0.8
-        else:
-            w_adv = -1.2
-        score = (w_adv * lvl) * adv + 0.9 * point + 0.8 * span + 0.7 * special_count
-        score += 0.2 if action.use_sp_attack and turn_phase != "late" else 0.0
+        # balanced：继承 aggressive 基础骨架，但中后期小牌更强调净 SP 收益。
+        metrics = _aggressive_action_metrics(state, player, action, cells)
+        normal_exists = bool(aggressive_ctx.get("normal_exists", True)) if aggressive_ctx else True
+        sp_setup_gain = _sp_setup_potential(state, player, cells)
+        sp_activated = _sp_activation_counts(state, player, cells)
+        net_sp_gain = float(sp_activated)
+        if action.use_sp_attack:
+            net_sp_gain -= float(sp_cost)
+        score = (3.0 * lvl) * adv + (1.2 * lvl) * point + (0.8 * lvl) * span + 0.25 * special_count
+        score += (2.2 * lvl) * metrics["touch_enemy"] + (1.5 * lvl) * metrics["surround_enemy"]
+        if point <= _aggressive_low_point_threshold() and turn_phase in ("mid", "late"):
+            if net_sp_gain > 0:
+                score += (9.0 * lvl) * net_sp_gain
+            elif net_sp_gain == 0 and sp_activated > 0:
+                score += (4.0 * lvl) * sp_activated
+            score += (1.4 * lvl) * sp_setup_gain
+            if action.use_sp_attack:
+                score += 0.45 * metrics["sp_enemy_cover"]
+        if action.use_sp_attack:
+            score -= 0.15 * sp_cost
+            if not normal_exists:
+                score += (3.2 * lvl) * metrics["sp_enemy_cover"]
+            else:
+                score += (0.9 * lvl) * metrics["sp_enemy_cover"]
     return score
 
 
@@ -896,12 +1022,15 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
 
     filtered_actions = actions
     if state.bot_config.style in ("aggressive", "balanced", "conservative"):
-        if state.bot_config.style == "aggressive":
-            filtered_actions = _filter_aggressive_actions(state, player, actions)
+        filtered_actions = _final_turn_actions(state, player, filtered_actions)
+        if state.bot_config.style in ("aggressive", "balanced"):
+            filtered_actions = _filter_aggressive_actions(state, player, filtered_actions)
             filtered_actions = _highest_point_actions(filtered_actions, ps)
         else:
-            filtered_actions = _highest_point_actions(actions, ps)
+            filtered_actions = _highest_point_actions(filtered_actions, ps)
             filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
+        filtered_actions = _maximize_sp_swing_actions(state, player, filtered_actions)
+        filtered_actions = _final_turn_actions(state, player, filtered_actions)
 
     nn_pick, nn_reason = _choose_bot_action_from_nn(state, player, filtered_actions)
     if nn_pick is not None:
@@ -926,7 +1055,7 @@ def _choose_bot_action(state: GameState, player: str = "P2") -> Action:
         )
 
     aggressive_ctx = None
-    if state.bot_config.style == "aggressive":
+    if state.bot_config.style in ("aggressive", "balanced"):
         aggressive_ctx = {
             "normal_exists": any((not a.pass_turn) and (not a.use_sp_attack) for a in filtered_actions),
             "reserved_no_special12": any(
@@ -989,15 +1118,18 @@ def choose_default_strategy_action(state: GameState, player: str, style: str, le
 
     filtered_actions = actions
     if style in ("aggressive", "balanced", "conservative"):
-        if style == "aggressive":
-            filtered_actions = _filter_aggressive_actions(state, player, actions)
+        filtered_actions = _final_turn_actions(state, player, filtered_actions)
+        if style in ("aggressive", "balanced"):
+            filtered_actions = _filter_aggressive_actions(state, player, filtered_actions)
             filtered_actions = _highest_point_actions(filtered_actions, ps)
         else:
-            filtered_actions = _highest_point_actions(actions, ps)
+            filtered_actions = _highest_point_actions(filtered_actions, ps)
             filtered_actions = _suppress_sp_attack_in_early_mid(filtered_actions, state.turn)
+        filtered_actions = _maximize_sp_swing_actions(state, player, filtered_actions)
+        filtered_actions = _final_turn_actions(state, player, filtered_actions)
 
     aggressive_ctx = None
-    if style == "aggressive":
+    if style in ("aggressive", "balanced"):
         aggressive_ctx = {
             "normal_exists": any((not a.pass_turn) and (not a.use_sp_attack) for a in filtered_actions),
             "reserved_no_special12": any(
