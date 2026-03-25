@@ -13,11 +13,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from autocontroller_rebuild_for_RL.runtime import (
     AutoControllerRuntime,
-    FrameApiAutoLauncher,
     MissingInterfaceError,
     REPO_ROOT,
     apply_clone_jelly_profile,
     load_config,
+)
+from autocontroller_rebuild_for_RL.main import (
+    _ensure_switch_link_ready,
+    _ensure_vision_ready,
 )
 
 
@@ -90,10 +93,8 @@ def main() -> int:
         print(json.dumps(asdict(config), ensure_ascii=False, indent=2))
         return 0
 
-    prelaunch_frame_api = None
-    if bool(getattr(args, "tmp_win_target", False)) and str(config.frame_api_url or "").strip():
-        prelaunch_frame_api = FrameApiAutoLauncher(config)
-        prelaunch_frame_api.ensure_started()
+    _ensure_switch_link_ready(config)
+    _ensure_vision_ready(config)
 
     override_target_wins = _prompt_target_wins_if_needed(args)
     if override_target_wins is not None:

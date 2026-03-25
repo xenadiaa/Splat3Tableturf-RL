@@ -1014,6 +1014,9 @@ def _press_button(steps: List[RemoteStep], bit_index: int, hold_ms: int = 70, ga
 
 BIT_PLUS = 9
 BIT_HOME = 12
+BIT_B = 1
+BIT_L = 4
+BIT_R = 5
 
 
 def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 70) -> None:
@@ -1034,33 +1037,18 @@ def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 70
 def _alternating_axis_tokens(
     dx: int,
     dy: int,
-    hold_ms: int = 50,
+    hold_ms: int = 1,
     gap_ms: int = 0,
 ) -> List[str]:
-    """Build an alternate dpad/left-stick movement token sequence.
-
-    This helper is intentionally not wired into the main flow yet.
-    Example: moving up 11 cells produces
-    `DUP,50,NOTHING,0,LUP,50,NOTHING,0,DUP,50,...`
-    so the source alternates between DPad and left stick.
-    """
-    press_ms = max(20, int(hold_ms))
-    release_ms = max(0, int(gap_ms))
-
-    def _append_moves(out: List[str], count: int, dpad_token: str, stick_token: str) -> None:
-        for idx in range(max(0, int(count))):
-            token = dpad_token if idx % 2 == 0 else stick_token
-            out.extend([token, str(press_ms), "NOTHING", str(release_ms)])
-
     tokens: List[str] = []
-    if dx > 0:
-        _append_moves(tokens, dx, "DRIGHT", "LRIGHT")
-    elif dx < 0:
-        _append_moves(tokens, -dx, "DLEFT", "LLEFT")
-    if dy > 0:
-        _append_moves(tokens, dy, "DDOWN", "LDOWN")
-    elif dy < 0:
-        _append_moves(tokens, -dy, "DUP", "LUP")
+    _append_alternating_axis_csv(tokens, dx, "DRIGHT", "LRIGHT", "DLEFT", "LLEFT")
+    _append_alternating_axis_csv(tokens, dy, "DDOWN", "LDOWN", "DUP", "LUP")
+    if gap_ms > 0:
+        out: List[str] = []
+        for idx in range(0, len(tokens), 2):
+            out.extend(tokens[idx : idx + 2])
+            out.extend(["NOTHING", str(int(gap_ms))])
+        tokens = out
     return tokens
 
 
@@ -1076,6 +1064,77 @@ def build_alternating_axis_sequence_csv(
     It is not called by the current runtime flow.
     """
     return ",".join(_alternating_axis_tokens(dx=dx, dy=dy, hold_ms=hold_ms, gap_ms=gap_ms))
+
+
+def _append_csv_command(parts: List[str], token: str, duration: int) -> None:
+    parts.extend([str(token).upper(), str(max(0, int(duration)))])
+
+
+def _append_csv_press(parts: List[str], token: str, duration: int = 1, nothing_after: Optional[int] = None) -> None:
+    _append_csv_command(parts, token, duration)
+    if nothing_after is not None:
+        _append_csv_command(parts, "NOTHING", nothing_after)
+
+
+def _append_alternating_axis_csv(
+    parts: List[str],
+    delta: int,
+    positive_dpad: str,
+    positive_stick: str,
+    negative_dpad: str,
+    negative_stick: str,
+) -> None:
+    count = abs(int(delta))
+    if count <= 0:
+        return
+    dpad_token, stick_token = (
+        (positive_dpad, positive_stick) if int(delta) > 0 else (negative_dpad, negative_stick)
+    )
+    for idx in range(count):
+        token = dpad_token if idx % 2 == 0 else stick_token
+        _append_csv_command(parts, token, 1)
+
+
+def _append_map_move_csv(parts: List[str], dx: int, dy: int) -> None:
+    _append_alternating_axis_csv(
+        parts,
+        dx,
+        positive_dpad="DRIGHT",
+        positive_stick="LRIGHT",
+        negative_dpad="DLEFT",
+        negative_stick="LLEFT",
+    )
+    _append_alternating_axis_csv(
+        parts,
+        dy,
+        positive_dpad="DDOWN",
+        positive_stick="LDOWN",
+        negative_dpad="DUP",
+        negative_stick="LUP",
+    )
+
+
+def _append_card_selection_csv(parts: List[str], from_index: int, to_index: int) -> None:
+    from_x, from_y = _card_grid_xy(from_index)
+    to_x, to_y = _card_grid_xy(to_index)
+    dx = int(to_x) - int(from_x)
+    dy = int(to_y) - int(from_y)
+    _append_alternating_axis_csv(
+        parts,
+        dx,
+        positive_dpad="DRIGHT",
+        positive_stick="LRIGHT",
+        negative_dpad="DLEFT",
+        negative_stick="LLEFT",
+    )
+    _append_alternating_axis_csv(
+        parts,
+        dy,
+        positive_dpad="DDOWN",
+        positive_stick="LDOWN",
+        negative_dpad="DUP",
+        negative_stick="LUP",
+    )
 
 
 def _card_grid_xy(index: int) -> Tuple[int, int]:
@@ -1697,13 +1756,9 @@ def _sp_pick_pool(obs: ObservedState) -> List[int]:
     return ordered
 
 
-def compile_action_with_defaults(action, obs: ObservedState) -> List[RemoteStep]:
+def compile_action_with_defaults(action, obs: ObservedState) -> str:
     if bool(getattr(action, "surrender", False)):
-        return [
-            RemoteStep(bits=(1 << BIT_PLUS), hold_ms=100, gap_ms=1000),
-            RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=100, gap_ms=1000),
-            RemoteStep(bits=(1 << BIT_A), hold_ms=110, gap_ms=60),
-        ]
+        return "PLUS,1,NOTHING,20,DRIGHT,1,NOTHING,20,A,1,NOTHING,20"
 
     hand = obs.hand_card_numbers
     if not hand:
@@ -1712,14 +1767,15 @@ def compile_action_with_defaults(action, obs: ObservedState) -> List[RemoteStep]
     if action_card not in hand:
         raise ValueError(f"card {action.card_number} not in observed hand {hand}")
 
-    steps: List[RemoteStep] = []
+    parts: List[str] = []
     if action.pass_turn:
         target_idx = hand.index(action_card)
-        _move_axis(steps, dx=0, dy=2)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
-        _move_card_selection(steps, from_index=0, to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
-        return steps
+        _append_csv_command(parts, "DDOWN", 1)
+        _append_csv_command(parts, "DDOWN", 1)
+        _append_csv_press(parts, "A", 1, 4)
+        _append_card_selection_csv(parts, from_index=0, to_index=target_idx)
+        _append_csv_press(parts, "A", 1, 20)
+        return ",".join(parts)
 
     if action.use_sp_attack:
         sp_pool = _sp_pick_pool(obs)
@@ -1728,14 +1784,16 @@ def compile_action_with_defaults(action, obs: ObservedState) -> List[RemoteStep]
         start_card = sp_pool[0]
         start_idx = hand.index(start_card)
         target_idx = hand.index(action_card)
-        _move_axis(steps, dx=1, dy=2)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
-        _move_card_selection(steps, from_index=start_idx, to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+        _append_csv_command(parts, "DDOWN", 1)
+        _append_csv_command(parts, "DDOWN", 1)
+        _append_csv_command(parts, "DRIGHT", 1)
+        _append_csv_press(parts, "A", 1, 4)
+        _append_card_selection_csv(parts, from_index=start_idx, to_index=target_idx)
+        _append_csv_press(parts, "A", 1, 1)
     else:
         target_idx = hand.index(action_card)
-        _move_card_selection(steps, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
+        _append_card_selection_csv(parts, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
+        _append_csv_press(parts, "A", 1, 1)
 
     cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
 
@@ -1743,15 +1801,15 @@ def compile_action_with_defaults(action, obs: ObservedState) -> List[RemoteStep]
     ccw_steps = (-int(action.rotation)) % 4
     if cw_steps <= ccw_steps:
         for _ in range(cw_steps):
-            _press_button(steps, BIT_X)
+            _append_csv_press(parts, "X", 1, 1)
     else:
         for _ in range(ccw_steps):
-            _press_button(steps, BIT_Y)
+            _append_csv_press(parts, "Y", 1, 1)
 
     target_x, target_y = _action_target_ui_xy(action, obs)
-    _move_axis(steps, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
-    _press_button(steps, BIT_A, hold_ms=110, gap_ms=60)
-    return steps
+    _append_map_move_csv(parts, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
+    _append_csv_press(parts, "A", 1, 20)
+    return ",".join(parts)
 
 
 class TerminalDebugUI:
@@ -1826,6 +1884,9 @@ class TerminalDebugUI:
                 continue
             ch = chars[idx]
             idx += 1
+            if ch in ("\r", "\n"):
+                self._runtime.send_manual_controller_input("HOME")
+                continue
             if ch == "=":
                 self._runtime.adjust_turn_index(+1)
                 continue
@@ -1872,7 +1933,7 @@ class TerminalDebugUI:
 
         lines = [
             "Tableturf AutoController Debug",
-            "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1  arrows=dpad  z=A  x=B  a=Y  s=X  c=L  d=+",
+            "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1  arrows=dpad  enter=HOME  z=A  x=B  a=Y  s=X  c=L  d=+",
             "",
             _fit(f"status: {state['status']}"),
             _fit(f"phase: {state['phase']}"),
@@ -2189,8 +2250,10 @@ class AutoControllerRuntime:
         raise RuntimeError("WAIT_PLAYABLE_TIMEOUT_SURRENDER")
 
     def _wait_for_next_turn_playable(self) -> None:
-        self._push_event("进入下一回合确认阶段：固定等待 0.5 秒，不进行 playable 检测。")
-        time.sleep(0.5)
+        self._push_event("进入下一回合确认阶段：固定等待 3 秒，不进行 playable 检测。")
+        start_ts = time.monotonic()
+        self._sleep_with_pause(3.0)
+        self._suspend_timeout_accumulation(time.monotonic() - start_ts)
         self._reset_playable_state_timers()
         seen_non_playable = False
         warned_continuous_playable = False
@@ -2277,18 +2340,85 @@ class AutoControllerRuntime:
         self._set_status(status="stopping", last_error=reason)
         self._push_event(reason)
 
+    def _current_serial_port_labels(self) -> List[str]:
+        return list_serial_port_labels()
+
+    def _serial_port_is_available(self, port: str) -> bool:
+        target = str(port or "").strip()
+        if not target:
+            return False
+        return any(parse_device_from_label(label) == target for label in self._current_serial_port_labels())
+
+    def _reconnect_controller_if_needed(self) -> bool:
+        current_port = str(self.serial_port or "").strip()
+        if current_port and self._serial_port_is_available(current_port):
+            try:
+                self.controller.release()
+                return False
+            except Exception:
+                pass
+        labels = self._current_serial_port_labels()
+        if not labels:
+            self._logger.write("switch_link 串口检查失败：当前没有可用串口，程序即将退出。")
+            self._push_event("switch_link_unavailable_exit")
+            self._set_status(last_error="NO_AVAILABLE_SWITCH_LINK_PORT", phase="error")
+            raise RuntimeError("NO_AVAILABLE_SWITCH_LINK_PORT")
+        next_port = parse_device_from_label(labels[0])
+        with contextlib.suppress(Exception):
+            self.controller.close()
+        self.controller = SerialRemoteController(port=next_port)
+        self.serial_port = next_port
+        self.config.serial_port = next_port
+        self.config.pick_serial = False
+        self._set_status(serial_port=self.serial_port)
+        self._logger.write(f"检测到原 switch_link 串口不可用，已自动切换到当前可用串口：{next_port}。")
+        self._push_event(f"switch_link_reconnected:{next_port}")
+        return True
+
+    def _send_runtime_smart_sequence(self, command_csv: str, timeout_seconds: float = 15.0) -> None:
+        try:
+            self.controller.send_smart_sequence_csv_blocking(
+                command_csv,
+                timeout_seconds=max(1.0, float(timeout_seconds)),
+            )
+        except TimeoutError:
+            self.controller.abort_active_sequence()
+            raise
+
     def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
         press_ms = max(20, int(hold_ms))
         release_gap_ms = max(40, int(gap_ms))
-        self.controller.send_smart_sequence_csv(
-            f"{token},{press_ms},NOTHING,{release_gap_ms}"
+        token_upper = str(token).upper()
+        if token_upper in {"PLUS", "HOME", "L", "R"}:
+            self._send_runtime_smart_sequence(f"{token_upper},1,NOTHING,6", timeout_seconds=6.0)
+            self._push_event(f"manual_controller_input:{token}")
+            return
+        bit_map = {
+            "A": BIT_A,
+            "B": BIT_B,
+            "X": BIT_X,
+            "Y": BIT_Y,
+            "L": BIT_L,
+            "R": BIT_R,
+            "PLUS": BIT_PLUS,
+            "HOME": BIT_HOME,
+            "DUP": BIT_DPAD_UP,
+            "DDOWN": BIT_DPAD_DOWN,
+            "DLEFT": BIT_DPAD_LEFT,
+            "DRIGHT": BIT_DPAD_RIGHT,
+        }
+        bit_index = bit_map.get(token_upper)
+        if bit_index is None:
+            raise ValueError(f"unsupported manual controller token: {token}")
+        self.controller.run_steps(
+            [RemoteStep(bits=(1 << bit_index), hold_ms=press_ms, gap_ms=release_gap_ms)]
         )
         self._push_event(f"manual_controller_input:{token}")
 
     def _press_home_and_stop(self, reason: str) -> None:
         self._set_status(phase="stopping", last_error=reason)
         self._push_event(reason)
-        self.controller.send_smart_sequence_csv("HOME,100")
+        self._send_runtime_smart_sequence("HOME,1,NOTHING,6", timeout_seconds=6.0)
         time.sleep(0.3)
         self.request_stop(reason)
 
@@ -2356,16 +2486,16 @@ class AutoControllerRuntime:
 
     def _run_surrender_sequence(self) -> None:
         self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 2 秒，最后按 A。")
-        self.controller.send_smart_sequence_csv("PLUS,120")
+        self._send_runtime_smart_sequence("PLUS,1,NOTHING,6", timeout_seconds=6.0)
         time.sleep(2.0)
-        self.controller.send_smart_sequence_csv("DRIGHT,120")
+        self.controller.run_steps([RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=120, gap_ms=0)])
         time.sleep(2.0)
-        self.controller.send_smart_sequence_csv("A,120")
+        self.controller.run_steps([RemoteStep(bits=(1 << BIT_A), hold_ms=120, gap_ms=0)])
 
     def _run_resume_reactivation_sequence(self) -> None:
         self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。")
         for idx in range(3):
-            self.controller.send_smart_sequence_csv("R,120")
+            self._send_runtime_smart_sequence("R,1,NOTHING,6", timeout_seconds=6.0)
             if idx < 2:
                 time.sleep(1.0)
 
@@ -2432,6 +2562,16 @@ class AutoControllerRuntime:
     def _wait_if_paused(self) -> None:
         while self._paused.is_set() and not self._stop_requested.is_set():
             time.sleep(0.1)
+
+    def _sleep_with_pause(self, seconds: float) -> None:
+        remaining = max(0.0, float(seconds))
+        deadline = time.monotonic() + remaining
+        while remaining > 0:
+            self._wait_if_paused()
+            self._ensure_not_stopped()
+            chunk = min(0.1, remaining)
+            time.sleep(chunk)
+            remaining = max(0.0, deadline - time.monotonic())
 
     def _ensure_not_stopped(self) -> None:
         if self._stop_requested.is_set():
@@ -2546,9 +2686,22 @@ class AutoControllerRuntime:
                 self._push_event(f"action_turn_{self.turn_index}: {action_text}")
                 self._logger.write(f"第 {self.turn_index} 回合采用策略 {resolved_strategy.label}，来源={resolved_strategy.source}，动作={action_text}。")
                 self._battle_replay.record_turn(state, action)
-                steps = compile_action_with_defaults(action, observed_state)
+                command_csv = compile_action_with_defaults(action, observed_state)
                 self._set_status(phase="executing_action")
-                self.controller.run_steps(steps)
+                try:
+                    self._send_runtime_smart_sequence(command_csv, timeout_seconds=15.0)
+                except TimeoutError:
+                    self._push_event("battle_action_sequence_timeout，当前出牌序列超时，已终止当前序列。")
+                    self._logger.write("当前出牌 smart-sequence 超时，已终止当前序列并开始检查 switch_link 串口状态。")
+                    reconnected = self._reconnect_controller_if_needed()
+                    if reconnected:
+                        self._logger.write("switch_link 串口已恢复，准备重新回到等待阶段。")
+                    else:
+                        self._logger.write("switch_link 串口检查正常，不做额外处理，准备回到等待阶段。")
+                    self._battle_started = False
+                    self._set_pending_result_check(False, "battle_action_sequence_timeout")
+                    self.vision.reset_battle_context()
+                    raise RuntimeError("BATTLE_ACTION_SEQUENCE_ABORTED")
                 self.vision.remember_executed_specials(action)
                 if self.turn_index < self.config.max_turns:
                     self._wait_for_next_turn_playable()
@@ -2566,7 +2719,10 @@ class AutoControllerRuntime:
         except TargetWinGoalReached:
             raise
         except RuntimeError as exc:
-            if str(exc) in {"BATTLE_PROGRESS_TIMEOUT_SURRENDER", "WAIT_PLAYABLE_TIMEOUT_SURRENDER"}:
+            if str(exc) in {
+                "BATTLE_PROGRESS_TIMEOUT_SURRENDER",
+                "WAIT_PLAYABLE_TIMEOUT_SURRENDER",
+            }:
                 if self._current_battle_stats_recorded and (
                     self._current_battle_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate"
                 ):
@@ -2577,6 +2733,11 @@ class AutoControllerRuntime:
                 self._set_status(phase="battle_timeout_restarting", last_error=str(exc))
                 self._push_event("对局因长时间无推进而投降，已重置状态，准备重新从等待阶段开始。")
                 self._reset_after_battle_resolution("timeout_surrender")
+                return
+            if str(exc) == "BATTLE_ACTION_SEQUENCE_ABORTED":
+                self._set_status(phase="battle_action_aborted", last_error=str(exc))
+                self._push_event("当前出牌序列已中止，已重置状态并重新回到等待阶段。")
+                self._reset_after_battle_resolution("battle_action_sequence_aborted")
                 return
             self._set_status(last_error=str(exc), phase="error")
             self._push_event(f"error: {exc}")

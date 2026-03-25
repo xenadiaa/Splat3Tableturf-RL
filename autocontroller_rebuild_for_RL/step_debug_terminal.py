@@ -19,6 +19,8 @@ from autocontroller_rebuild_for_RL.runtime import (
     RemoteStep,
     _FrameVisionPipeline,
     _action_target_ui_xy,
+    _append_alternating_axis_csv,
+    _append_card_selection_csv,
     _engine_xy_to_ui_xy,
     _resolve_serial_port,
     choose_action_from_resolved_strategy,
@@ -89,22 +91,6 @@ def _parse_args() -> argparse.Namespace:
         help="0 means no limit",
     )
     return parser.parse_args()
-
-
-def _steps_to_debug_rows(steps: List[RemoteStep]) -> List[dict]:
-    rows: List[dict] = []
-    for idx, step in enumerate(steps, start=1):
-        pressed = [name for bit, name in BIT_NAMES.items() if step.bits & (1 << bit)]
-        rows.append(
-            {
-                "index": idx,
-                "buttons": pressed or ["<none>"],
-                "bits": step.bits,
-                "hold_ms": step.hold_ms,
-                "gap_ms": step.gap_ms,
-            }
-        )
-    return rows
 
 
 def _wait_for_enter(prompt: str) -> str:
@@ -378,9 +364,10 @@ def _action_phase_breakdown(action, state, obs) -> Dict[str, object]:
     if action.use_sp_attack:
         selection_steps.extend(["DPadDown", "DPadDown", "DPadRight", "A"])
         sp_pool = [int(x) for x in obs.hand_card_numbers if x is not None]
-        if card_number in sp_pool:
-            idx = sp_pool.index(card_number)
-            selection_steps.extend(_selection_path_names(0, idx))
+        if card_number in sp_pool and sp_pool:
+            start_idx = hand.index(sp_pool[0]) if sp_pool[0] in hand else 0
+            target_idx = hand.index(card_number) if card_number in hand else start_idx
+            selection_steps.extend(_selection_path_names(start_idx, target_idx))
         selection_steps.append("A")
     else:
         if card_number in hand:
@@ -412,9 +399,9 @@ def _action_phase_breakdown(action, state, obs) -> Dict[str, object]:
 
 
 def _selection_path_names(from_index: int, to_index: int) -> List[str]:
-    from_x, from_y = divmod_like_card(from_index)
-    to_x, to_y = divmod_like_card(to_index)
-    return _axis_path_names(to_x - from_x, to_y - from_y)
+    parts: List[str] = []
+    _append_card_selection_csv(parts, from_index, to_index)
+    return _tokens_to_names(parts)
 
 
 def divmod_like_card(index: int) -> Tuple[int, int]:
@@ -423,16 +410,37 @@ def divmod_like_card(index: int) -> Tuple[int, int]:
 
 
 def _axis_path_names(dx: int, dy: int) -> List[str]:
-    out: List[str] = []
-    if dx > 0:
-        out.extend(["DPadRight"] * dx)
-    elif dx < 0:
-        out.extend(["DPadLeft"] * (-dx))
-    if dy > 0:
-        out.extend(["DPadDown"] * dy)
-    elif dy < 0:
-        out.extend(["DPadUp"] * (-dy))
-    return out
+    parts: List[str] = []
+    _append_alternating_axis_csv(parts, dx, "DRIGHT", "LRIGHT", "DLEFT", "LLEFT")
+    _append_alternating_axis_csv(parts, dy, "DDOWN", "LDOWN", "DUP", "LUP")
+    return _tokens_to_names(parts)
+
+
+def _tokens_to_names(parts: List[str]) -> List[str]:
+    token_names = {
+        "DUP": "DPadUp",
+        "DDOWN": "DPadDown",
+        "DLEFT": "DPadLeft",
+        "DRIGHT": "DPadRight",
+        "LUP": "LeftStickUp",
+        "LDOWN": "LeftStickDown",
+        "LLEFT": "LeftStickLeft",
+        "LRIGHT": "LeftStickRight",
+        "A": "A",
+        "B": "B",
+        "X": "X",
+        "Y": "Y",
+        "PLUS": "Plus",
+        "LOOP": "Loop",
+        "NOTHING": "Nothing",
+    }
+    names: List[str] = []
+    for idx in range(0, len(parts), 2):
+        token = str(parts[idx]).upper()
+        duration = str(parts[idx + 1]) if idx + 1 < len(parts) else ""
+        label = token_names.get(token, token)
+        names.append(f"{label}x{duration}" if token == "LOOP" else label)
+    return names
 
 
 def main() -> int:
@@ -495,7 +503,7 @@ def main() -> int:
             observed_state = state.to_observed_state()
             resolved_strategy = resolve_strategy(config, state.map_id, state.map_name)
             action = choose_action_from_resolved_strategy(observed_state, resolved_strategy)
-            steps = compile_action_with_defaults(action, observed_state)
+            command_csv = compile_action_with_defaults(action, observed_state)
 
             _print_block(
                 "识别输入/输出",
@@ -590,7 +598,7 @@ def main() -> int:
             if cmd == "q":
                 return 0
 
-            controller.run_steps(steps)
+            controller.send_smart_sequence_csv_blocking(command_csv, timeout_seconds=15.0)
             _print_block(
                 "本步结果",
                 {

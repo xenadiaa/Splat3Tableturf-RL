@@ -5,7 +5,8 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 
 COMMAND_MAX = 30
-SMART_HEX_VERSION = 8
+SMART_HEX_VERSION = 9
+SMART_HEX_ACCEPTED_VERSIONS = {8, 9}
 
 # Token -> firmware command char (from AutoController Others_SmartProgram.c switch-case).
 TOKEN_TO_CHAR: Dict[str, str] = {
@@ -132,4 +133,3 @@ def encode_smart_sequence(commands: Sequence[SmartCommand], max_commands: int = 
 
 def encode_smart_sequence_csv(command_csv: str, max_commands: int = COMMAND_MAX) -> bytes:
     return encode_smart_sequence(parse_smart_command_csv(command_csv), max_commands=max_commands)
-

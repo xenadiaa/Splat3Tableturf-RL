@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import struct
 import time
 from typing import Iterable
 
 from .input_mapper import RemoteStep
-from .smart_program_compat import SMART_HEX_VERSION, encode_smart_sequence, encode_smart_sequence_csv
+from .smart_program_compat import (
+    SMART_HEX_ACCEPTED_VERSIONS,
+    SMART_HEX_VERSION,
+    encode_smart_sequence,
+    encode_smart_sequence_csv,
+    parse_smart_command_csv,
+)
 
 try:
     import serial
@@ -58,16 +65,50 @@ class SerialRemoteController:
         payload = encode_smart_sequence_csv(command_csv)
         self.send_smart_sequence_payload(payload)
 
+    def _wait_smart_sequence_complete(self, command_count: int, timeout_seconds: float) -> bool:
+        remaining = max(0, int(command_count))
+        if remaining <= 0:
+            return True
+        deadline = time.time() + max(0.2, float(timeout_seconds))
+        while remaining > 0 and time.time() < deadline:
+            b = self._ser.read(1)
+            if not b:
+                continue
+            byte = b[0]
+            if remaining == command_count:
+                if byte in SMART_HEX_ACCEPTED_VERSIONS or byte == 0xFF:
+                    remaining -= 1
+                continue
+            # Helper-side logic pops one command for every returned byte after the first,
+            # even if the byte is unexpected. We mirror that here to avoid hanging.
+            remaining -= 1
+        return remaining == 0
+
+    def send_smart_sequence_csv_blocking(self, command_csv: str, timeout_seconds: float = 10.0) -> None:
+        commands = parse_smart_command_csv(command_csv)
+        payload = encode_smart_sequence(commands)
+        self.send_smart_sequence_payload(payload)
+        if not self._wait_smart_sequence_complete(len(commands), timeout_seconds=timeout_seconds):
+            raise TimeoutError(f"smart sequence did not finish within {timeout_seconds:.1f}s")
+
+    def abort_active_sequence(self) -> None:
+        with contextlib.suppress(Exception):
+            self.release()
+        with contextlib.suppress(Exception):
+            self._ser.reset_input_buffer()
+        with contextlib.suppress(Exception):
+            self._ser.reset_output_buffer()
+
     def wait_smart_sequence_start_ack(self, timeout_seconds: float = 2.0) -> bool:
         """
-        First command completion ack is SMART_HEX_VERSION (8) when accepted.
+        First command completion ack is SMART_HEX_VERSION when accepted.
         """
         deadline = time.time() + max(0.1, timeout_seconds)
         while time.time() < deadline:
             b = self._ser.read(1)
             if not b:
                 continue
-            if b[0] == SMART_HEX_VERSION:
+            if b[0] in SMART_HEX_ACCEPTED_VERSIONS or b[0] == SMART_HEX_VERSION:
                 return True
             # Some firmware replies 0xFF for generic command completion.
             if b[0] == 0xFF:
