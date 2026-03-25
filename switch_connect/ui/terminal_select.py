@@ -55,15 +55,22 @@ def choose_with_arrows(
         while True:
             _clear_screen()
             width = shutil.get_terminal_size((80, 24)).columns
+            lines: List[str] = []
             for line in str(title).splitlines() or [""]:
-                print(line[:width])
-            print("-" * min(width, 80))
+                lines.append(line[:width])
+            lines.append("-" * min(width, 80))
             for i, opt in enumerate(options):
-                marker = ">" if i == idx else " "
-                print(f"{marker} {opt}")
-            print()
-            for line in str(footer).splitlines() or [""]:
-                print(line[:width])
+                if i == idx:
+                    lines.append(f">  {opt}")
+                else:
+                    lines.append(f"   {opt}")
+            if str(footer).strip():
+                lines.append("")
+                for line in str(footer).splitlines() or [""]:
+                    lines.append(line[:width])
+            body = "\r\n".join(lines) + "\r\n"
+            sys.stdout.write(body)
+            sys.stdout.flush()
 
             key = _read_key()
             if key == "up":

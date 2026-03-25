@@ -440,10 +440,9 @@ def _resolve_downward_combo(
     return None
 
 
-def detect_map_state_from_frames(frames_bgr: List[np.ndarray], map_name: str) -> Dict:
-    if not frames_bgr:
-        raise ValueError("frames_bgr must not be empty")
-    frame_results = [detect_map_state(frame, map_name) for frame in frames_bgr]
+def _merge_state_results_from_frames(frame_results: List[Dict], frames_bgr: List[np.ndarray], map_name: str) -> Dict:
+    if not frame_results:
+        raise ValueError("frame_results must not be empty")
     cell_keys = [_cell_vote_key(cell) for cell in frame_results[0]["cells"]]
     initial_cells: List[Dict] = []
 
@@ -663,6 +662,13 @@ def detect_map_state_from_frames(frames_bgr: List[np.ndarray], map_name: str) ->
         "unknown_combo_debug_image": unknown_combo_debug_image,
         "unknown_combo_debug_document": unknown_combo_debug_document,
     }
+
+
+def detect_map_state_from_frames(frames_bgr: List[np.ndarray], map_name: str) -> Dict:
+    if not frames_bgr:
+        raise ValueError("frames_bgr must not be empty")
+    frame_results = [detect_map_state(frame, map_name) for frame in frames_bgr]
+    return _merge_state_results_from_frames(frame_results, frames_bgr, map_name)
 
 
 def _frame_json_url_from_frame_url(frame_url: str) -> str:

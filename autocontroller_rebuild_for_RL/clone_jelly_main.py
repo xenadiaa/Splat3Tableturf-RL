@@ -16,12 +16,13 @@ from autocontroller_rebuild_for_RL.runtime import (
     FrameApiAutoLauncher,
     MissingInterfaceError,
     REPO_ROOT,
+    apply_clone_jelly_profile,
     load_config,
 )
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tableturf auto controller orchestrator")
+    parser = argparse.ArgumentParser(description="Clone Jelly Tableturf auto controller")
     parser.add_argument(
         "--config",
         default="autocontroller_rebuild_for_RL/runtime_config.example.json",
@@ -75,8 +76,6 @@ def _clear_terminal_for_runtime_ui() -> None:
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
     with contextlib.suppress(Exception):
-        # Startup cleanup should clear both the visible screen and the scrollback
-        # left by shell prompts / launch commands before the runtime UI begins.
         sys.stdout.write("\r\033[3J\033[2J\033[H")
         sys.stdout.flush()
 
@@ -84,6 +83,7 @@ def _clear_terminal_for_runtime_ui() -> None:
 def main() -> int:
     args = _parse_args()
     config = load_config(args.config)
+    config = apply_clone_jelly_profile(config)
     setattr(config, "_original_continuous_run", bool(config.continuous_run))
     setattr(config, "_original_target_win_count", int(config.target_win_count))
     if args.print_config:

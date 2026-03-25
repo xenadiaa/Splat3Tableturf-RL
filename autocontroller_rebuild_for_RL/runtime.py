@@ -40,7 +40,10 @@ from tableturf_vision.map_state_detector import MapStateTracker, detect_map_stat
 from tableturf_vision.mapper_preview import _match_card
 from tableturf_vision.playable_detector import detect_draw_banner, detect_lose_banner, detect_playable_banner, detect_win_banner
 from tableturf_vision.reference_matcher import detect_map_from_frame, load_map_info, map_name_cn_to_id
-from tableturf_vision.settlement_map_state_detector import analyze_settlement_map_state
+from tableturf_vision.settlement_map_state_detector import (
+    analyze_settlement_map_state,
+    analyze_settlement_map_state_from_frame_api,
+)
 from tableturf_vision.sp_detector import get_enemy_sp_count_frame, get_sp_count_frame
 from tableturf_vision.tableturf_mapper import _load_layout
 from vision_capture.adapter import FFmpegCaptureSource, auto_detect_capture_device_name
@@ -50,6 +53,7 @@ from src.engine.loaders import MAP_PADDING, load_map
 from src.strategy import nn_loader
 from src.strategy.registry import choose_action_from_strategy_id
 from src.utils.common_utils import create_card_from_id
+from src.utils.common_utils import _card_cells_on_map
 from src.view.gamepad_ui import _find_local_view_rightbottom_self_special_anchor
 
 
@@ -64,6 +68,18 @@ class MissingInterfaceError(RuntimeError):
 
 class TargetWinGoalReached(RuntimeError):
     """Raised when the temporary/session target win count has been reached."""
+
+
+MAP_STATE_MULTI_FRAME_DEFAULT = 5
+MAP_STATE_MULTI_FRAME_PLAYABLE = 10
+MAP_STATE_MULTI_FRAME_POLL_INTERVAL_SECONDS = 0.08
+MAP_STATE_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS = 2.0
+SETTLEMENT_MULTI_FRAME_COUNT = 30
+SETTLEMENT_MULTI_FRAME_POLL_INTERVAL_SECONDS = 0.08
+SETTLEMENT_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS = 2.0
+CAPTURE_RECOVERY_RETRY_SECONDS = 5.0
+CAPTURE_RECOVERY_MAX_RETRIES = 6
+CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS = 60.0
 
 
 def _unique_debug_image_path(out_dir: Path, prefix: str, idx: int) -> Path:
@@ -223,6 +239,34 @@ def _engine_xy_to_replay_xy(map_id: str, x: Optional[int], y: Optional[int], gri
     return (int(x), int(y))
 
 
+def _compute_board_scores_from_grid(grid: List[List[int]]) -> Tuple[int, int]:
+    p1 = 0
+    p2 = 0
+    for row in grid:
+        for cell in row:
+            mask = int(cell)
+            if (mask & int(Map_PointBit.IsValid)) == 0:
+                continue
+            is_p1 = (mask & int(Map_PointBit.IsP1)) != 0
+            is_p2 = (mask & int(Map_PointBit.IsP2)) != 0
+            if is_p1 and not is_p2:
+                p1 += 1
+            elif is_p2 and not is_p1:
+                p2 += 1
+    return p1, p2
+
+
+def _format_score_broadcast(p1_score: int, p2_score: int) -> str:
+    diff = int(p1_score) - int(p2_score)
+    if diff > 0:
+        lead_text = f"我方领先 {diff} 格"
+    elif diff < 0:
+        lead_text = f"对方领先 {abs(diff)} 格"
+    else:
+        lead_text = "当前平分"
+    return f"比分播报：我方 {int(p1_score)}，对方 {int(p2_score)}。{lead_text}。"
+
+
 def _resolve_serial_port(configured_port: str, pick_serial: bool) -> str:
     if configured_port.strip():
         return configured_port.strip()
@@ -304,6 +348,14 @@ class ControllerConfig:
     log_file: str = "autocontroller_rebuild_for_RL/debug_runtime/log/autocontroller.log"
     global_stats_file: str = "autocontroller_rebuild_for_RL/map_battle_stats.json"
     battle_replay_dir: str = "autocontroller_rebuild_for_RL/replays"
+    enable_battle_replay: bool = True
+    stats_mode: str = "map"
+    aggregate_stats_file: str = ""
+    aggregate_stats_name: str = "session"
+    map_state_frame_count_default: int = MAP_STATE_MULTI_FRAME_DEFAULT
+    map_state_frame_count_playable: int = MAP_STATE_MULTI_FRAME_PLAYABLE
+    settlement_frame_count: int = SETTLEMENT_MULTI_FRAME_COUNT
+    preserve_p1_special_history: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> "ControllerConfig":
@@ -544,6 +596,30 @@ class BattleReplayWriter:
             return path
 
 
+class NoOpBattleReplayWriter:
+    def start_battle(self, battle_index: int) -> None:
+        del battle_index
+
+    def record_turn(self, state: ParsedTurnState, action: Any) -> None:
+        del state, action
+
+    def complete_previous_move_after_state(self, state: ParsedTurnState) -> None:
+        del state
+
+    def finalize(
+        self,
+        *,
+        battle_status: str,
+        winner: Optional[str],
+        rounds_played: Optional[int],
+        map_id: str,
+        map_name: str,
+        settlement_map_state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        del battle_status, winner, rounds_played, map_id, map_name, settlement_map_state
+        return None
+
+
 class GlobalMapStatsWriter:
     def __init__(self, path: Path):
         self._path = path
@@ -608,6 +684,53 @@ class GlobalMapStatsWriter:
         with self._lock:
             row = self._stats.setdefault(name, {"Battles": 0, "Wins": 0, "Errors": 0})
             row[key] = int(row.get(key, 0)) + int(amount)
+            self._write()
+
+
+class AggregateStatsWriter:
+    def __init__(self, path: Path, name: str):
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._name = str(name or "session")
+        self._stats: Dict[str, int] = {"Battles": 0, "Wins": 0, "Errors": 0}
+        self._load_existing()
+        self._write()
+
+    def _load_existing(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        stats = payload.get("stats", {}) if isinstance(payload, dict) else {}
+        if not isinstance(stats, dict):
+            return
+        for key in ("Battles", "Wins", "Errors"):
+            try:
+                self._stats[key] = int(stats.get(key, self._stats[key]))
+            except Exception:
+                continue
+
+    def _write(self) -> None:
+        payload = {
+            "format": "aggregate_battle_stats_v1",
+            "name": self._name,
+            "stats": {
+                "Battles": int(self._stats.get("Battles", 0)),
+                "Wins": int(self._stats.get("Wins", 0)),
+                "Errors": int(self._stats.get("Errors", 0)),
+            },
+        }
+        self._path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def increment(self, map_name: str, key: str, amount: int = 1) -> None:
+        del map_name
+        if key not in {"Battles", "Wins", "Errors"}:
+            raise ValueError(f"unsupported stats key: {key}")
+        with self._lock:
+            self._stats[key] = int(self._stats.get(key, 0)) + int(amount)
             self._write()
 
 
@@ -732,6 +855,10 @@ class FrameApiAutoLauncher:
                 return
             time.sleep(0.2)
         raise RuntimeError("FRAME_API_START_TIMEOUT")
+
+    def restart(self) -> None:
+        self.stop()
+        self.ensure_started()
 
     def stop(self) -> None:
         if self._proc is None:
@@ -902,6 +1029,53 @@ def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 70
     elif dy < 0:
         for _ in range(-dy):
             _press_button(steps, BIT_DPAD_UP, hold_ms=move_hold_ms, gap_ms=130)
+
+
+def _alternating_axis_tokens(
+    dx: int,
+    dy: int,
+    hold_ms: int = 50,
+    gap_ms: int = 0,
+) -> List[str]:
+    """Build an alternate dpad/left-stick movement token sequence.
+
+    This helper is intentionally not wired into the main flow yet.
+    Example: moving up 11 cells produces
+    `DUP,50,NOTHING,0,LUP,50,NOTHING,0,DUP,50,...`
+    so the source alternates between DPad and left stick.
+    """
+    press_ms = max(20, int(hold_ms))
+    release_ms = max(0, int(gap_ms))
+
+    def _append_moves(out: List[str], count: int, dpad_token: str, stick_token: str) -> None:
+        for idx in range(max(0, int(count))):
+            token = dpad_token if idx % 2 == 0 else stick_token
+            out.extend([token, str(press_ms), "NOTHING", str(release_ms)])
+
+    tokens: List[str] = []
+    if dx > 0:
+        _append_moves(tokens, dx, "DRIGHT", "LRIGHT")
+    elif dx < 0:
+        _append_moves(tokens, -dx, "DLEFT", "LLEFT")
+    if dy > 0:
+        _append_moves(tokens, dy, "DDOWN", "LDOWN")
+    elif dy < 0:
+        _append_moves(tokens, -dy, "DUP", "LUP")
+    return tokens
+
+
+def build_alternating_axis_sequence_csv(
+    dx: int,
+    dy: int,
+    hold_ms: int = 50,
+    gap_ms: int = 0,
+) -> str:
+    """Return a smart-sequence CSV using alternating DPad / left-stick moves.
+
+    Kept as a spare movement encoder for long straight-line moves.
+    It is not called by the current runtime flow.
+    """
+    return ",".join(_alternating_axis_tokens(dx=dx, dy=dy, hold_ms=hold_ms, gap_ms=gap_ms))
 
 
 def _card_grid_xy(index: int) -> Tuple[int, int]:
@@ -1632,7 +1806,26 @@ class TerminalDebugUI:
         if not ready:
             return
         chars = os.read(self._stdin_fd, 16).decode("utf-8", errors="ignore")
-        for ch in chars:
+        idx = 0
+        while idx < len(chars):
+            if chars[idx : idx + 3] == "\x1b[A":
+                self._runtime.send_manual_controller_input("DUP")
+                idx += 3
+                continue
+            if chars[idx : idx + 3] == "\x1b[B":
+                self._runtime.send_manual_controller_input("DDOWN")
+                idx += 3
+                continue
+            if chars[idx : idx + 3] == "\x1b[C":
+                self._runtime.send_manual_controller_input("DRIGHT")
+                idx += 3
+                continue
+            if chars[idx : idx + 3] == "\x1b[D":
+                self._runtime.send_manual_controller_input("DLEFT")
+                idx += 3
+                continue
+            ch = chars[idx]
+            idx += 1
             if ch == "=":
                 self._runtime.adjust_turn_index(+1)
                 continue
@@ -1646,6 +1839,18 @@ class TerminalDebugUI:
                 self._runtime.resume()
             elif key == "q":
                 self._runtime.request_stop("user_requested_quit")
+            elif key == "z":
+                self._runtime.send_manual_controller_input("A")
+            elif key == "x":
+                self._runtime.send_manual_controller_input("B")
+            elif key == "a":
+                self._runtime.send_manual_controller_input("Y")
+            elif key == "s":
+                self._runtime.send_manual_controller_input("X")
+            elif key == "c":
+                self._runtime.send_manual_controller_input("L")
+            elif key == "d":
+                self._runtime.send_manual_controller_input("PLUS")
 
     def _render(self) -> None:
         state = self._runtime.debug_snapshot()
@@ -1667,7 +1872,7 @@ class TerminalDebugUI:
 
         lines = [
             "Tableturf AutoController Debug",
-            "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1",
+            "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1  arrows=dpad  z=A  x=B  a=Y  s=X  c=L  d=+",
             "",
             _fit(f"status: {state['status']}"),
             _fit(f"phase: {state['phase']}"),
@@ -1723,17 +1928,30 @@ class AutoControllerRuntime:
         self.config = config
         self.serial_port = _resolve_serial_port(config.serial_port, config.pick_serial)
         self.controller = SerialRemoteController(port=self.serial_port)
-        self.vision = _FrameVisionPipeline(config)
+        self.vision = _FrameVisionPipeline(
+            config,
+            on_capture_recovery_pause=self._suspend_timeout_accumulation,
+            on_capture_recovery_event=self._push_event,
+        )
         log_path = _resolve_debug_log_path(config.log_file)
         self._logger = RuntimeLogWriter(log_path)
-        stats_path = Path(config.global_stats_file)
-        if not stats_path.is_absolute():
-            stats_path = REPO_ROOT / stats_path
-        self._global_stats = GlobalMapStatsWriter(stats_path)
-        replay_dir = Path(config.battle_replay_dir)
-        if not replay_dir.is_absolute():
-            replay_dir = REPO_ROOT / replay_dir
-        self._battle_replay = BattleReplayWriter(replay_dir)
+        if str(config.stats_mode or "map").strip().lower() == "aggregate":
+            aggregate_path = Path(config.aggregate_stats_file or "autocontroller_rebuild_for_RL/clone_jelly_state.json")
+            if not aggregate_path.is_absolute():
+                aggregate_path = REPO_ROOT / aggregate_path
+            self._global_stats = AggregateStatsWriter(aggregate_path, config.aggregate_stats_name)
+        else:
+            stats_path = Path(config.global_stats_file)
+            if not stats_path.is_absolute():
+                stats_path = REPO_ROOT / stats_path
+            self._global_stats = GlobalMapStatsWriter(stats_path)
+        if bool(config.enable_battle_replay):
+            replay_dir = Path(config.battle_replay_dir)
+            if not replay_dir.is_absolute():
+                replay_dir = REPO_ROOT / replay_dir
+            self._battle_replay = BattleReplayWriter(replay_dir)
+        else:
+            self._battle_replay = NoOpBattleReplayWriter()
         self.turn_index = 1
         self.win_count = 0
         self.battle_count = 0
@@ -1807,10 +2025,31 @@ class AutoControllerRuntime:
         self._last_progress_ts = time.monotonic()
         self._logger.write(f"进度推进：{reason}")
 
+    def _suspend_timeout_accumulation(self, seconds: float, reason: str = "") -> None:
+        delta = max(0.0, float(seconds))
+        if delta <= 0.0:
+            return
+        self._last_progress_ts += delta
+        if self._playable_seen_since is not None:
+            self._playable_seen_since += delta
+        if self._non_playable_seen_since is not None:
+            self._non_playable_seen_since += delta
+        if reason:
+            self._logger.write(f"采集恢复等待 {delta:.1f}s：{reason}")
+
     def _stats_map_name(self) -> str:
         if str(self._current_battle_map_name or "").strip():
             return str(self._current_battle_map_name).strip()
         return str(getattr(self.vision, "_map_name", "") or "").strip()
+
+    def _increment_stats(self, key: str, amount: int = 1, map_name: str = "") -> None:
+        stats_mode = str(self.config.stats_mode or "map").strip().lower()
+        target_name = str(map_name or self._stats_map_name()).strip()
+        self._global_stats.increment(target_name, key, amount)
+        if stats_mode == "aggregate":
+            self._logger.write(f"{self.config.aggregate_stats_name} 统计更新：{key} +{amount}。")
+        elif target_name:
+            self._logger.write(f"地图统计更新：{target_name} {key} +{amount}。")
 
     def _set_pending_result_check(self, value: bool, reason: str) -> None:
         self._pending_result_check = bool(value)
@@ -1819,13 +2058,55 @@ class AutoControllerRuntime:
     def _current_replay_map_id(self) -> str:
         return str(getattr(self.vision, "_map_id", "") or "")
 
+    def _reset_after_battle_resolution(self, reason: str) -> None:
+        self._battle_started = False
+        self.turn_index = 1
+        self._wait_a_enabled = True
+        self._wait_silent_logged = False
+        self._force_wait_a_reactivation = True
+        self._reset_playable_state_timers()
+        self.vision.reset_battle_context()
+        self._current_battle_map_name = ""
+        self._current_battle_stats_recorded = False
+        self._set_status(
+            phase="waiting_playable",
+            turn=1,
+            map_id="",
+            hand="",
+            p1_sp=0,
+            last_action="",
+            strategy_id=self.config.strategy_id,
+            strategy_source="",
+        )
+        self._logger.write(f"本局已重置上下文，准备进入下一局等待阶段。reason={reason}")
+
     def _analyze_settlement_result(self, frame) -> Optional[Dict[str, Any]]:
         map_name = self._stats_map_name()
         map_id = self._current_replay_map_id()
         if not map_name:
             return None
         try:
-            result = analyze_settlement_map_state(frame, map_name)
+            if str(self.config.frame_api_url or "").strip():
+                timeout_seconds = max(
+                    3.0,
+                    float(max(1, int(self.config.settlement_frame_count))) / max(1.0, float(self.config.capture_fps))
+                    + float(SETTLEMENT_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS),
+                )
+                if int(self.config.settlement_frame_count) <= 1:
+                    result = analyze_settlement_map_state(frame, map_name)
+                else:
+                    result = self.vision.run_frame_api_operation(
+                        lambda: analyze_settlement_map_state_from_frame_api(
+                            map_name=map_name,
+                            frame_url=str(self.config.frame_api_url).strip(),
+                            sample_count=int(self.config.settlement_frame_count),
+                            poll_interval_seconds=float(SETTLEMENT_MULTI_FRAME_POLL_INTERVAL_SECONDS),
+                            timeout_seconds=float(timeout_seconds),
+                        ),
+                        "Settlement frame API",
+                    )
+            else:
+                result = analyze_settlement_map_state(frame, map_name)
             if map_id:
                 return _compact_settlement_map_state_for_replay(map_id, result)
             return {
@@ -1996,6 +2277,14 @@ class AutoControllerRuntime:
         self._set_status(status="stopping", last_error=reason)
         self._push_event(reason)
 
+    def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
+        press_ms = max(20, int(hold_ms))
+        release_gap_ms = max(40, int(gap_ms))
+        self.controller.send_smart_sequence_csv(
+            f"{token},{press_ms},NOTHING,{release_gap_ms}"
+        )
+        self._push_event(f"manual_controller_input:{token}")
+
     def _press_home_and_stop(self, reason: str) -> None:
         self._set_status(phase="stopping", last_error=reason)
         self._push_event(reason)
@@ -2013,8 +2302,8 @@ class AutoControllerRuntime:
         try:
             choice = choose_with_arrows(
                 ["继续对战", "结束返回终端"],
-                title=f"已达成目标胜场：{reached}。是否继续对战？",
-                footer="使用 ↑/↓ 选择，回车确认。",
+                title=f"已达成目标胜场：{reached}。是否继续对战？（使用 ↑/↓ 选择，回车确认）",
+                footer="",
             )
             if choice != "继续对战":
                 self._logger.write(f"用户选择结束本次自动对战。已达成胜场：{reached}。")
@@ -2023,14 +2312,23 @@ class AutoControllerRuntime:
 
             self.vision.ensure_capture_ready()
             while True:
-                raw = input("请输入新的目标胜场（0 表示无限循环；正整数表示接下来还需再赢多少局）: ").strip()
+                raw = input("请输入新的目标胜场（>=0，直接回车表示按配置继续运行）：").strip()
                 if raw == "":
-                    print("请输入 0 或正整数。")
-                    continue
+                    original_continuous_run = bool(getattr(self.config, "_original_continuous_run", self.config.continuous_run))
+                    original_target_win_count = int(
+                        getattr(self.config, "_original_target_win_count", self.config.target_win_count)
+                    )
+                    self.config.continuous_run = original_continuous_run
+                    self.config.target_win_count = original_target_win_count
+                    self._logger.write("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。")
+                    self._push_event("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。")
+                    self._set_status(status="running", phase="idle", last_error="")
+                    should_restart_ui = True
+                    return True
                 try:
                     value = int(raw)
                 except ValueError:
-                    print(f"无效输入：{raw}，请输入 0 或正整数。")
+                    print(f"无效输入：{raw}，请输入 >=0 的整数，或直接回车按配置继续运行。")
                     continue
                 if value < 0:
                     print("目标胜场不能为负数。")
@@ -2092,47 +2390,43 @@ class AutoControllerRuntime:
             return
         if bool(lose_result.get("lose")):
             settlement_map_state = self._analyze_settlement_result(frame)
+            if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
+                p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
             self._set_pending_result_check(False, "settlement_detected_lose_banner")
             self.win_count += 1
             stats_map_name = self._stats_map_name()
-            if stats_map_name:
-                self._global_stats.increment(stats_map_name, "Wins", 1)
-                self._logger.write(f"地图统计更新：{stats_map_name} Wins +1。")
+            if stats_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate":
+                self._increment_stats("Wins", 1, stats_map_name)
             self._set_status(wins=self.win_count)
             self._push_event(f"battle_result=win total_wins={self.win_count}")
             self._mark_progress("检测到敌方战败标志，本局记为胜利。")
             self._finalize_battle_replay("win", "P1", settlement_map_state=settlement_map_state)
-            self.vision.reset_battle_context()
-            self._wait_a_enabled = True
-            self._wait_silent_logged = False
-            self._current_battle_map_name = ""
-            self._current_battle_stats_recorded = False
+            self._reset_after_battle_resolution("win")
             if (not self.config.continuous_run) and self.win_count >= max(1, int(self.config.target_win_count)):
                 raise TargetWinGoalReached("target_win_count_reached")
             return
         if bool(win_result.get("win")):
             settlement_map_state = self._analyze_settlement_result(frame)
+            if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
+                p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
             self._set_pending_result_check(False, "settlement_detected_win_banner")
             self._push_event("battle_result=lose")
             self._mark_progress("检测到我方战败标志，本局记为战败。")
             self._finalize_battle_replay("lose", "P2", settlement_map_state=settlement_map_state)
-            self.vision.reset_battle_context()
-            self._wait_a_enabled = True
-            self._wait_silent_logged = False
-            self._current_battle_map_name = ""
-            self._current_battle_stats_recorded = False
+            self._reset_after_battle_resolution("lose")
             return
         if bool(draw_result.get("draw")):
             settlement_map_state = self._analyze_settlement_result(frame)
+            if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
+                p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
             self._set_pending_result_check(False, "settlement_detected_draw_banner")
             self._push_event("battle_result=draw")
             self._mark_progress("检测到平局标志，本局记为平局。")
             self._finalize_battle_replay("draw", "draw", settlement_map_state=settlement_map_state)
-            self.vision.reset_battle_context()
-            self._wait_a_enabled = True
-            self._wait_silent_logged = False
-            self._current_battle_map_name = ""
-            self._current_battle_stats_recorded = False
+            self._reset_after_battle_resolution("draw")
             return
 
     def _wait_if_paused(self) -> None:
@@ -2176,9 +2470,7 @@ class AutoControllerRuntime:
                     self._push_event("battle_result_unresolved_on_playable")
                     self._logger.write("已重新进入可出牌状态，但上一局未检测到明确 win/lose/draw 标志；不按 playable 推断胜负，本局结果记为 uncertain。")
                     self._finalize_battle_replay("uncertain", None)
-                    self.vision.reset_battle_context()
-                    self._current_battle_map_name = ""
-                    self._current_battle_stats_recorded = False
+                    self._reset_after_battle_resolution("uncertain")
                     self._push_event("上一局结果未解析，已清除旧地图上下文，下一局将重新检测地图。")
                 self._push_event("playable_detected")
                 self._mark_progress("检测到可出牌状态，停止继续按 A。")
@@ -2223,14 +2515,15 @@ class AutoControllerRuntime:
                 self._battle_replay.complete_previous_move_after_state(state)
                 if (not self._current_battle_stats_recorded) and state.map_name:
                     self._current_battle_map_name = str(state.map_name)
-                    self._global_stats.increment(self._current_battle_map_name, "Battles", 1)
+                    self._increment_stats("Battles", 1, self._current_battle_map_name)
                     self._current_battle_stats_recorded = True
-                    self._logger.write(f"地图统计更新：{self._current_battle_map_name} Battles +1。")
                 observed_state = state.to_observed_state()
                 resolved_strategy = resolve_strategy(self.config, state.map_id, state.map_name)
+                p1_score_now, p2_score_now = _compute_board_scores_from_grid(state.map_grid)
                 self._logger.write(
                     f"第 {self.turn_index} 回合识别完成：地图={state.map_name}({state.map_id})，手牌={state.hand_card_numbers}，SP={state.p1_sp}。"
                 )
+                self._logger.write(f"第 {self.turn_index} 回合{_format_score_broadcast(p1_score_now, p2_score_now)}")
                 self._set_status(
                     phase="planning_action",
                     turn=self.turn_index,
@@ -2256,6 +2549,7 @@ class AutoControllerRuntime:
                 steps = compile_action_with_defaults(action, observed_state)
                 self._set_status(phase="executing_action")
                 self.controller.run_steps(steps)
+                self.vision.remember_executed_specials(action)
                 if self.turn_index < self.config.max_turns:
                     self._wait_for_next_turn_playable()
                 self.turn_index += 1
@@ -2273,17 +2567,16 @@ class AutoControllerRuntime:
             raise
         except RuntimeError as exc:
             if str(exc) in {"BATTLE_PROGRESS_TIMEOUT_SURRENDER", "WAIT_PLAYABLE_TIMEOUT_SURRENDER"}:
-                if self._current_battle_stats_recorded and self._current_battle_map_name:
-                    self._global_stats.increment(self._current_battle_map_name, "Errors", 1)
-                    self._logger.write(f"地图统计更新：{self._current_battle_map_name} Errors +1（超时投降）。")
+                if self._current_battle_stats_recorded and (
+                    self._current_battle_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate"
+                ):
+                    self._increment_stats("Errors", 1, self._current_battle_map_name)
+                    self._logger.write("本局超时投降，已计入错误统计。")
                 self._finalize_battle_replay("timeout_surrender", None)
                 self._set_pending_result_check(False, f"runtime_error:{exc}")
                 self._set_status(phase="battle_timeout_restarting", last_error=str(exc))
                 self._push_event("对局因长时间无推进而投降，已重置状态，准备重新从等待阶段开始。")
-                self._wait_a_enabled = True
-                self._wait_silent_logged = False
-                self._current_battle_map_name = ""
-                self._current_battle_stats_recorded = False
+                self._reset_after_battle_resolution("timeout_surrender")
                 return
             self._set_status(last_error=str(exc), phase="error")
             self._push_event(f"error: {exc}")
@@ -2309,8 +2602,15 @@ class AutoControllerRuntime:
 
 
 class _FrameVisionPipeline:
-    def __init__(self, config: ControllerConfig):
+    def __init__(
+        self,
+        config: ControllerConfig,
+        on_capture_recovery_pause: Optional[Callable[[float, str], None]] = None,
+        on_capture_recovery_event: Optional[Callable[[str], None]] = None,
+    ):
         self._config = config
+        self._on_capture_recovery_pause = on_capture_recovery_pause
+        self._on_capture_recovery_event = on_capture_recovery_event
         layout_path = Path(config.layout_json)
         if not layout_path.is_absolute():
             layout_path = REPO_ROOT / layout_path
@@ -2340,6 +2640,9 @@ class _FrameVisionPipeline:
         self._map_id: Optional[str] = None
         self._map_name: Optional[str] = None
         self._map_tracker: Optional[MapStateTracker] = None
+        self._persisted_p1_special_positions: Set[Tuple[int, int]] = set()
+        self._persisted_p2_special_positions: Set[Tuple[int, int]] = set()
+        self._persisted_conflict_positions: Set[Tuple[int, int]] = set()
         self.last_sp_count = 0
         self.last_enemy_sp_count = 0
         debug_dir = _resolve_debug_screenshot_dir(config.debug_frame_dir)
@@ -2361,10 +2664,74 @@ class _FrameVisionPipeline:
         self._map_id = None
         self._map_name = None
         self._map_tracker = None
+        self._persisted_p1_special_positions.clear()
+        self._persisted_p2_special_positions.clear()
+        self._persisted_conflict_positions.clear()
 
     def ensure_capture_ready(self) -> None:
         if self._frame_api_launcher is not None:
             self._frame_api_launcher.ensure_started()
+
+    def run_frame_api_operation(self, operation: Callable[[], Any], description: str) -> Any:
+        if self._frame_api_launcher is None:
+            return operation()
+
+        last_error = "unknown error"
+        recovery_started_at = time.monotonic()
+        failed_rounds = 0
+        restart_count = 0
+
+        while True:
+            round_started_at = time.monotonic()
+            try:
+                result = operation()
+                if failed_rounds > 0 and self._on_capture_recovery_event is not None:
+                    self._on_capture_recovery_event(
+                        f"{description} 已恢复成功（此前失败 {failed_rounds} 轮，重启预览 {restart_count} 次）。"
+                    )
+                return result
+            except Exception as exc:
+                last_error = str(exc)
+                failed_rounds += 1
+
+            elapsed = time.monotonic() - recovery_started_at
+            if elapsed >= float(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS):
+                break
+
+            if self._on_capture_recovery_event is not None:
+                self._on_capture_recovery_event(
+                    f"{description} 失败，准备在 {CAPTURE_RECOVERY_RETRY_SECONDS:.0f}s 后重试 "
+                    f"(本轮累计失败 {failed_rounds} 次，总恢复 {elapsed:.1f}s)：{last_error}"
+                )
+
+            if failed_rounds % int(CAPTURE_RECOVERY_MAX_RETRIES) == 0:
+                try:
+                    self._frame_api_launcher.restart()
+                    restart_count += 1
+                    if self._on_capture_recovery_event is not None:
+                        self._on_capture_recovery_event(
+                            f"{description} 连续失败 {failed_rounds} 轮，已尝试重启 preview_stream_opencv.py（第 {restart_count} 次）。"
+                        )
+                except Exception as exc:
+                    last_error = f"{last_error}; FRAME_API_RESTART_FAILED:{exc}"
+                    if self._on_capture_recovery_event is not None:
+                        self._on_capture_recovery_event(f"重启 preview_stream_opencv.py 失败：{exc}")
+
+            round_elapsed = time.monotonic() - round_started_at
+            remaining = float(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS) - (time.monotonic() - recovery_started_at)
+            if remaining <= 0:
+                if self._on_capture_recovery_pause is not None and round_elapsed > 0:
+                    self._on_capture_recovery_pause(float(round_elapsed), f"{description} 恢复失败轮次")
+                break
+            sleep_seconds = min(max(0.0, float(CAPTURE_RECOVERY_RETRY_SECONDS) - round_elapsed), max(0.0, remaining))
+            total_paused = max(0.0, round_elapsed) + max(0.0, sleep_seconds)
+            if self._on_capture_recovery_pause is not None and total_paused > 0:
+                self._on_capture_recovery_pause(float(total_paused), f"{description} 恢复等待")
+            time.sleep(float(sleep_seconds))
+
+        raise RuntimeError(
+            f"{description} unavailable after {int(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS)}s recovery window: {last_error}"
+        )
 
     def _read_latest_frame(self):
         fallback_specs = [
@@ -2379,13 +2746,16 @@ class _FrameVisionPipeline:
             {"width": 1280, "height": 720, "pixel_format": "yuyv422"},
             {"width": 1920, "height": 1080, "pixel_format": "yuyv422"},
         ]
-        frame = self._capture.read_with_fallbacks(
-            timeout_seconds=self._config.capture_read_timeout_seconds,
-            fallback_specs=fallback_specs,
-        )
-        if frame is None:
-            raise RuntimeError(f"Capture frame unavailable: {self._capture.last_error or 'unknown error'}")
-        return frame
+        def _op():
+            frame = self._capture.read_with_fallbacks(
+                timeout_seconds=self._config.capture_read_timeout_seconds,
+                fallback_specs=fallback_specs,
+            )
+            if frame is None:
+                raise RuntimeError(str(self._capture.last_error or "unknown error"))
+            return frame
+
+        return self.run_frame_api_operation(_op, "Capture frame")
 
     def _save_debug_snapshot(self, frame, payload: Dict[str, Any]) -> None:
         if not self._config.save_debug_frames:
@@ -2534,6 +2904,70 @@ class _FrameVisionPipeline:
             p1_sp=self._config.manual_fields.p1_sp,
         )
 
+    def _apply_p1_special_history(self, raw_labels: List[List[str]]) -> List[List[str]]:
+        if not bool(self._config.preserve_p1_special_history):
+            return raw_labels
+        cleared_labels = {
+            "empty",
+            "changed",
+            "transparent",
+        }
+        out = [list(row) for row in raw_labels]
+        for y, row in enumerate(out):
+            for x, label in enumerate(row):
+                pos = (int(x), int(y))
+                if label in {"p1_special", "p1_special_activated"}:
+                    self._persisted_p1_special_positions.add(pos)
+                    self._persisted_p2_special_positions.discard(pos)
+                    self._persisted_conflict_positions.discard(pos)
+                    continue
+                if label in {"p2_special", "p2_special_activated"}:
+                    self._persisted_p1_special_positions.discard(pos)
+                    self._persisted_p2_special_positions.add(pos)
+                    self._persisted_conflict_positions.discard(pos)
+                    continue
+                if label == "conflict":
+                    self._persisted_p1_special_positions.discard(pos)
+                    self._persisted_p2_special_positions.discard(pos)
+                    self._persisted_conflict_positions.add(pos)
+                    continue
+                if pos in self._persisted_conflict_positions:
+                    if label == "p1_fill":
+                        out[y][x] = "conflict"
+                        continue
+                    if label in cleared_labels:
+                        self._persisted_conflict_positions.discard(pos)
+                        # continue evaluating possible p1_special history cleanup below
+                if pos in self._persisted_p1_special_positions:
+                    if label == "p1_fill":
+                        out[y][x] = "p1_special"
+                        continue
+                    if label in cleared_labels:
+                        self._persisted_p1_special_positions.discard(pos)
+                if pos in self._persisted_p2_special_positions:
+                    if label == "p2_fill":
+                        out[y][x] = "p2_special"
+                        continue
+                    if label in cleared_labels:
+                        self._persisted_p2_special_positions.discard(pos)
+        return out
+
+    def remember_executed_specials(self, action: Any) -> None:
+        if not bool(self._config.preserve_p1_special_history):
+            return
+        if bool(getattr(action, "pass_turn", False)) or bool(getattr(action, "surrender", False)):
+            return
+        if getattr(action, "x", None) is None or getattr(action, "y", None) is None:
+            return
+        try:
+            card = create_card_from_id(int(action.card_number))
+            cells = _card_cells_on_map(card, int(action.x), int(action.y), int(action.rotation or 0))
+        except Exception:
+            return
+        for x, y, cell_type in cells:
+            if int(cell_type) == 2:
+                self._persisted_p1_special_positions.add((int(x - MAP_PADDING), int(y - MAP_PADDING)))
+
     def parse_turn_state(self, turn_index: int) -> ParsedTurnState:
         frame = self._read_latest_frame()
         playable_result = detect_playable_banner(frame)
@@ -2578,9 +3012,40 @@ class _FrameVisionPipeline:
         self.last_sp_count = int(get_sp_count_frame(frame))
         self.last_enemy_sp_count = int(get_enemy_sp_count_frame(frame))
         raw_map_state_result = detect_map_state(frame, self._map_name)
-        state_frames = self._collect_recent_frames(frame, sample_count=5, poll_interval_seconds=0.08)
-        map_state_result = self._map_tracker.update_frames(state_frames)
-        board_labels_raw = _map_state_to_board_labels(self._map_id, map_state_result)
+        state_frame_count = (
+            max(1, int(self._config.map_state_frame_count_playable))
+            if bool(playable_result.get("playable"))
+            else max(1, int(self._config.map_state_frame_count_default))
+        )
+        state_frame_count_used = 1
+        if str(self._config.frame_api_url or "").strip() and state_frame_count > 1:
+            frame_api_timeout_seconds = max(
+                3.0,
+                float(state_frame_count) / max(1.0, float(self._config.capture_fps))
+                + float(MAP_STATE_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS),
+            )
+            map_state_result = self.run_frame_api_operation(
+                lambda: self._map_tracker.update_frame_api(
+                    frame_url=str(self._config.frame_api_url).strip(),
+                    sample_count=int(state_frame_count),
+                    poll_interval_seconds=MAP_STATE_MULTI_FRAME_POLL_INTERVAL_SECONDS,
+                    timeout_seconds=frame_api_timeout_seconds,
+                ),
+                "Map-state frame API",
+            )
+            state_frame_count_used = int(map_state_result.get("frame_count_used", state_frame_count) or state_frame_count)
+        elif state_frame_count > 1:
+            state_frames = self._collect_recent_frames(
+                frame,
+                sample_count=state_frame_count,
+                poll_interval_seconds=MAP_STATE_MULTI_FRAME_POLL_INTERVAL_SECONDS,
+            )
+            map_state_result = self._map_tracker.update_frames(state_frames)
+            state_frame_count_used = len(state_frames)
+        else:
+            map_state_result = self._map_tracker.update_frame(frame)
+            state_frame_count_used = 1
+        board_labels_raw = self._apply_p1_special_history(_map_state_to_board_labels(self._map_id, map_state_result))
         board_labels = _pad_board_labels_to_engine_dims(self._map_id, board_labels_raw)
         engine_map_grid = _extract_board_grid(board_labels)
         analysis_result = {
@@ -2588,7 +3053,8 @@ class _FrameVisionPipeline:
             "map_match": map_match or {"map_id": self._map_id, "map_name_zh": self._map_name},
             "raw_map_state": raw_map_state_result,
             "map_state": map_state_result,
-            "map_state_frame_count": len(state_frames),
+            "map_state_frame_count": int(state_frame_count_used),
+            "map_state_frame_count_target": int(state_frame_count),
             "board": {
                 "raw_labels": board_labels_raw,
                 "labels": board_labels,
@@ -2642,3 +3108,21 @@ def load_config(path: str) -> ControllerConfig:
     if not cfg_path.is_absolute():
         cfg_path = REPO_ROOT / cfg_path
     return ControllerConfig.from_json(cfg_path)
+
+
+def apply_clone_jelly_profile(config: ControllerConfig) -> ControllerConfig:
+    config.strategy_id = "module:clone_jelly_strategy"
+    config.strategy_id_by_map = {}
+    config.strategy_id_by_map_name = {}
+    config.policy_config_json = ""
+    config.progress_timeout_seconds = 30.0
+    config.enable_battle_replay = False
+    config.stats_mode = "aggregate"
+    config.aggregate_stats_name = "clone_jelly"
+    config.aggregate_stats_file = "autocontroller_rebuild_for_RL/clone_jelly_state.json"
+    config.log_file = "autocontroller_rebuild_for_RL/debug_runtime/log/clone_jelly.log"
+    config.map_state_frame_count_default = 1
+    config.map_state_frame_count_playable = 1
+    config.settlement_frame_count = 1
+    config.preserve_p1_special_history = True
+    return config

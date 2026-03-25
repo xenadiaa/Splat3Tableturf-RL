@@ -20,8 +20,10 @@ from tableturf_vision.map_state_detector import (
     MAP_NAMES,
     _classify_cell,
     _extract_pure_green_points,
+    _merge_state_results_from_frames,
     _map_nonzero_columns,
     _sample_patch_mean_bgr,
+    collect_rotating_frames_from_frame_api,
     render_map_state_grid,
 )
 
@@ -165,11 +167,49 @@ def analyze_settlement_map_state_image_path(image_path: Path, map_name: str) -> 
     return result
 
 
+def analyze_settlement_map_state_from_frames(frames_bgr: List[np.ndarray], map_name: str) -> Dict:
+    if not frames_bgr:
+        raise ValueError("frames_bgr must not be empty")
+    frame_results = [analyze_settlement_map_state(frame, map_name) for frame in frames_bgr]
+    return _merge_state_results_from_frames(frame_results, frames_bgr, map_name)
+
+
+def analyze_settlement_map_state_from_frame_api(
+    map_name: str,
+    frame_url: str = "http://127.0.0.1:8765/frame.jpg",
+    frame_json_url: str = "",
+    sample_count: int = 5,
+    poll_interval_seconds: float = 0.08,
+    timeout_seconds: float = 3.0,
+) -> Dict:
+    collected = collect_rotating_frames_from_frame_api(
+        frame_url=frame_url,
+        frame_json_url=frame_json_url,
+        sample_count=sample_count,
+        poll_interval_seconds=poll_interval_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    result = analyze_settlement_map_state_from_frames(collected["frames"], map_name)
+    result["frame_api"] = {
+        "frame_url": collected["frame_url"],
+        "frame_json_url": collected["frame_json_url"],
+        "frame_count_collected": int(collected["frame_count_collected"]),
+        "requested_sample_count": int(collected["requested_sample_count"]),
+        "metadata": collected["metadata"],
+    }
+    return result
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Detect settlement-time cell-state labels for one of the 15 maps.")
     p.add_argument("--map-name", default="", help="Chinese map name")
     p.add_argument("--image", default="", help="image path; empty means latest capture image")
     p.add_argument("--input-dir", default="vision_capture/debug")
+    p.add_argument("--frame-url", default="", help="frame API jpg url; when set, use rotating-frame vote mode")
+    p.add_argument("--frame-json-url", default="", help="frame API metadata url; defaults to /frame.json")
+    p.add_argument("--sample-count", type=int, default=5, help="number of rotating frames to vote")
+    p.add_argument("--poll-interval", type=float, default=0.08, help="seconds between frame polling attempts")
+    p.add_argument("--timeout-seconds", type=float, default=3.0, help="frame collection timeout")
     p.add_argument("--json", action="store_true", help="print full JSON result")
     p.add_argument("--print-grid", action="store_true", help="print terminal map-structure preview")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color in --print-grid output")
@@ -216,12 +256,25 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    image = _resolve_image(args.image, args.input_dir)
-    result = analyze_settlement_map_state_image_path(image, args.map_name)
+    if args.frame_url:
+        result = analyze_settlement_map_state_from_frame_api(
+            args.map_name,
+            frame_url=args.frame_url,
+            frame_json_url=args.frame_json_url,
+            sample_count=args.sample_count,
+            poll_interval_seconds=args.poll_interval,
+            timeout_seconds=args.timeout_seconds,
+        )
+    else:
+        image = _resolve_image(args.image, args.input_dir)
+        result = analyze_settlement_map_state_image_path(image, args.map_name)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.print_grid:
-        print(f"Image: {result['image']}")
+        if "image" in result:
+            print(f"Image: {result['image']}")
+        elif "frame_api" in result:
+            print(f"Frame API: {result['frame_api']['frame_url']}")
         print(f"Map: {args.map_name}")
         print(f"Counts: {json.dumps(result['counts'], ensure_ascii=False)}")
         print("[Grid]")

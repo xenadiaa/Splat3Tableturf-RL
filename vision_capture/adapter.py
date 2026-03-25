@@ -112,8 +112,9 @@ def auto_detect_capture_device_name(prefer_usb: bool = True) -> Optional[str]:
     candidates = names
     if prefer_usb:
         filtered = [n for n in names if is_usb_capture_device_name(n)]
-        if filtered:
-            candidates = filtered
+        if not filtered:
+            return None
+        candidates = filtered
 
     candidates = sorted(candidates, key=rank_capture_device_name, reverse=True)
     return candidates[0] if candidates else None

@@ -48,6 +48,8 @@ from tableturf_vision.reference_matcher import (
 )
 from tableturf_vision.settlement_map_state_detector import (
     analyze_settlement_map_state,
+    analyze_settlement_map_state_from_frame_api,
+    analyze_settlement_map_state_from_frames,
     analyze_settlement_map_state_image_path,
     load_all_settlement_map_reference_points,
     load_settlement_map_reference_points,
