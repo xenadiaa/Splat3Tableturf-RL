@@ -12,6 +12,7 @@ from ..assets.tableturf_types import GameMap, Map_PointBit
 from ..engine.env_core import Action, BotConfig, GameState, PlayerState, step
 from ..engine.loaders import MAP_PADDING, load_map
 from .common_utils import create_card_from_id, validate_place_card_action
+from .npc_match_utils import npc_card_pool_by_map
 
 
 def _all_card_ids() -> List[int]:
@@ -565,6 +566,18 @@ def infer_other_action_from_known_action(
     if known_player not in ("P1", "P2"):
         raise ValueError("known_player must be P1 or P2")
     other_player = "P2" if known_player == "P1" else "P1"
+    inferred_pool = None
+    used_pool_source = "provided"
+    effective_p1_deck = list(p1_deck or [])
+    effective_p2_deck = list(p2_deck or [])
+    if other_player == "P1" and not effective_p1_deck:
+        inferred_pool = npc_card_pool_by_map(map_id)
+        effective_p1_deck = [int(x) for x in inferred_pool["card_numbers"]]
+        used_pool_source = "map_npc_union"
+    elif other_player == "P2" and not effective_p2_deck:
+        inferred_pool = npc_card_pool_by_map(map_id)
+        effective_p2_deck = [int(x) for x in inferred_pool["card_numbers"]]
+        used_pool_source = "map_npc_union"
     return {
         "ok": True,
         "implemented": False,
@@ -574,10 +587,15 @@ def infer_other_action_from_known_action(
         "known_player": known_player,
         "known_action": dict(known_action),
         "other_player": other_player,
+        "p1_deck_effective": effective_p1_deck,
+        "p2_deck_effective": effective_p2_deck,
+        "other_action_card_pool_source": used_pool_source,
+        "other_action_card_pool": (inferred_pool["card_numbers"] if inferred_pool else (effective_p1_deck if other_player == "P1" else effective_p2_deck)),
+        "map_npc_pool_info": inferred_pool,
         "candidates": [
             asdict(Action(player=other_player, card_number=None, pass_turn=True)),
         ],
-        "message": "stub only; currently returns opponent pass_turn",
+        "message": "stub only; currently returns opponent pass_turn, but missing opponent deck now falls back to the union of all NPC deck cards on this map",
     }
 
 

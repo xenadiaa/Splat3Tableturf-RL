@@ -1008,7 +1008,7 @@ class ASpamWorker:
             self._thread.join(timeout=2.0)
 
 
-def _press_button(steps: List[RemoteStep], bit_index: int, hold_ms: int = 70, gap_ms: int = 130) -> None:
+def _press_button(steps: List[RemoteStep], bit_index: int, hold_ms: int = 50, gap_ms: int = 100) -> None:
     steps.append(RemoteStep(bits=(1 << bit_index), hold_ms=hold_ms, gap_ms=gap_ms))
 
 
@@ -1019,19 +1019,19 @@ BIT_L = 4
 BIT_R = 5
 
 
-def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 70) -> None:
+def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 50) -> None:
     if dx > 0:
         for _ in range(dx):
-            _press_button(steps, BIT_DPAD_RIGHT, hold_ms=move_hold_ms, gap_ms=130)
+            _press_button(steps, BIT_DPAD_RIGHT, hold_ms=move_hold_ms, gap_ms=100)
     elif dx < 0:
         for _ in range(-dx):
-            _press_button(steps, BIT_DPAD_LEFT, hold_ms=move_hold_ms, gap_ms=130)
+            _press_button(steps, BIT_DPAD_LEFT, hold_ms=move_hold_ms, gap_ms=100)
     if dy > 0:
         for _ in range(dy):
-            _press_button(steps, BIT_DPAD_DOWN, hold_ms=move_hold_ms, gap_ms=130)
+            _press_button(steps, BIT_DPAD_DOWN, hold_ms=move_hold_ms, gap_ms=100)
     elif dy < 0:
         for _ in range(-dy):
-            _press_button(steps, BIT_DPAD_UP, hold_ms=move_hold_ms, gap_ms=130)
+            _press_button(steps, BIT_DPAD_UP, hold_ms=move_hold_ms, gap_ms=100)
 
 
 def _alternating_axis_tokens(
@@ -1079,6 +1079,31 @@ def _append_csv_press(parts: List[str], token: str, duration: int = 1, nothing_a
 @dataclass
 class _AlternatingMoveState:
     next_kind: str = "dpad"
+
+
+@dataclass
+class ActionCommandPlan:
+    menu_phase_csv: str = ""
+    selection_phase_csv: str = ""
+    map_phase_csv: str = ""
+
+    def non_empty_phases(self) -> List[Tuple[str, str]]:
+        phases: List[Tuple[str, str]] = []
+        if self.menu_phase_csv:
+            phases.append(("menu", self.menu_phase_csv))
+        if self.selection_phase_csv:
+            phases.append(("selection", self.selection_phase_csv))
+        if self.map_phase_csv:
+            phases.append(("map", self.map_phase_csv))
+        return phases
+
+
+def _phase_transition_delay_seconds(current_phase: str, next_phase: str) -> float:
+    current_name = str(current_phase or "").strip().lower()
+    next_name = str(next_phase or "").strip().lower()
+    if current_name == "selection" and next_name == "map":
+        return 0.3
+    return 0.1
 
 
 def _append_alternating_direction_csv(
@@ -1172,6 +1197,67 @@ def _move_card_selection(steps: List[RemoteStep], from_index: int, to_index: int
     from_x, from_y = _card_grid_xy(from_index)
     to_x, to_y = _card_grid_xy(to_index)
     _move_axis(steps, dx=to_x - from_x, dy=to_y - from_y)
+
+
+def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteStep]:
+    hand = list(obs.hand_card_numbers or [])
+    if not hand:
+        raise ValueError("hand_card_numbers is empty")
+    action_card = action.card_number if action.card_number is not None else hand[0]
+    if action_card not in hand:
+        raise ValueError(f"card {action.card_number} not in observed hand {hand}")
+
+    steps: List[RemoteStep] = []
+
+    if bool(getattr(action, "surrender", False)):
+        _press_button(steps, BIT_PLUS, hold_ms=120, gap_ms=2000)
+        _press_button(steps, BIT_DPAD_RIGHT, hold_ms=120, gap_ms=2000)
+        _press_button(steps, BIT_A, hold_ms=120, gap_ms=200)
+        return steps
+
+    selected_hand_index = int(obs.selected_hand_index or 0)
+
+    if bool(getattr(action, "pass_turn", False)):
+        _press_button(steps, BIT_DPAD_DOWN)
+        _press_button(steps, BIT_DPAD_DOWN)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=130)
+        target_idx = hand.index(action_card)
+        _move_card_selection(steps, from_index=0, to_index=target_idx)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+        return steps
+
+    if bool(getattr(action, "use_sp_attack", False)):
+        sp_pool = _sp_pick_pool(obs)
+        if action_card not in sp_pool:
+            raise ValueError(f"card {action_card} not available in sp pick pool {sp_pool}")
+        start_card = sp_pool[0]
+        start_idx = hand.index(start_card)
+        target_idx = hand.index(action_card)
+        _press_button(steps, BIT_DPAD_DOWN)
+        _press_button(steps, BIT_DPAD_DOWN)
+        _press_button(steps, BIT_DPAD_RIGHT)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=130)
+        _move_card_selection(steps, from_index=start_idx, to_index=target_idx)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+    else:
+        target_idx = hand.index(action_card)
+        _move_card_selection(steps, from_index=selected_hand_index, to_index=target_idx)
+        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+
+    cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
+    cw_steps = int(action.rotation) % 4
+    ccw_steps = (-int(action.rotation)) % 4
+    if cw_steps <= ccw_steps:
+        for _ in range(cw_steps):
+            _press_button(steps, BIT_X)
+    else:
+        for _ in range(ccw_steps):
+            _press_button(steps, BIT_Y)
+
+    target_x, target_y = _action_target_ui_xy(action, obs)
+    _move_axis(steps, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
+    _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+    return steps
 
 
 def _build_state_from_observation(obs: ObservedState) -> GameState:
@@ -1782,9 +1868,13 @@ def _sp_pick_pool(obs: ObservedState) -> List[int]:
     return ordered
 
 
-def compile_action_with_defaults(action, obs: ObservedState) -> str:
+def _csv_from_parts(parts: List[str]) -> str:
+    return ",".join(parts) if parts else ""
+
+
+def compile_action_command_plan(action, obs: ObservedState) -> ActionCommandPlan:
     if bool(getattr(action, "surrender", False)):
-        return "PLUS,1,NOTHING,20,DRIGHT,1,NOTHING,20,A,1,NOTHING,20"
+        return ActionCommandPlan(menu_phase_csv="PLUS,1,NOTHING,20,DRIGHT,1,NOTHING,20,A,1,NOTHING,20")
 
     hand = obs.hand_card_numbers
     if not hand:
@@ -1793,15 +1883,21 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
     if action_card not in hand:
         raise ValueError(f"card {action.card_number} not in observed hand {hand}")
 
-    parts: List[str] = []
     move_state = _AlternatingMoveState()
+    menu_parts: List[str] = []
+    selection_parts: List[str] = []
+    map_parts: List[str] = []
     if action.pass_turn:
         target_idx = hand.index(action_card)
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DUP", stick_token="LUP")
-        _append_csv_press(parts, "A", 1, 2)
-        _append_card_selection_csv(parts, move_state, from_index=0, to_index=target_idx)
-        _append_csv_press(parts, "A", 1, 20)
-        return ",".join(parts)
+        _append_alternating_direction_csv(menu_parts, move_state, dpad_token="DUP", stick_token="LUP")
+        _append_csv_press(menu_parts, "A", 1, 2)
+        _append_card_selection_csv(selection_parts, move_state, from_index=0, to_index=target_idx)
+        _append_csv_press(selection_parts, "A", 1, 20)
+        return ActionCommandPlan(
+            menu_phase_csv=_csv_from_parts(menu_parts),
+            selection_phase_csv=_csv_from_parts(selection_parts),
+            map_phase_csv="",
+        )
 
     if action.use_sp_attack:
         sp_pool = _sp_pick_pool(obs)
@@ -1810,15 +1906,15 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
         start_card = sp_pool[0]
         start_idx = hand.index(start_card)
         target_idx = hand.index(action_card)
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DUP", stick_token="LUP")
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DRIGHT", stick_token="LRIGHT")
-        _append_csv_press(parts, "A", 1, 2)
-        _append_card_selection_csv(parts, move_state, from_index=start_idx, to_index=target_idx)
-        _append_csv_press(parts, "A", 1, 1)
+        _append_alternating_direction_csv(menu_parts, move_state, dpad_token="DUP", stick_token="LUP")
+        _append_alternating_direction_csv(menu_parts, move_state, dpad_token="DRIGHT", stick_token="LRIGHT")
+        _append_csv_press(menu_parts, "A", 1, 2)
+        _append_card_selection_csv(selection_parts, move_state, from_index=start_idx, to_index=target_idx)
+        _append_csv_press(selection_parts, "A", 1, 1)
     else:
         target_idx = hand.index(action_card)
-        _append_card_selection_csv(parts, move_state, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
-        _append_csv_press(parts, "A", 1, 2)
+        _append_card_selection_csv(selection_parts, move_state, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
+        _append_csv_press(selection_parts, "A", 1, 2)
 
     cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
 
@@ -1826,15 +1922,28 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
     ccw_steps = (-int(action.rotation)) % 4
     if cw_steps <= ccw_steps:
         for _ in range(cw_steps):
-            _append_csv_press(parts, "X", 1, 1)
+            _append_csv_press(map_parts, "X", 1, 2)
     else:
         for _ in range(ccw_steps):
-            _append_csv_press(parts, "Y", 1, 1)
+            _append_csv_press(map_parts, "Y", 1, 2)
 
     target_x, target_y = _action_target_ui_xy(action, obs)
-    _append_map_move_csv(parts, move_state, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
-    _append_csv_press(parts, "A", 1, 20)
-    return ",".join(parts)
+    _append_map_move_csv(map_parts, move_state, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
+    _append_csv_press(map_parts, "A", 1, 20)
+    return ActionCommandPlan(
+        menu_phase_csv=_csv_from_parts(menu_parts),
+        selection_phase_csv=_csv_from_parts(selection_parts),
+        map_phase_csv=_csv_from_parts(map_parts),
+    )
+
+
+def compile_action_with_defaults(action, obs: ObservedState) -> str:
+    plan = compile_action_command_plan(action, obs)
+    merged: List[str] = []
+    for _phase_name, command_csv in plan.non_empty_phases():
+        if command_csv:
+            merged.extend([part for part in command_csv.split(",") if part.strip()])
+    return ",".join(merged)
 
 
 class TerminalDebugUI:
@@ -2400,24 +2509,10 @@ class AutoControllerRuntime:
         self._push_event(f"switch_link_reconnected:{next_port}")
         return True
 
-    def _send_runtime_smart_sequence(self, command_csv: str, timeout_seconds: float = 15.0) -> None:
-        try:
-            self.controller.send_smart_sequence_csv_blocking(
-                command_csv,
-                timeout_seconds=max(1.0, float(timeout_seconds)),
-            )
-        except TimeoutError:
-            self.controller.abort_active_sequence()
-            raise
-
     def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
         press_ms = max(20, int(hold_ms))
         release_gap_ms = max(40, int(gap_ms))
         token_upper = str(token).upper()
-        if token_upper in {"PLUS", "HOME", "L", "R"}:
-            self._send_runtime_smart_sequence(f"{token_upper},1,NOTHING,6", timeout_seconds=6.0)
-            self._push_event(f"manual_controller_input:{token}")
-            return
         bit_map = {
             "A": BIT_A,
             "B": BIT_B,
@@ -2443,7 +2538,7 @@ class AutoControllerRuntime:
     def _press_home_and_stop(self, reason: str) -> None:
         self._set_status(phase="stopping", last_error=reason)
         self._push_event(reason)
-        self._send_runtime_smart_sequence("HOME,1,NOTHING,6", timeout_seconds=6.0)
+        self.controller.run_steps([RemoteStep(bits=(1 << BIT_HOME), hold_ms=50, gap_ms=100)])
         time.sleep(0.3)
         self.request_stop(reason)
 
@@ -2511,7 +2606,7 @@ class AutoControllerRuntime:
 
     def _run_surrender_sequence(self) -> None:
         self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 2 秒，最后按 A。")
-        self._send_runtime_smart_sequence("PLUS,1,NOTHING,6", timeout_seconds=6.0)
+        self.controller.run_steps([RemoteStep(bits=(1 << BIT_PLUS), hold_ms=50, gap_ms=100)])
         time.sleep(2.0)
         self.controller.run_steps([RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=120, gap_ms=0)])
         time.sleep(2.0)
@@ -2520,7 +2615,7 @@ class AutoControllerRuntime:
     def _run_resume_reactivation_sequence(self) -> None:
         self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。")
         for idx in range(3):
-            self._send_runtime_smart_sequence("R,1,NOTHING,6", timeout_seconds=6.0)
+            self.controller.run_steps([RemoteStep(bits=(1 << BIT_R), hold_ms=50, gap_ms=100)])
             if idx < 2:
                 time.sleep(1.0)
 
@@ -2711,20 +2806,19 @@ class AutoControllerRuntime:
                 self._push_event(f"action_turn_{self.turn_index}: {action_text}")
                 self._logger.write(f"第 {self.turn_index} 回合采用策略 {resolved_strategy.label}，来源={resolved_strategy.source}，动作={action_text}。")
                 self._battle_replay.record_turn(state, action)
-                command_csv = compile_action_with_defaults(action, observed_state)
+                battle_steps = compile_action_to_runtime_steps(action, observed_state)
                 self._set_status(phase="executing_action")
                 try:
-                    self._send_runtime_smart_sequence(command_csv, timeout_seconds=15.0)
-                except TimeoutError:
-                    self._push_event("battle_action_sequence_timeout，当前出牌序列超时，已终止当前序列。")
-                    self._logger.write("当前出牌 smart-sequence 超时，已终止当前序列并开始检查 switch_link 串口状态。")
+                    self.controller.run_steps(battle_steps)
+                except Exception:
+                    self._logger.write("当前出牌 RemoteStep 序列执行异常，开始检查 switch_link 串口状态。")
                     reconnected = self._reconnect_controller_if_needed()
                     if reconnected:
                         self._logger.write("switch_link 串口已恢复，准备重新回到等待阶段。")
                     else:
                         self._logger.write("switch_link 串口检查正常，不做额外处理，准备回到等待阶段。")
                     self._battle_started = False
-                    self._set_pending_result_check(False, "battle_action_sequence_timeout")
+                    self._set_pending_result_check(False, "battle_action_sequence_error")
                     self.vision.reset_battle_context()
                     raise RuntimeError("BATTLE_ACTION_SEQUENCE_ABORTED")
                 self.vision.remember_executed_specials(action)

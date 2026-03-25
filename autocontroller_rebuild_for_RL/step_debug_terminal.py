@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -24,6 +25,7 @@ from autocontroller_rebuild_for_RL.runtime import (
     _engine_xy_to_ui_xy,
     _resolve_serial_port,
     choose_action_from_resolved_strategy,
+    compile_action_to_runtime_steps,
     compile_action_with_defaults,
     load_config,
     resolve_strategy,
@@ -503,7 +505,7 @@ def main() -> int:
             observed_state = state.to_observed_state()
             resolved_strategy = resolve_strategy(config, state.map_id, state.map_name)
             action = choose_action_from_resolved_strategy(observed_state, resolved_strategy)
-            command_csv = compile_action_with_defaults(action, observed_state)
+            battle_steps = compile_action_to_runtime_steps(action, observed_state)
 
             _print_block(
                 "识别输入/输出",
@@ -598,7 +600,7 @@ def main() -> int:
             if cmd == "q":
                 return 0
 
-            controller.send_smart_sequence_csv_blocking(command_csv, timeout_seconds=15.0)
+            controller.run_steps(battle_steps)
             _print_block(
                 "本步结果",
                 {
