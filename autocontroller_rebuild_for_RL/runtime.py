@@ -1076,8 +1076,26 @@ def _append_csv_press(parts: List[str], token: str, duration: int = 1, nothing_a
         _append_csv_command(parts, "NOTHING", nothing_after)
 
 
+@dataclass
+class _AlternatingMoveState:
+    next_kind: str = "dpad"
+
+
+def _append_alternating_direction_csv(
+    parts: List[str],
+    state: "_AlternatingMoveState",
+    *,
+    dpad_token: str,
+    stick_token: str,
+) -> None:
+    use_dpad = str(state.next_kind).lower() != "stick"
+    _append_csv_command(parts, dpad_token if use_dpad else stick_token, 1)
+    state.next_kind = "stick" if use_dpad else "dpad"
+
+
 def _append_alternating_axis_csv(
     parts: List[str],
+    state: "_AlternatingMoveState",
     delta: int,
     positive_dpad: str,
     positive_stick: str,
@@ -1091,13 +1109,18 @@ def _append_alternating_axis_csv(
         (positive_dpad, positive_stick) if int(delta) > 0 else (negative_dpad, negative_stick)
     )
     for idx in range(count):
-        token = dpad_token if idx % 2 == 0 else stick_token
-        _append_csv_command(parts, token, 1)
+        _append_alternating_direction_csv(
+            parts,
+            state,
+            dpad_token=dpad_token,
+            stick_token=stick_token,
+        )
 
 
-def _append_map_move_csv(parts: List[str], dx: int, dy: int) -> None:
+def _append_map_move_csv(parts: List[str], state: "_AlternatingMoveState", dx: int, dy: int) -> None:
     _append_alternating_axis_csv(
         parts,
+        state,
         dx,
         positive_dpad="DRIGHT",
         positive_stick="LRIGHT",
@@ -1106,6 +1129,7 @@ def _append_map_move_csv(parts: List[str], dx: int, dy: int) -> None:
     )
     _append_alternating_axis_csv(
         parts,
+        state,
         dy,
         positive_dpad="DDOWN",
         positive_stick="LDOWN",
@@ -1114,13 +1138,14 @@ def _append_map_move_csv(parts: List[str], dx: int, dy: int) -> None:
     )
 
 
-def _append_card_selection_csv(parts: List[str], from_index: int, to_index: int) -> None:
+def _append_card_selection_csv(parts: List[str], state: "_AlternatingMoveState", from_index: int, to_index: int) -> None:
     from_x, from_y = _card_grid_xy(from_index)
     to_x, to_y = _card_grid_xy(to_index)
     dx = int(to_x) - int(from_x)
     dy = int(to_y) - int(from_y)
     _append_alternating_axis_csv(
         parts,
+        state,
         dx,
         positive_dpad="DRIGHT",
         positive_stick="LRIGHT",
@@ -1129,6 +1154,7 @@ def _append_card_selection_csv(parts: List[str], from_index: int, to_index: int)
     )
     _append_alternating_axis_csv(
         parts,
+        state,
         dy,
         positive_dpad="DDOWN",
         positive_stick="LDOWN",
@@ -1768,12 +1794,13 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
         raise ValueError(f"card {action.card_number} not in observed hand {hand}")
 
     parts: List[str] = []
+    move_state = _AlternatingMoveState()
     if action.pass_turn:
         target_idx = hand.index(action_card)
-        _append_csv_command(parts, "DDOWN", 1)
-        _append_csv_command(parts, "DDOWN", 1)
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
         _append_csv_press(parts, "A", 1, 4)
-        _append_card_selection_csv(parts, from_index=0, to_index=target_idx)
+        _append_card_selection_csv(parts, move_state, from_index=0, to_index=target_idx)
         _append_csv_press(parts, "A", 1, 20)
         return ",".join(parts)
 
@@ -1784,15 +1811,15 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
         start_card = sp_pool[0]
         start_idx = hand.index(start_card)
         target_idx = hand.index(action_card)
-        _append_csv_command(parts, "DDOWN", 1)
-        _append_csv_command(parts, "DDOWN", 1)
-        _append_csv_command(parts, "DRIGHT", 1)
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DRIGHT", stick_token="LRIGHT")
         _append_csv_press(parts, "A", 1, 4)
-        _append_card_selection_csv(parts, from_index=start_idx, to_index=target_idx)
+        _append_card_selection_csv(parts, move_state, from_index=start_idx, to_index=target_idx)
         _append_csv_press(parts, "A", 1, 1)
     else:
         target_idx = hand.index(action_card)
-        _append_card_selection_csv(parts, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
+        _append_card_selection_csv(parts, move_state, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
         _append_csv_press(parts, "A", 1, 1)
 
     cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
@@ -1807,7 +1834,7 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
             _append_csv_press(parts, "Y", 1, 1)
 
     target_x, target_y = _action_target_ui_xy(action, obs)
-    _append_map_move_csv(parts, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
+    _append_map_move_csv(parts, move_state, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
     _append_csv_press(parts, "A", 1, 20)
     return ",".join(parts)
 
@@ -2716,6 +2743,8 @@ class AutoControllerRuntime:
             self._wait_silent_logged = False
             self._logger.write(f"12 回合结束，进入结算检查阶段。当前累计局数={self.battle_count}，累计胜场={self.win_count}。")
             self._set_status(phase="battle_complete", battles=self.battle_count)
+            self._push_event("结算阶段冷却：固定等待 7 秒，结束后再重启按 A 与 playable 检测。")
+            self._sleep_with_pause(7.0)
         except TargetWinGoalReached:
             raise
         except RuntimeError as exc:
