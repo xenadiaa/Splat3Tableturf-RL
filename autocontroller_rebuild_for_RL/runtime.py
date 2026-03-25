@@ -1797,9 +1797,8 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
     move_state = _AlternatingMoveState()
     if action.pass_turn:
         target_idx = hand.index(action_card)
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
-        _append_csv_press(parts, "A", 1, 4)
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DUP", stick_token="LUP")
+        _append_csv_press(parts, "A", 1, 2)
         _append_card_selection_csv(parts, move_state, from_index=0, to_index=target_idx)
         _append_csv_press(parts, "A", 1, 20)
         return ",".join(parts)
@@ -1811,16 +1810,15 @@ def compile_action_with_defaults(action, obs: ObservedState) -> str:
         start_card = sp_pool[0]
         start_idx = hand.index(start_card)
         target_idx = hand.index(action_card)
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
-        _append_alternating_direction_csv(parts, move_state, dpad_token="DDOWN", stick_token="LDOWN")
+        _append_alternating_direction_csv(parts, move_state, dpad_token="DUP", stick_token="LUP")
         _append_alternating_direction_csv(parts, move_state, dpad_token="DRIGHT", stick_token="LRIGHT")
-        _append_csv_press(parts, "A", 1, 4)
+        _append_csv_press(parts, "A", 1, 2)
         _append_card_selection_csv(parts, move_state, from_index=start_idx, to_index=target_idx)
         _append_csv_press(parts, "A", 1, 1)
     else:
         target_idx = hand.index(action_card)
         _append_card_selection_csv(parts, move_state, from_index=int(obs.selected_hand_index or 0), to_index=target_idx)
-        _append_csv_press(parts, "A", 1, 1)
+        _append_csv_press(parts, "A", 1, 2)
 
     cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
 

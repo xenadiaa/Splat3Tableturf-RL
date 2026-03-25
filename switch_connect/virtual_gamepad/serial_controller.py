@@ -7,6 +7,7 @@ from typing import Iterable
 
 from .input_mapper import RemoteStep
 from .smart_program_compat import (
+    COMMAND_MAX,
     SMART_HEX_ACCEPTED_VERSIONS,
     SMART_HEX_VERSION,
     encode_smart_sequence,
@@ -86,10 +87,17 @@ class SerialRemoteController:
 
     def send_smart_sequence_csv_blocking(self, command_csv: str, timeout_seconds: float = 10.0) -> None:
         commands = parse_smart_command_csv(command_csv)
-        payload = encode_smart_sequence(commands)
-        self.send_smart_sequence_payload(payload)
-        if not self._wait_smart_sequence_complete(len(commands), timeout_seconds=timeout_seconds):
-            raise TimeoutError(f"smart sequence did not finish within {timeout_seconds:.1f}s")
+        if not commands:
+            return
+        deadline = time.time() + max(0.2, float(timeout_seconds))
+        chunk_size = max(1, int(COMMAND_MAX) - 2)
+        for offset in range(0, len(commands), chunk_size):
+            chunk = commands[offset : offset + chunk_size]
+            payload = encode_smart_sequence(chunk)
+            self.send_smart_sequence_payload(payload)
+            remaining_timeout = max(0.2, deadline - time.time())
+            if not self._wait_smart_sequence_complete(len(chunk), timeout_seconds=remaining_timeout):
+                raise TimeoutError(f"smart sequence did not finish within {timeout_seconds:.1f}s")
 
     def abort_active_sequence(self) -> None:
         with contextlib.suppress(Exception):
