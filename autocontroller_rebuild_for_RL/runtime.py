@@ -328,7 +328,7 @@ class ControllerConfig:
     serial_port: str = ""
     pick_serial: bool = True
     wait_press_hold_ms: int = 110
-    wait_press_gap_ms: int = 2000
+    wait_press_gap_ms: int = 1300
     playable_poll_seconds: float = 0.35
     max_turns: int = 12
     continuous_run: bool = True
@@ -356,6 +356,8 @@ class ControllerConfig:
     map_state_frame_count_playable: int = MAP_STATE_MULTI_FRAME_PLAYABLE
     settlement_frame_count: int = SETTLEMENT_MULTI_FRAME_COUNT
     preserve_p1_special_history: bool = False
+    clone_jelly_split_action_execution: bool = False
+    clone_jelly_sp_attack_up_right: bool = False
 
     @classmethod
     def from_json(cls, path: Path) -> "ControllerConfig":
@@ -1199,7 +1201,12 @@ def _move_card_selection(steps: List[RemoteStep], from_index: int, to_index: int
     _move_axis(steps, dx=to_x - from_x, dy=to_y - from_y)
 
 
-def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteStep]:
+def compile_action_menu_selection_steps(
+    action,
+    obs: ObservedState,
+    *,
+    sp_attack_up_right: bool = False,
+) -> List[RemoteStep]:
     hand = list(obs.hand_card_numbers or [])
     if not hand:
         raise ValueError("hand_card_numbers is empty")
@@ -1220,10 +1227,10 @@ def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteSt
     if bool(getattr(action, "pass_turn", False)):
         _press_button(steps, BIT_DPAD_DOWN)
         _press_button(steps, BIT_DPAD_DOWN)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=130)
+        _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
         target_idx = hand.index(action_card)
         _move_card_selection(steps, from_index=0, to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+        _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
         return steps
 
     if bool(getattr(action, "use_sp_attack", False)):
@@ -1233,16 +1240,49 @@ def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteSt
         start_card = sp_pool[0]
         start_idx = hand.index(start_card)
         target_idx = hand.index(action_card)
-        _press_button(steps, BIT_DPAD_DOWN)
-        _press_button(steps, BIT_DPAD_DOWN)
+        if sp_attack_up_right:
+            _press_button(steps, BIT_DPAD_UP)
+        else:
+            _press_button(steps, BIT_DPAD_DOWN)
+            _press_button(steps, BIT_DPAD_DOWN)
         _press_button(steps, BIT_DPAD_RIGHT)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=130)
+        _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
         _move_card_selection(steps, from_index=start_idx, to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+        _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
+        return steps
+
+    target_idx = hand.index(action_card)
+    _move_card_selection(steps, from_index=selected_hand_index, to_index=target_idx)
+    _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
+    return steps
+
+
+def compile_action_map_phase_csv(action, obs: ObservedState) -> str:
+    if bool(getattr(action, "surrender", False)) or bool(getattr(action, "pass_turn", False)):
+        return ""
+
+    cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
+    parts: List[str] = []
+    cw_steps = int(action.rotation) % 4
+    ccw_steps = (-int(action.rotation)) % 4
+    if cw_steps <= ccw_steps:
+        for _ in range(cw_steps):
+            _append_csv_press(parts, "X", 1, 2)
     else:
-        target_idx = hand.index(action_card)
-        _move_card_selection(steps, from_index=selected_hand_index, to_index=target_idx)
-        _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+        for _ in range(ccw_steps):
+            _append_csv_press(parts, "Y", 1, 2)
+
+    target_x, target_y = _action_target_ui_xy(action, obs)
+    move_state = _AlternatingMoveState()
+    _append_map_move_csv(parts, move_state, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
+    _append_csv_press(parts, "A", 1, 20)
+    return _csv_from_parts(parts)
+
+
+def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteStep]:
+    steps = compile_action_menu_selection_steps(action, obs)
+    if bool(getattr(action, "surrender", False)) or bool(getattr(action, "pass_turn", False)):
+        return steps
 
     cursor_x, cursor_y = _initial_ui_anchor_for_map(obs)
     cw_steps = int(action.rotation) % 4
@@ -1256,7 +1296,7 @@ def compile_action_to_runtime_steps(action, obs: ObservedState) -> List[RemoteSt
 
     target_x, target_y = _action_target_ui_xy(action, obs)
     _move_axis(steps, dx=int(target_x) - int(cursor_x), dy=int(target_y) - int(cursor_y))
-    _press_button(steps, BIT_A, hold_ms=110, gap_ms=200)
+    _press_button(steps, BIT_A, hold_ms=50, gap_ms=100)
     return steps
 
 
@@ -2619,6 +2659,23 @@ class AutoControllerRuntime:
             if idx < 2:
                 time.sleep(1.0)
 
+    def _execute_battle_action(self, action, observed_state: ObservedState) -> None:
+        if bool(self.config.clone_jelly_split_action_execution):
+            selection_steps = compile_action_menu_selection_steps(
+                action,
+                observed_state,
+                sp_attack_up_right=bool(self.config.clone_jelly_sp_attack_up_right),
+            )
+            if selection_steps:
+                self.controller.run_steps(selection_steps)
+            map_phase_csv = compile_action_map_phase_csv(action, observed_state)
+            if map_phase_csv:
+                time.sleep(0.1)
+                self.controller.send_smart_sequence_csv_blocking(map_phase_csv, timeout_seconds=15.0)
+            return
+        battle_steps = compile_action_to_runtime_steps(action, observed_state)
+        self.controller.run_steps(battle_steps)
+
     def _finalize_previous_battle_as_not_win(self, reason: str) -> None:
         if not self._pending_result_check:
             return
@@ -2806,10 +2863,9 @@ class AutoControllerRuntime:
                 self._push_event(f"action_turn_{self.turn_index}: {action_text}")
                 self._logger.write(f"第 {self.turn_index} 回合采用策略 {resolved_strategy.label}，来源={resolved_strategy.source}，动作={action_text}。")
                 self._battle_replay.record_turn(state, action)
-                battle_steps = compile_action_to_runtime_steps(action, observed_state)
                 self._set_status(phase="executing_action")
                 try:
-                    self.controller.run_steps(battle_steps)
+                    self._execute_battle_action(action, observed_state)
                 except Exception:
                     self._logger.write("当前出牌 RemoteStep 序列执行异常，开始检查 switch_link 串口状态。")
                     reconnected = self._reconnect_controller_if_needed()
@@ -3393,7 +3449,7 @@ def load_config(path: str) -> ControllerConfig:
 
 
 def apply_clone_jelly_profile(config: ControllerConfig) -> ControllerConfig:
-    config.strategy_id = "module:clone_jelly_strategy"
+    config.strategy_id = "module:autocontroller_clone_jelly_strategy"
     config.strategy_id_by_map = {}
     config.strategy_id_by_map_name = {}
     config.policy_config_json = ""
@@ -3407,4 +3463,6 @@ def apply_clone_jelly_profile(config: ControllerConfig) -> ControllerConfig:
     config.map_state_frame_count_playable = 1
     config.settlement_frame_count = 1
     config.preserve_p1_special_history = True
+    config.clone_jelly_split_action_execution = False
+    config.clone_jelly_sp_attack_up_right = False
     return config

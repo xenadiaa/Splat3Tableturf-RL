@@ -25,6 +25,8 @@ from autocontroller_rebuild_for_RL.runtime import (
     _engine_xy_to_ui_xy,
     _resolve_serial_port,
     choose_action_from_resolved_strategy,
+    compile_action_map_phase_csv,
+    compile_action_menu_selection_steps,
     compile_action_to_runtime_steps,
     compile_action_with_defaults,
     load_config,
@@ -600,7 +602,20 @@ def main() -> int:
             if cmd == "q":
                 return 0
 
-            controller.run_steps(battle_steps)
+            if bool(config.clone_jelly_split_action_execution):
+                selection_steps = compile_action_menu_selection_steps(
+                    action,
+                    observed_state,
+                    sp_attack_up_right=bool(config.clone_jelly_sp_attack_up_right),
+                )
+                if selection_steps:
+                    controller.run_steps(selection_steps)
+                map_phase_csv = compile_action_map_phase_csv(action, observed_state)
+                if map_phase_csv:
+                    time.sleep(0.1)
+                    controller.send_smart_sequence_csv_blocking(map_phase_csv, timeout_seconds=15.0)
+            else:
+                controller.run_steps(battle_steps)
             _print_block(
                 "本步结果",
                 {

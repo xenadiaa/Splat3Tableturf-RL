@@ -15,7 +15,7 @@
   "serial_port": "/dev/cu.usbserial-02ENTJB1",
   "pick_serial": false,
   "wait_press_hold_ms": 110,
-  "wait_press_gap_ms": 2000,
+  "wait_press_gap_ms": 1300,
   "playable_poll_seconds": 0.35,
   "max_turns": 12,
   "continuous_run": true,

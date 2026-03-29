@@ -16,11 +16,22 @@ from src.utils.action_infer_utils import infer
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Infer possible action pairs from before/after map snapshots")
-    p.add_argument("input_json", help="JSON file with map_id/before_grid/after_grid/p1_hand/p2_hand[/p1_sp/p2_sp/turn]")
+    p = argparse.ArgumentParser(description="Unified Tableturf inference entry")
+    p.add_argument(
+        "input_json",
+        help=(
+            "JSON file for unified inference. Depending on mode, may include "
+            "map_id/before_grid/after_grid/known_player/known_action/p1_action/p2_action."
+        ),
+    )
     p.add_argument(
         "--mode",
-        choices=("map_to_both_actions", "map_plus_one_action_to_other", "both_actions_to_map"),
+        choices=(
+            "map_to_both_actions",
+            "map_plus_one_action_to_other",
+            "both_actions_to_map",
+            "played_plus_hand_to_deck",
+        ),
         default=None,
     )
     p.add_argument("--max-results", type=int, default=128)

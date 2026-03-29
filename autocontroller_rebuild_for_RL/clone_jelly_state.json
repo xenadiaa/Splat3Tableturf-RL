@@ -2,8 +2,8 @@
   "format": "aggregate_battle_stats_v1",
   "name": "clone_jelly",
   "stats": {
-    "Battles": 337,
-    "Wins": 302,
-    "Errors": 9
+    "Battles": 372,
+    "Wins": 332,
+    "Errors": 10
   }
 }

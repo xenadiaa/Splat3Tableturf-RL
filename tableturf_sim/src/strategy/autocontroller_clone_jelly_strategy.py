@@ -1,0 +1,322 @@
+"""AutoControllerHelper-inspired Clone Jelly strategy.
+
+This module ports the high-level phase logic from AutoControllerHelper's
+`ThreeTwelveSp` Tableturf AI into the simulator strategy system:
+
+- early game: use small cards to extend toward the opponent
+- mid game: build special points until 3 SP is available
+- late game: preserve the 12-point finisher for the last turn
+- final turn: spend 3 SP on the 12-point finisher when possible
+
+The simulator has richer state than the original vision-driven C++ bot, so this
+port uses exact legal actions and board state while keeping the same overall
+decision priorities.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from src.assets.tableturf_types import Map_PointBit
+from src.engine.env_core import _card_cells_on_map, _find_card_in_hand
+from src.utils.common_utils import create_card_from_id
+
+STRATEGY_LABEL = "AutoController Clone Jelly"
+
+
+def _payload_to_card(state, player: str, payload: Dict[str, object]):
+    return _find_card_in_hand(state.players[player], payload.get("card_number"))
+
+
+def _payload_cells(state, player: str, payload: Dict[str, object]) -> List[Tuple[int, int, int]]:
+    card = _payload_to_card(state, player, payload)
+    if card is None or bool(payload.get("pass_turn", False)):
+        return []
+    return _card_cells_on_map(
+        card,
+        int(payload.get("x", 0)),
+        int(payload.get("y", 0)),
+        int(payload.get("rotation", 0)),
+    )
+
+
+def _neighbors8(x: int, y: int) -> Iterable[Tuple[int, int]]:
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            yield x + dx, y + dy
+
+
+def _owner_bits(player: str) -> Tuple[int, int]:
+    if player == "P1":
+        return int(Map_PointBit.IsP1), int(Map_PointBit.IsP2)
+    return int(Map_PointBit.IsP2), int(Map_PointBit.IsP1)
+
+
+def _card_point(state, player: str, payload: Dict[str, object]) -> int:
+    card = _payload_to_card(state, player, payload)
+    return int(card.CardPoint) if card is not None else -1
+
+
+def _card_sp_cost(state, player: str, payload: Dict[str, object]) -> int:
+    card = _payload_to_card(state, player, payload)
+    return int(card.SpecialCost) if card is not None else 0
+
+
+def _finisher_card_numbers(state, player: str) -> List[int]:
+    nums: List[int] = []
+    for cid in state.players[player].deck_ids:
+        card = create_card_from_id(cid)
+        if int(card.CardPoint) == 12:
+            nums.append(card.Number)
+    return nums
+
+
+def _project_score_swing(state, player: str, payload: Dict[str, object]) -> float:
+    own_bit, opp_bit = _owner_bits(player)
+    swing = 0.0
+    for x, y, _cell_type in _payload_cells(state, player, payload):
+        m = int(state.map.get_point(x, y))
+        had_own = (m & own_bit) != 0
+        had_opp = (m & opp_bit) != 0
+        if had_opp and not had_own:
+            swing += 2.0
+        elif not had_own and not had_opp:
+            swing += 1.0
+    return swing
+
+
+def _placed_occupancy(state, player: str, payload: Dict[str, object]) -> Tuple[set[Tuple[int, int]], set[Tuple[int, int]]]:
+    occupied = set()
+    special = set()
+    for x, y, cell_type in _payload_cells(state, player, payload):
+        occupied.add((x, y))
+        if int(cell_type) == 2:
+            special.add((x, y))
+    return occupied, special
+
+
+def _special_points_after_action(state, player: str, payload: Dict[str, object]) -> List[Tuple[int, int]]:
+    own_bit, _opp_bit = _owner_bits(player)
+    occupied, placed_special = _placed_occupancy(state, player, payload)
+    out: List[Tuple[int, int]] = []
+    seen = set()
+    for y in range(state.map.height):
+        for x in range(state.map.width):
+            m = int(state.map.get_point(x, y))
+            if (m & own_bit) != 0 and (m & int(Map_PointBit.IsSp)) != 0:
+                out.append((x, y))
+                seen.add((x, y))
+    for pos in placed_special:
+        if pos not in seen and pos in occupied:
+            out.append(pos)
+    return out
+
+
+def _is_blocked_after_action(state, player: str, payload: Dict[str, object], x: int, y: int) -> bool:
+    if not (0 <= x < state.map.width and 0 <= y < state.map.height):
+        return True
+    occupied, _special = _placed_occupancy(state, player, payload)
+    if (x, y) in occupied:
+        return True
+    m = int(state.map.get_point(x, y))
+    if (m & int(Map_PointBit.IsValid)) == 0:
+        return True
+    return (m & (int(Map_PointBit.IsP1) | int(Map_PointBit.IsP2))) != 0
+
+
+def _build_special_score(state, player: str, payload: Dict[str, object]) -> int:
+    score = 0
+    for x, y in _special_points_after_action(state, player, payload):
+        surround_count = 0
+        for nx, ny in _neighbors8(x, y):
+            if _is_blocked_after_action(state, player, payload, nx, ny):
+                surround_count += 1
+        score += sum(range(surround_count))
+        if surround_count == 8:
+            score += 40
+    return score
+
+
+def _build_special_delta(state, player: str, payload: Dict[str, object]) -> int:
+    return _build_special_score(state, player, payload) - _build_special_score(state, player, {"pass_turn": True})
+
+
+def _home_anchor(state, player: str) -> Tuple[float, float]:
+    valid_cells: List[Tuple[int, int]] = []
+    for y in range(state.map.height):
+        for x in range(state.map.width):
+            m = int(state.map.get_point(x, y))
+            if (m & int(Map_PointBit.IsValid)) != 0:
+                valid_cells.append((x, y))
+    if not valid_cells:
+        return 0.0, 0.0
+    target_y = max(y for _x, y in valid_cells) if player == "P1" else min(y for _x, y in valid_cells)
+    xs = [x for x, y in valid_cells if y == target_y]
+    if not xs:
+        return 0.0, float(target_y)
+    return sum(xs) / len(xs), float(target_y)
+
+
+def _rotation_penalty(payload: Dict[str, object]) -> int:
+    rotation = int(payload.get("rotation", 0))
+    return rotation if rotation % 2 == 0 else 1
+
+
+def _special_anchor(state, player: str, payload: Dict[str, object]) -> Tuple[float, float]:
+    _occupied, placed_special = _placed_occupancy(state, player, payload)
+    if placed_special:
+        x, y = next(iter(placed_special))
+        return float(x), float(y)
+    cells = _payload_cells(state, player, payload)
+    if not cells:
+        return 0.0, 0.0
+    return (
+        sum(x for x, _y, _t in cells) / len(cells),
+        sum(y for _x, y, _t in cells) / len(cells),
+    )
+
+
+def _least_moves_score(state, player: str, payload: Dict[str, object]) -> float:
+    hx, hy = _home_anchor(state, player)
+    ax, ay = _special_anchor(state, player, payload)
+    return 10.0 - abs(ax - hx) - abs(ay - hy) - float(_rotation_penalty(payload))
+
+
+def _expand_turf_score(state, player: str, payload: Dict[str, object]) -> float:
+    ax, ay = _special_anchor(state, player, payload)
+    map_mid_x = (state.map.width - 1) / 2.0
+    forward = -ay if player == "P1" else ay
+    return 30.0 + forward - abs(ax - map_mid_x)
+
+
+def _best_by_score(actions: List[dict], scorer) -> Dict[str, object]:
+    best = None
+    best_score = None
+    for action in actions:
+        score = scorer(action)
+        if best_score is None or score > best_score:
+            best = action
+            best_score = score
+    if best is None:
+        raise RuntimeError("no action available")
+    return best
+
+
+def choose_action(state, player: str, legal_actions: List[dict], context: Dict[str, object]) -> Dict[str, object]:
+    if not legal_actions:
+        raise RuntimeError("legal_actions is empty")
+
+    ps = state.players[player]
+    turns_left = max(1, int(state.max_turns) - int(state.turn) + 1)
+    finishers = set(_finisher_card_numbers(state, player))
+    finisher_in_hand = {c.Number for c in ps.hand if c.Number in finishers}
+
+    non_pass = [a for a in legal_actions if not bool(a.get("pass_turn", False))]
+    normal = [a for a in non_pass if not bool(a.get("use_sp_attack", False))]
+    sp_actions = [a for a in non_pass if bool(a.get("use_sp_attack", False))]
+
+    # Final turn: spend 3 SP on the 12-point finisher whenever possible.
+    if state.turn >= state.max_turns:
+        finisher_sp = [
+            a for a in sp_actions
+            if a.get("card_number") in finisher_in_hand and _card_sp_cost(state, player, a) <= ps.sp
+        ]
+        if ps.sp >= 3 and finisher_sp:
+            return _best_by_score(
+                finisher_sp,
+                lambda a: (
+                    _project_score_swing(state, player, a),
+                    _card_point(state, player, a),
+                ),
+            )
+        usable_sp = [a for a in sp_actions if _card_sp_cost(state, player, a) <= ps.sp]
+        if usable_sp:
+            return _best_by_score(usable_sp, lambda a: (_project_score_swing(state, player, a), _card_point(state, player, a)))
+        if normal:
+            return _best_by_score(normal, lambda a: (_project_score_swing(state, player, a), _card_point(state, player, a)))
+        return legal_actions[0]
+
+    # Before the final turn, preserve the 12-point finisher when alternatives exist.
+    if finisher_in_hand:
+        keep_finisher = [
+            a for a in legal_actions
+            if bool(a.get("pass_turn", False)) or a.get("card_number") not in finisher_in_hand
+        ]
+        if keep_finisher:
+            legal_actions = keep_finisher
+            non_pass = [a for a in legal_actions if not bool(a.get("pass_turn", False))]
+            normal = [a for a in non_pass if not bool(a.get("use_sp_attack", False))]
+            sp_actions = [a for a in non_pass if bool(a.get("use_sp_attack", False))]
+
+    # AutoController's ThreeTwelveSp mode avoids >4-point cards before the final turn.
+    small_normal = [a for a in normal if _card_point(state, player, a) <= 4]
+    if small_normal:
+        normal = small_normal
+
+    # Spend excess SP on small cards if we are already above the finisher threshold.
+    if ps.sp > 3:
+        extra_sp = [
+            a for a in sp_actions
+            if _card_sp_cost(state, player, a) <= ps.sp
+            and _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
+        ]
+        profitable_sp = [a for a in extra_sp if _project_score_swing(state, player, a) > _card_point(state, player, a)]
+        if profitable_sp:
+            return _best_by_score(
+                profitable_sp,
+                lambda a: (
+                    _project_score_swing(state, player, a),
+                    -_card_sp_cost(state, player, a),
+                    _card_point(state, player, a),
+                ),
+            )
+
+    # First 4 turns: extend toward the opponent with small cards.
+    if turns_left >= 9 and normal:
+        return _best_by_score(
+            normal,
+            lambda a: (
+                _expand_turf_score(state, player, a),
+                _card_point(state, player, a),
+                _least_moves_score(state, player, a),
+            ),
+        )
+
+    # Mid game before 3 SP: build special as aggressively as possible.
+    if normal and ps.sp < 3:
+        return _best_by_score(
+            normal,
+            lambda a: (
+                _build_special_delta(state, player, a),
+                _build_special_score(state, player, a),
+                _expand_turf_score(state, player, a),
+                _card_point(state, player, a),
+            ),
+        )
+
+    # Late game with finisher ready: keep expanding while preferring easy placements.
+    if normal:
+        return _best_by_score(
+            normal,
+            lambda a: (
+                _expand_turf_score(state, player, a),
+                _least_moves_score(state, player, a),
+                _build_special_delta(state, player, a),
+                _card_point(state, player, a),
+            ),
+        )
+
+    usable_sp = [a for a in sp_actions if _card_sp_cost(state, player, a) <= ps.sp]
+    if usable_sp:
+        return _best_by_score(
+            usable_sp,
+            lambda a: (
+                _project_score_swing(state, player, a),
+                -_card_sp_cost(state, player, a),
+                _card_point(state, player, a),
+            ),
+        )
+
+    return legal_actions[0]

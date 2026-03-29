@@ -12,6 +12,7 @@ from ..assets.tableturf_types import GameMap, Map_PointBit
 from ..engine.env_core import Action, BotConfig, GameState, PlayerState, step
 from ..engine.loaders import MAP_PADDING, load_map
 from .common_utils import create_card_from_id, validate_place_card_action
+from .infer_config import infer_mode_flags
 from .npc_match_utils import npc_card_pool_by_map
 
 
@@ -635,6 +636,59 @@ def infer_map_from_known_actions(
     }
 
 
+def infer_deck_from_played_and_hand(
+    player: str,
+    played_card_numbers: Optional[List[int]] = None,
+    hand_card_numbers: Optional[List[int]] = None,
+    deck_size: int = 15,
+) -> Dict[str, object]:
+    """
+    Infer a player's deck from observed played cards + current hand.
+
+    Rules:
+    - dedupe by card number
+    - if unique count == deck_size, deck is fully resolved
+    - if unique count < deck_size, deck is partial/incomplete
+    - if unique count > deck_size, input is contradictory
+    """
+    if player not in ("P1", "P2"):
+        raise ValueError("player must be P1 or P2")
+    played = _dedupe_keep_order(played_card_numbers or [])
+    hand = _dedupe_keep_order(hand_card_numbers or [])
+    merged = _dedupe_keep_order(list(played) + list(hand))
+    if len(merged) > int(deck_size):
+        return {
+            "ok": False,
+            "implemented": True,
+            "mode": "infer_deck_from_played_and_hand",
+            "player": player,
+            "deck_size": int(deck_size),
+            "played_card_numbers": played,
+            "hand_card_numbers": hand,
+            "inferred_deck_ids": merged,
+            "resolved": False,
+            "error": "UNIQUE_CARD_COUNT_EXCEEDS_DECK_SIZE",
+        }
+    return {
+        "ok": True,
+        "implemented": True,
+        "mode": "infer_deck_from_played_and_hand",
+        "player": player,
+        "deck_size": int(deck_size),
+        "played_card_numbers": played,
+        "hand_card_numbers": hand,
+        "unique_count": len(merged),
+        "inferred_deck_ids": merged,
+        "resolved": len(merged) == int(deck_size),
+        "remaining_unknown_count": max(0, int(deck_size) - len(merged)),
+        "message": (
+            "deck fully resolved"
+            if len(merged) == int(deck_size)
+            else "deck still incomplete; more played/hand cards required"
+        ),
+    }
+
+
 def infer(
     mode: str,
     map_id: str,
@@ -660,11 +714,23 @@ def infer(
     - map_to_both_actions
     - map_plus_one_action_to_other
     - both_actions_to_map
+    - played_plus_hand_to_deck
     """
+    flags = infer_mode_flags(mode)
+
+    if not flags["enable_exact"] and not flags["enable_fuzzy"]:
+        return {
+            "ok": False,
+            "mode": mode,
+            "implemented": False,
+            "error": "INFERENCE_DISABLED_BY_CONFIG",
+            "inference_flags": flags,
+        }
+
     if mode == "map_to_both_actions":
         if before_grid is None or after_grid is None:
             raise ValueError("before_grid and after_grid are required for mode map_to_both_actions")
-        return infer_actions_from_map_transition(
+        result = infer_actions_from_map_transition(
             map_id=map_id,
             before_grid=before_grid,
             after_grid=after_grid,
@@ -677,12 +743,15 @@ def infer(
             turn=turn,
             max_results=max_results,
         )
+        result["inference_flags"] = flags
+        result["inference_path"] = "exact_only" if not flags["enable_fuzzy"] else "exact_then_fuzzy"
+        return result
     if mode == "map_plus_one_action_to_other":
         if before_grid is None or after_grid is None:
             raise ValueError("before_grid and after_grid are required for mode map_plus_one_action_to_other")
         if not known_player:
             raise ValueError("known_player is required for mode map_plus_one_action_to_other")
-        return infer_other_action_from_known_action(
+        result = infer_other_action_from_known_action(
             map_id=map_id,
             before_grid=before_grid,
             after_grid=after_grid,
@@ -696,10 +765,13 @@ def infer(
             p2_sp=p2_sp,
             turn=turn,
         )
+        result["inference_flags"] = flags
+        result["inference_path"] = "exact_only" if not flags["enable_fuzzy"] else "exact_then_fuzzy"
+        return result
     if mode == "both_actions_to_map":
         if before_grid is None:
             raise ValueError("before_grid is required for mode both_actions_to_map")
-        return infer_map_from_known_actions(
+        result = infer_map_from_known_actions(
             map_id=map_id,
             before_grid=before_grid,
             after_grid=after_grid or before_grid,
@@ -713,6 +785,21 @@ def infer(
             p2_sp=p2_sp,
             turn=turn,
         )
+        result["inference_flags"] = flags
+        result["inference_path"] = "exact_only" if not flags["enable_fuzzy"] else "exact_then_fuzzy"
+        return result
+    if mode == "played_plus_hand_to_deck":
+        if not known_player:
+            raise ValueError("known_player/player is required for mode played_plus_hand_to_deck")
+        result = infer_deck_from_played_and_hand(
+            player=known_player,
+            played_card_numbers=[int(x) for x in (known_action or {}).get("played_card_numbers", [])],
+            hand_card_numbers=[int(x) for x in (known_action or {}).get("hand_card_numbers", [])],
+            deck_size=int((known_action or {}).get("deck_size", 15)),
+        )
+        result["inference_flags"] = flags
+        result["inference_path"] = "exact_only" if not flags["enable_fuzzy"] else "exact_then_fuzzy"
+        return result
     raise ValueError(f"unsupported infer mode: {mode}")
 
 

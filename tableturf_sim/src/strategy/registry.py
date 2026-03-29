@@ -14,6 +14,21 @@ NPC_DEFAULTS_JSON = STRATEGY_DIR / "npc_defaults.json"
 DEFAULT_DEFS_JSON = STRATEGY_DIR / "default_strategy_defs.json"
 
 
+def _load_module_strategy_meta(module_name: str) -> Dict[str, str]:
+    try:
+        module = importlib.import_module(f"src.strategy.{module_name}")
+    except Exception:
+        return {}
+    label = getattr(module, "STRATEGY_LABEL", None)
+    strategy_id = getattr(module, "STRATEGY_ID", None)
+    out: Dict[str, str] = {}
+    if isinstance(label, str) and label.strip():
+        out["label"] = label.strip()
+    if isinstance(strategy_id, str) and strategy_id.strip():
+        out["id"] = strategy_id.strip()
+    return out
+
+
 def load_npc_strategy_table() -> List[dict]:
     data = json.loads(NPC_DEFAULTS_JSON.read_text(encoding="utf-8"))
     if not isinstance(data, list):
@@ -60,11 +75,12 @@ def list_available_strategy_ids() -> List[dict]:
         )
     for path in sorted(STRATEGY_DIR.glob("*_strategy.py")):
         mod_name = path.stem
+        meta = _load_module_strategy_meta(mod_name)
         rows.append(
             {
-                "id": f"module:{mod_name}",
+                "id": meta.get("id", f"module:{mod_name}"),
                 "kind": "module",
-                "label": f"Module {mod_name}",
+                "label": meta.get("label", f"Module {mod_name}"),
                 "module_name": mod_name,
                 "path": str(path),
             }
