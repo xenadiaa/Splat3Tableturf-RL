@@ -7,12 +7,14 @@ import json
 import os
 import re
 import select
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
@@ -80,6 +82,18 @@ SETTLEMENT_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS = 2.0
 CAPTURE_RECOVERY_RETRY_SECONDS = 5.0
 CAPTURE_RECOVERY_MAX_RETRIES = 6
 CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS = 60.0
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen_local_direct(req_or_url: Any, timeout: float):
+    url = req_or_url.full_url if isinstance(req_or_url, urllib.request.Request) else str(req_or_url)
+    parsed = urllib.parse.urlparse(str(url))
+    host = str(parsed.hostname or "").strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return _NO_PROXY_OPENER.open(req_or_url, timeout=timeout)
+    return urllib.request.urlopen(req_or_url, timeout=timeout)
 
 
 def _unique_debug_image_path(out_dir: Path, prefix: str, idx: int) -> Path:
@@ -770,7 +784,7 @@ class HttpJpegCaptureSource:
         last_error = "HTTP_FRAME_FETCH_FAILED:unknown"
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(req, timeout=min(1.0, max(0.3, float(timeout_seconds)))) as resp:
+                with _urlopen_local_direct(req, timeout=min(1.0, max(0.3, float(timeout_seconds)))) as resp:
                     payload = resp.read()
             except Exception as exc:
                 last_error = f"HTTP_FRAME_FETCH_FAILED:{exc}"
@@ -808,6 +822,69 @@ class FrameApiAutoLauncher:
         self._config = config
         self._proc: Optional[subprocess.Popen] = None
 
+    def _launch_script_path(self) -> Path:
+        return _resolve_repo_path(self._config.frame_api_launch_script)
+
+    def _launch_config_path(self) -> Path:
+        return _resolve_repo_path(self._config.frame_api_launch_config)
+
+    def _launch_cmd(self) -> List[str]:
+        return [sys.executable, str(self._launch_script_path()), "--config", str(self._launch_config_path())]
+
+    def _cleanup_stale_preview_processes(self) -> None:
+        script_path = str(self._launch_script_path())
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-af", script_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return
+
+        current_pid = self._proc.pid if self._proc is not None and self._proc.poll() is None else None
+        for line in str(proc.stdout or "").splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except Exception:
+                continue
+            cmdline = parts[1] if len(parts) > 1 else ""
+            if pid == current_pid:
+                continue
+            if script_path not in cmdline:
+                continue
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-af", script_path],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return
+        for line in str(proc.stdout or "").splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except Exception:
+                continue
+            cmdline = parts[1] if len(parts) > 1 else ""
+            if pid == current_pid:
+                continue
+            if script_path not in cmdline:
+                continue
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGKILL)
+
     def _health_url(self) -> str:
         explicit = str(self._config.frame_api_health_url or "").strip()
         if explicit:
@@ -821,13 +898,24 @@ class FrameApiAutoLauncher:
 
     def is_ready(self, timeout_seconds: float = 1.0) -> bool:
         health_url = self._health_url()
-        if not health_url:
+        if health_url:
+            req = urllib.request.Request(health_url, headers={"Cache-Control": "no-cache"})
+            try:
+                with _urlopen_local_direct(req, timeout=max(0.3, timeout_seconds)) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                if bool(payload.get("has_frame")):
+                    return True
+            except Exception:
+                pass
+        frame_url = str(self._config.frame_api_url or "").strip()
+        if not frame_url:
             return False
-        req = urllib.request.Request(health_url, headers={"Cache-Control": "no-cache"})
+        req = urllib.request.Request(frame_url, headers={"Cache-Control": "no-cache"})
         try:
-            with urllib.request.urlopen(req, timeout=max(0.3, timeout_seconds)) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-            return bool(payload.get("has_frame"))
+            with _urlopen_local_direct(req, timeout=max(0.3, timeout_seconds)) as resp:
+                content_type = str(resp.headers.get("Content-Type", "")).lower()
+                payload = resp.read(32)
+            return bool(payload) and ("jpeg" in content_type or "image/" in content_type)
         except Exception:
             return False
 
@@ -839,9 +927,10 @@ class FrameApiAutoLauncher:
         if not self._config.frame_api_auto_start:
             raise RuntimeError("FRAME_API_NOT_READY_AND_AUTO_START_DISABLED")
 
-        script_path = _resolve_repo_path(self._config.frame_api_launch_script)
-        launch_config = _resolve_repo_path(self._config.frame_api_launch_config)
-        cmd = [sys.executable, str(script_path), "--config", str(launch_config)]
+        if self._proc is not None and self._proc.poll() is None:
+            self.stop()
+        self._cleanup_stale_preview_processes()
+        cmd = self._launch_cmd()
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(REPO_ROOT),
@@ -2550,9 +2639,20 @@ class AutoControllerRuntime:
         return True
 
     def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
-        press_ms = max(20, int(hold_ms))
-        release_gap_ms = max(40, int(gap_ms))
         token_upper = str(token).upper()
+        if token_upper in {"PLUS", "HOME"}:
+            self.controller.send_smart_sequence_csv_blocking(f"{token_upper},1", timeout_seconds=2.0)
+            self._push_event(f"manual_controller_input:{token}")
+            return
+        special_timing = {
+            "L": (80, 120),
+            "R": (80, 120),
+        }
+        if token_upper in special_timing:
+            press_ms, release_gap_ms = special_timing[token_upper]
+        else:
+            press_ms = max(20, int(hold_ms))
+            release_gap_ms = max(40, int(gap_ms))
         bit_map = {
             "A": BIT_A,
             "B": BIT_B,
@@ -2578,7 +2678,7 @@ class AutoControllerRuntime:
     def _press_home_and_stop(self, reason: str) -> None:
         self._set_status(phase="stopping", last_error=reason)
         self._push_event(reason)
-        self.controller.run_steps([RemoteStep(bits=(1 << BIT_HOME), hold_ms=50, gap_ms=100)])
+        self.controller.send_smart_sequence_csv_blocking("HOME,1", timeout_seconds=2.0)
         time.sleep(0.3)
         self.request_stop(reason)
 
@@ -2646,7 +2746,7 @@ class AutoControllerRuntime:
 
     def _run_surrender_sequence(self) -> None:
         self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 2 秒，最后按 A。")
-        self.controller.run_steps([RemoteStep(bits=(1 << BIT_PLUS), hold_ms=50, gap_ms=100)])
+        self.controller.send_smart_sequence_csv_blocking("PLUS,1", timeout_seconds=2.0)
         time.sleep(2.0)
         self.controller.run_steps([RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=120, gap_ms=0)])
         time.sleep(2.0)

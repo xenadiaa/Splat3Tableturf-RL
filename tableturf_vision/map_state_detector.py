@@ -5,6 +5,7 @@ import glob
 import json
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from functools import lru_cache
@@ -62,6 +63,18 @@ TOKEN_MAP = {
 }
 
 CellPos = Tuple[int, int]
+
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen_local_direct(req_or_url: Any, timeout: float):
+    url = req_or_url.full_url if isinstance(req_or_url, urllib.request.Request) else str(req_or_url)
+    parsed = urllib.parse.urlparse(str(url))
+    host = str(parsed.hostname or "").strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return _NO_PROXY_OPENER.open(req_or_url, timeout=timeout)
+    return urllib.request.urlopen(req_or_url, timeout=timeout)
 
 
 def _resolve_image(image: str, input_dir: str) -> Path:
@@ -684,13 +697,13 @@ def _frame_json_url_from_frame_url(frame_url: str) -> str:
 
 def _fetch_json(url: str, timeout_seconds: float) -> Dict[str, Any]:
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=max(0.3, float(timeout_seconds))) as resp:
+    with _urlopen_local_direct(req, timeout=max(0.3, float(timeout_seconds))) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _fetch_frame(url: str, timeout_seconds: float) -> np.ndarray:
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=max(0.3, float(timeout_seconds))) as resp:
+    with _urlopen_local_direct(req, timeout=max(0.3, float(timeout_seconds))) as resp:
         payload = resp.read()
     buf = np.frombuffer(payload, dtype=np.uint8)
     frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)

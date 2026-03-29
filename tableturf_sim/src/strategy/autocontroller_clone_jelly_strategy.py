@@ -15,11 +15,12 @@ decision priorities.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from src.assets.tableturf_types import Map_PointBit
+from src.assets.tableturf_types import Map_PointBit, Map_PointMask
 from src.engine.env_core import _card_cells_on_map, _find_card_in_hand
-from src.utils.common_utils import create_card_from_id
+from src.utils.common_utils import create_card_from_id, validate_place_card_action
 
 STRATEGY_LABEL = "AutoController Clone Jelly"
 
@@ -73,6 +74,14 @@ def _finisher_card_numbers(state, player: str) -> List[int]:
     return nums
 
 
+def _finisher_card(state, player: str):
+    for cid in state.players[player].deck_ids:
+        card = create_card_from_id(cid)
+        if int(card.CardPoint) == 12:
+            return card
+    return None
+
+
 def _project_score_swing(state, player: str, payload: Dict[str, object]) -> float:
     own_bit, opp_bit = _owner_bits(player)
     swing = 0.0
@@ -85,6 +94,12 @@ def _project_score_swing(state, player: str, payload: Dict[str, object]) -> floa
         elif not had_own and not had_opp:
             swing += 1.0
     return swing
+
+
+def _normal_owner_mask(player: str, cell_type: int) -> int:
+    if player == "P1":
+        return int(Map_PointMask.P1Special if int(cell_type) == 2 else Map_PointMask.P1Normal)
+    return int(Map_PointMask.P2Special if int(cell_type) == 2 else Map_PointMask.P2Normal)
 
 
 def _placed_occupancy(state, player: str, payload: Dict[str, object]) -> Tuple[set[Tuple[int, int]], set[Tuple[int, int]]]:
@@ -204,6 +219,128 @@ def _best_by_score(actions: List[dict], scorer) -> Dict[str, object]:
     return best
 
 
+def _action_key(payload: Dict[str, object]) -> Tuple[object, ...]:
+    return (
+        payload.get("card_number"),
+        bool(payload.get("pass_turn", False)),
+        bool(payload.get("use_sp_attack", False)),
+        int(payload.get("rotation", 0)),
+        payload.get("x"),
+        payload.get("y"),
+    )
+
+
+def _count_turf(game_map, player: str) -> int:
+    own_bit, _opp_bit = _owner_bits(player)
+    total = 0
+    for y in range(game_map.height):
+        for x in range(game_map.width):
+            m = int(game_map.get_point(x, y))
+            if (m & own_bit) != 0:
+                total += 1
+    return total
+
+
+def _cover_enemy_turf_score(before_map, after_map, player: str) -> int:
+    own_before = _count_turf(before_map, player)
+    own_after = _count_turf(after_map, player)
+    opp_player = "P2" if player == "P1" else "P1"
+    opp_before = _count_turf(before_map, opp_player)
+    opp_after = _count_turf(after_map, opp_player)
+    return 100 + (opp_before - opp_after) + (own_after - own_before)
+
+
+def _apply_normal_action_to_map(state, player: str, payload: Dict[str, object]):
+    game_map = deepcopy(state.map)
+    for x, y, cell_type in _payload_cells(state, player, payload):
+        game_map.set_point(x, y, _normal_owner_mask(player, cell_type))
+    return game_map
+
+
+def _apply_action_to_map(state, player: str, payload: Dict[str, object]):
+    game_map = deepcopy(state.map)
+    for x, y, cell_type in _payload_cells(state, player, payload):
+        game_map.set_point(x, y, _normal_owner_mask(player, cell_type))
+    return game_map
+
+
+def _finisher_enemy_cover_count(game_map, finisher_card, player: str, x: int, y: int, rotation: int) -> int:
+    _own_bit, opp_bit = _owner_bits(player)
+    cells = _card_cells_on_map(finisher_card, x, y, rotation)
+    covered = 0
+    for cx, cy, _cell_type in cells:
+        m = int(game_map.get_point(cx, cy))
+        if (m & opp_bit) != 0:
+            covered += 1
+    return covered
+
+
+def _max_finisher_special_score(game_map, finisher_card, player: str) -> Optional[int]:
+    best: Optional[int] = None
+    is_p1 = player == "P1"
+    for rotation in (0, 1, 2, 3):
+        for y in range(game_map.height):
+            for x in range(game_map.width):
+                ok, _reason, cells = validate_place_card_action(
+                    card=finisher_card,
+                    game_map=game_map,
+                    anchor_x=x,
+                    anchor_y=y,
+                    rotation=rotation,
+                    is_p1=is_p1,
+                    use_sp_attack=True,
+                )
+                if not ok:
+                    continue
+                finisher_map = deepcopy(game_map)
+                for cx, cy, cell_type in cells:
+                    finisher_map.set_point(cx, cy, _normal_owner_mask(player, cell_type))
+                score = _cover_enemy_turf_score(game_map, finisher_map, player)
+                if score <= int(finisher_card.CardPoint):
+                    continue
+                if best is None or score > best:
+                    best = score
+    return best
+
+
+def _max_finisher_enemy_cover(game_map, finisher_card, player: str) -> int:
+    best = 0
+    is_p1 = player == "P1"
+    for rotation in (0, 1, 2, 3):
+        for y in range(game_map.height):
+            for x in range(game_map.width):
+                ok, _reason, _cells = validate_place_card_action(
+                    card=finisher_card,
+                    game_map=game_map,
+                    anchor_x=x,
+                    anchor_y=y,
+                    rotation=rotation,
+                    is_p1=is_p1,
+                    use_sp_attack=True,
+                )
+                if not ok:
+                    continue
+                covered = _finisher_enemy_cover_count(game_map, finisher_card, player, x, y, rotation)
+                if covered > best:
+                    best = covered
+    return best
+
+
+def _future_finisher_priority(
+    payload: Dict[str, object],
+    current_finisher_score: Optional[int],
+    future_finisher_scores: Dict[Tuple[object, ...], Optional[int]],
+) -> int:
+    if current_finisher_score is None:
+        return 0
+    predicted = future_finisher_scores.get(_action_key(payload))
+    if predicted is None:
+        return 0
+    if predicted > current_finisher_score:
+        return 1000 + int(predicted)
+    return 0
+
+
 def choose_action(state, player: str, legal_actions: List[dict], context: Dict[str, object]) -> Dict[str, object]:
     if not legal_actions:
         raise RuntimeError("legal_actions is empty")
@@ -211,6 +348,7 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
     ps = state.players[player]
     turns_left = max(1, int(state.max_turns) - int(state.turn) + 1)
     finishers = set(_finisher_card_numbers(state, player))
+    finisher_card = _finisher_card(state, player)
     finisher_in_hand = {c.Number for c in ps.hand if c.Number in finishers}
 
     non_pass = [a for a in legal_actions if not bool(a.get("pass_turn", False))]
@@ -255,14 +393,44 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
     if small_normal:
         normal = small_normal
 
+    current_finisher_score: Optional[int] = None
+    future_finisher_scores: Dict[Tuple[object, ...], Optional[int]] = {}
+    current_finisher_enemy_cover = 0
+    if finisher_card is not None and ps.sp >= 3 and state.turn < state.max_turns:
+        current_finisher_score = _max_finisher_special_score(state.map, finisher_card, player)
+        current_finisher_enemy_cover = _max_finisher_enemy_cover(state.map, finisher_card, player)
+        for action in normal:
+            preview_map = _apply_normal_action_to_map(state, player, action)
+            future_finisher_scores[_action_key(action)] = _max_finisher_special_score(preview_map, finisher_card, player)
+
+        if current_finisher_score is not None:
+            preserved_normal: List[dict] = []
+            for action in normal:
+                predicted = future_finisher_scores.get(_action_key(action))
+                if predicted is None or predicted >= current_finisher_score:
+                    preserved_normal.append(action)
+            if preserved_normal:
+                normal = preserved_normal
+
     # Spend excess SP on small cards if we are already above the finisher threshold.
     if ps.sp > 3:
         extra_sp = [
             a for a in sp_actions
             if _card_sp_cost(state, player, a) <= ps.sp
+            and (ps.sp - _card_sp_cost(state, player, a)) >= 3
             and _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
         ]
-        profitable_sp = [a for a in extra_sp if _project_score_swing(state, player, a) > _card_point(state, player, a)]
+        protected_sp: List[dict] = []
+        for action in extra_sp:
+            if finisher_card is None:
+                protected_sp.append(action)
+                continue
+            preview_map = _apply_action_to_map(state, player, action)
+            future_enemy_cover = _max_finisher_enemy_cover(preview_map, finisher_card, player)
+            if current_finisher_enemy_cover >= 12 and future_enemy_cover < 12:
+                continue
+            protected_sp.append(action)
+        profitable_sp = [a for a in protected_sp if _project_score_swing(state, player, a) > _card_point(state, player, a)]
         if profitable_sp:
             return _best_by_score(
                 profitable_sp,
@@ -278,6 +446,7 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
         return _best_by_score(
             normal,
             lambda a: (
+                _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
                 _expand_turf_score(state, player, a),
                 _card_point(state, player, a),
                 _least_moves_score(state, player, a),
@@ -289,6 +458,7 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
         return _best_by_score(
             normal,
             lambda a: (
+                _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
                 _build_special_delta(state, player, a),
                 _build_special_score(state, player, a),
                 _expand_turf_score(state, player, a),
@@ -301,6 +471,7 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
         return _best_by_score(
             normal,
             lambda a: (
+                _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
                 _expand_turf_score(state, player, a),
                 _least_moves_score(state, player, a),
                 _build_special_delta(state, player, a),
