@@ -65,6 +65,11 @@ def _load_config(path: Path) -> Dict[str, object]:
     return out
 
 
+def _save_config(path: Path, cfg: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _pick_video_device(prefer_usb_only: bool) -> str:
     devices = list_avfoundation_video_devices()
     if prefer_usb_only:
@@ -128,6 +133,30 @@ def _resolve_video_index(device_name: str) -> Optional[int]:
     return None
 
 
+def _candidate_video_indices(device_name: str) -> List[int]:
+    rows = list_avfoundation_video_device_rows()
+    name = str(device_name or "").strip()
+    candidates: List[int] = []
+
+    if name.isdigit():
+        candidates.append(int(name))
+    else:
+        for ordinal, row in enumerate(rows):
+            if row["name"] != name:
+                continue
+            avfoundation_index = int(row["index"])
+            candidates.append(avfoundation_index)
+            if ordinal != avfoundation_index:
+                candidates.append(ordinal)
+            break
+
+    max_scan = max(2, len(rows))
+    for idx in range(max_scan):
+        if idx not in candidates:
+            candidates.append(idx)
+    return candidates
+
+
 def _open_video_capture(
     device_name: str,
     profiles: List[Dict[str, object]],
@@ -135,39 +164,58 @@ def _open_video_capture(
     timeout_seconds: float,
 ) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str]:
     last_error = ""
-    device_index = _resolve_video_index(device_name)
-    if device_index is None:
+    candidate_indices = _candidate_video_indices(device_name)
+    if not candidate_indices:
         return None, None, None, f"DEVICE_INDEX_NOT_FOUND:{device_name}"
 
-    for profile in profiles:
-        width = int(profile["width"])
-        height = int(profile["height"])
-        cap = cv2.VideoCapture(device_index, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened():
-            last_error = f"OPENCV_OPEN_FAILED:{device_index}"
+    for device_index in candidate_indices:
+        for profile in profiles:
+            width = int(profile["width"])
+            height = int(profile["height"])
+            cap = cv2.VideoCapture(device_index, cv2.CAP_AVFOUNDATION)
+            if not cap.isOpened():
+                last_error = f"OPENCV_OPEN_FAILED:{device_index}"
+                cap.release()
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+
+            deadline = time.monotonic() + max(0.5, timeout_seconds)
+            frame: Optional[np.ndarray] = None
+            while time.monotonic() < deadline:
+                ok, grabbed = cap.read()
+                if ok and grabbed is not None and grabbed.size > 0:
+                    frame = grabbed
+                    break
+                time.sleep(0.03)
+
+            if frame is not None:
+                if device_index != candidate_indices[0]:
+                    print(f"[open] using fallback OpenCV index {device_index} for {device_name}")
+                return cap, profile, frame, ""
+
+            last_error = f"{profile['label']}: FRAME_TIMEOUT({timeout_seconds}s) @ index {device_index}"
             cap.release()
-            continue
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-
-        deadline = time.monotonic() + max(0.5, timeout_seconds)
-        frame: Optional[np.ndarray] = None
-        while time.monotonic() < deadline:
-            ok, grabbed = cap.read()
-            if ok and grabbed is not None and grabbed.size > 0:
-                frame = grabbed
-                break
-            time.sleep(0.03)
-
-        if frame is not None:
-            return cap, profile, frame, ""
-
-        last_error = f"{profile['label']}: FRAME_TIMEOUT({timeout_seconds}s)"
-        cap.release()
 
     return None, None, None, last_error
+
+
+def _reopen_video_capture(
+    current_cap: cv2.VideoCapture,
+    device_name: str,
+    profiles: List[Dict[str, object]],
+    fps: int,
+    timeout_seconds: float,
+) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str]:
+    current_cap.release()
+    return _open_video_capture(
+        device_name=device_name,
+        profiles=profiles,
+        fps=fps,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 @dataclass
@@ -413,7 +461,7 @@ def _overlay_status(
         f"Capture: {profile_label}",
         f"API: {api_url}/frame.jpg",
         f"Saved: {saved_count}",
-        "Keys: Enter save PNG, Shift+Enter/B burst 30 PNG, Esc/close window/Ctrl+C quit",
+        "Keys: Enter save PNG, B burst 30 PNG, R reselect source, Esc/close window/Ctrl+C quit",
     ]
     for idx, text in enumerate(lines):
         y = 30 + idx * 28
@@ -538,9 +586,7 @@ def main() -> int:
             key = key_ex & 0xFF
             if key == 27:
                 break
-            shift_enter = (key_ex not in (10, 13)) and ((key_ex & 0xFF) in (10, 13))
-            burst_key = key in (ord("b"), ord("B")) or shift_enter
-            if burst_key:
+            if key in (ord("b"), ord("B")):
                 start_idx = saved_count + 1
                 saved_count += 30
                 worker = threading.Thread(
@@ -551,6 +597,53 @@ def main() -> int:
                 )
                 worker.start()
                 print("[burst] saving next 30 frames")
+                continue
+            if key in (ord("r"), ord("R")):
+                cfg["device_name"] = "invalid"
+                cfg["pick_device"] = False
+                _save_config(cfg_path, cfg)
+                print(f"[reselect] config marked invalid: {cfg_path}")
+                picked_device = _pick_video_device(prefer_usb_only=not args.allow_non_usb)
+                if not picked_device:
+                    print("[reselect] cancelled")
+                    continue
+
+                next_cap, next_profile, next_frame, reopen_error = _reopen_video_capture(
+                    current_cap=cap,
+                    device_name=picked_device,
+                    profiles=profiles,
+                    fps=args.fps,
+                    timeout_seconds=args.probe_seconds,
+                )
+                if next_cap is None or next_profile is None or next_frame is None:
+                    print(f"[reselect] failed: {reopen_error}")
+                    cap, active_profile, first_frame, error = _open_video_capture(
+                        device_name=device_name,
+                        profiles=profiles,
+                        fps=args.fps,
+                        timeout_seconds=args.probe_seconds,
+                    )
+                    if cap is None or active_profile is None or first_frame is None:
+                        print(f"Unable to reopen previous stream. last_error={error}")
+                        break
+                    state.device_name = device_name
+                    state.profile_label = str(active_profile["label"])
+                    state.update_frame(first_frame)
+                    last_frame_ts = time.monotonic()
+                    continue
+
+                cap = next_cap
+                active_profile = next_profile
+                device_name = picked_device
+                state.device_name = device_name
+                state.profile_label = str(active_profile["label"])
+                state.update_frame(next_frame)
+                last_frame_ts = time.monotonic()
+                cfg["device_name"] = device_name
+                cfg["pick_device"] = False
+                _save_config(cfg_path, cfg)
+                print(f"[reselect] switched to {device_name}")
+                print(f"[reselect] config updated: {cfg_path}")
                 continue
             if key in (10, 13):
                 saved_count += 1

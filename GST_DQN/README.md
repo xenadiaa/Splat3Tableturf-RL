@@ -18,7 +18,7 @@
 
 ## 训练示例
 
-在仓库根目录 `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL` 下运行：
+在仓库根目录 `Splat3Tableturf-RL` 下运行：
 
 ```bash
 python -m GST_DQN.train --map-id Square --p1-deck "player:正方广场" --p2-deck MiniGame_Aori --bot-style aggressive --bot-level high

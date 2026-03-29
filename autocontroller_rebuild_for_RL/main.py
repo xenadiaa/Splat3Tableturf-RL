@@ -21,6 +21,7 @@ from autocontroller_rebuild_for_RL.runtime import (
 )
 from switch_connect.ui.terminal_select import choose_with_arrows
 from switch_connect.virtual_gamepad.device_discovery import list_serial_port_labels, parse_device_from_label
+from switch_connect.virtual_gamepad.serial_controller import SerialRemoteController
 from vision_capture.adapter import is_usb_capture_device_name, list_avfoundation_video_devices
 
 
@@ -109,20 +110,73 @@ def _prompt_choice(options: List[str], title: str) -> str:
     return str(options[0]).strip()
 
 
-def _ensure_switch_link_ready(config) -> None:
+def _persist_runtime_serial_selection(config_path: Path, serial_port: str) -> None:
+    payload = _load_json_obj(config_path)
+    payload["serial_port"] = str(serial_port or "").strip()
+    payload["pick_serial"] = False
+    _write_json_obj(config_path, payload)
+
+
+def _serial_port_supports_switch_link(serial_port: str) -> bool:
+    port = str(serial_port or "").strip()
+    if not port:
+        return False
+    try:
+        ctl = SerialRemoteController(port=port, timeout=0.1)
+    except Exception:
+        return False
+    try:
+        return bool(ctl.probe_firmware(timeout_seconds=1.2))
+    finally:
+        with contextlib.suppress(Exception):
+            ctl.close()
+
+
+def _switch_link_probe_priority(label: str, configured_port: str = "") -> tuple[int, str]:
+    text = str(label or "").lower()
+    port = parse_device_from_label(label)
+    if configured_port and port == configured_port:
+        return (0, text)
+    if "cp210" in text or "usbserial" in text:
+        return (1, text)
+    if "wch" in text or "ch340" in text:
+        return (2, text)
+    if "/dev/cu." in text:
+        return (3, text)
+    return (4, text)
+
+
+def _usable_switch_link_labels(labels: List[str], configured_port: str = "") -> List[str]:
+    usable: List[str] = []
+    for label in sorted(labels, key=lambda item: _switch_link_probe_priority(item, configured_port)):
+        port = parse_device_from_label(label)
+        if _serial_port_supports_switch_link(port):
+            usable.append(label)
+    return usable
+
+
+def _ensure_switch_link_ready(config, config_path: str | Path = "") -> None:
     labels = list_serial_port_labels()
     configured = str(config.serial_port or "").strip()
     if configured and any(parse_device_from_label(label) == configured for label in labels):
-        config.serial_port = configured
-        config.pick_serial = False
-        return
-    if not labels:
-        raise RuntimeError("未检测到可用的 switch_link 串口，请先连接 CP2104 后再启动。")
-    picked = _prompt_choice(labels, "选择可用的 switch_link 串口")
+        if _serial_port_supports_switch_link(configured):
+            config.serial_port = configured
+            config.pick_serial = False
+            return
+    remaining_labels = [label for label in labels if parse_device_from_label(label) != configured]
+    usable_labels = _usable_switch_link_labels(remaining_labels, configured)
+    if not usable_labels:
+        raise RuntimeError("未检测到可用的 switch_link 串口，请先连接正确的 CP2104/虚拟手柄串口后再启动。")
+    picked = _prompt_choice(usable_labels, "选择可用的 switch_link 串口")
     if not picked:
         raise RuntimeError("未选择 switch_link 串口，启动已取消。")
     config.serial_port = parse_device_from_label(picked)
     config.pick_serial = False
+    if config_path:
+        resolved = Path(config_path)
+        if not resolved.is_absolute():
+            resolved = REPO_ROOT / resolved
+        _persist_runtime_serial_selection(resolved, str(config.serial_port or "").strip())
 
 
 def _usb_capture_device_names() -> List[str]:
@@ -198,7 +252,7 @@ def main() -> int:
         print(json.dumps(asdict(config), ensure_ascii=False, indent=2))
         return 0
 
-    _ensure_switch_link_ready(config)
+    _ensure_switch_link_ready(config, args.config)
     _ensure_vision_ready(config)
 
     override_target_wins = _prompt_target_wins_if_needed(args)

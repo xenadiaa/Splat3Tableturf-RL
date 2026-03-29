@@ -1,11 +1,11 @@
 {
-  "image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/间隔墙.jpg",
+  "image": "../vision_capture/debug/间隔墙.jpg",
   "map_match": {
     "enum_index": 13,
     "map_id": "Painted",
     "map_name_zh": "间隔墙",
     "score": 1.0,
-    "template_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/间隔墙.jpg",
+    "template_image": "../vision_capture/debug/间隔墙.jpg",
     "match_mode": "named_template_jpg_exact_mask",
     "expected_cards": [
       {

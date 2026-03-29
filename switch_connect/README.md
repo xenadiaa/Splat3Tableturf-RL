@@ -9,9 +9,9 @@ Pipeline:
 `ObservedState -> policy(engine/nn) -> action -> virtual_gamepad -> serial`
 
 Repository split by responsibility:
-- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture`: capture-card device access and screenshots
-- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision`: Tableturf-specific image parsing and judge tools
-- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/switch_connect`: strategy and controller output only
+- `vision_capture`: capture-card device access and screenshots
+- `tableturf_vision`: Tableturf-specific image parsing and judge tools
+- `switch_connect`: strategy and controller output only
 
 ## Layout
 
@@ -33,7 +33,7 @@ Repository split by responsibility:
 ## Quick Start
 
 ```bash
-cd /Users/xenadia/Documents/GitHub/Splat3Tableturf-RL
+cd ..
 python3 switch_connect/bridge_runner.py \
   --state-json switch_connect/examples/state_example.json \
   --print-steps
@@ -41,8 +41,8 @@ python3 switch_connect/bridge_runner.py \
 
 Capture and vision tools have been moved out of this package.
 Use:
-- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture`
-- `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision`
+- `vision_capture`
+- `tableturf_vision`
 
 Use NN policy (python module callable):
 

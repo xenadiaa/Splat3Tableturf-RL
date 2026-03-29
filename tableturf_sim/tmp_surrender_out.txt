@@ -142,4 +142,4 @@ SP可用卡: 无
 [L] 查看牌组状态
 提示: 投降已确认: GAME_OVER_SURRENDER winner=P2
 winner=P2
-log_path=/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_sim/data/logs/Tableturf_20260309T183644Z_Square_Alice_BotAggHigh_6104a33d.jsonl
+log_path=data/logs/Tableturf_20260309T183644Z_Square_Alice_BotAggHigh_6104a33d.jsonl

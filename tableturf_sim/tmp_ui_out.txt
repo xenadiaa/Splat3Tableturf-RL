@@ -1950,4 +1950,4 @@ eeebb.b..ebb...
 [L] 查看牌组状态
 提示: 跳过已确认: TURN_RESOLVED {'turn': 13, 'p1_sp_gain': 0, 'p2_sp_gain': 0, 'p1_sp': 12, 'p2_sp': 0, 'p1_score': 1, 'p2_score': 110, 'done': True, 'winner': 'P2'}
 winner=P2
-log_path=/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_sim/data/logs/Tableturf_20260309T182518Z_Square_Alice_BotAggHigh_32836260.jsonl
+log_path=data/logs/Tableturf_20260309T182518Z_Square_Alice_BotAggHigh_32836260.jsonl

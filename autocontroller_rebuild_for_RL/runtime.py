@@ -48,7 +48,12 @@ from tableturf_vision.settlement_map_state_detector import (
 )
 from tableturf_vision.sp_detector import get_enemy_sp_count_frame, get_sp_count_frame
 from tableturf_vision.tableturf_mapper import _load_layout
-from vision_capture.adapter import FFmpegCaptureSource, auto_detect_capture_device_name
+from vision_capture.adapter import (
+    FFmpegCaptureSource,
+    auto_detect_capture_device_name,
+    is_usb_capture_device_name,
+    list_avfoundation_video_devices,
+)
 from vision_capture.state_types import ObservedState
 from src.engine.env_core import GameState, PlayerState, legal_actions
 from src.engine.loaders import MAP_PADDING, load_map
@@ -80,7 +85,7 @@ SETTLEMENT_MULTI_FRAME_COUNT = 30
 SETTLEMENT_MULTI_FRAME_POLL_INTERVAL_SECONDS = 0.08
 SETTLEMENT_MULTI_FRAME_TIMEOUT_MARGIN_SECONDS = 2.0
 CAPTURE_RECOVERY_RETRY_SECONDS = 5.0
-CAPTURE_RECOVERY_MAX_RETRIES = 6
+CAPTURE_RECOVERY_MAX_RETRIES = 12
 CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS = 60.0
 
 
@@ -110,6 +115,34 @@ def _load_callable(ref: str) -> Callable[..., Any]:
     if func is None or not callable(func):
         raise ValueError(f"callable not found: {ref}")
     return func
+
+
+def _load_json_obj(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_json_obj(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _usb_capture_device_names() -> List[str]:
+    names = [str(name).strip() for name in list_avfoundation_video_devices()]
+    names = [name for name in names if name and is_usb_capture_device_name(name)]
+    seen: Set[str] = set()
+    out: List[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 def _board_label_to_mask(label: str) -> int:
@@ -570,6 +603,12 @@ class BattleReplayWriter:
             if prev.get("p2_sp_after") is None:
                 prev["p2_sp_after"] = int(state.p2_sp)
 
+    def discard_last_move(self) -> None:
+        with self._lock:
+            if not self._active or not self._moves:
+                return
+            self._moves.pop()
+
     def finalize(
         self,
         *,
@@ -621,6 +660,9 @@ class NoOpBattleReplayWriter:
 
     def complete_previous_move_after_state(self, state: ParsedTurnState) -> None:
         del state
+
+    def discard_last_move(self) -> None:
+        return
 
     def finalize(
         self,
@@ -896,6 +938,28 @@ class FrameApiAutoLauncher:
             return base[:-11] + "/health"
         return base.rstrip("/") + "/health"
 
+    def _ensure_launch_target_selected(self) -> None:
+        launch_config_path = self._launch_config_path()
+        launch_cfg = _load_json_obj(launch_config_path)
+        configured_name = str(launch_cfg.get("device_name", "") or self._config.capture_device_name or "").strip()
+        available_usb = _usb_capture_device_names()
+        if configured_name and configured_name in available_usb and is_usb_capture_device_name(configured_name):
+            return
+        if not available_usb:
+            raise RuntimeError("NO_USB_CAPTURE_DEVICE_AVAILABLE")
+        picked = ""
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            picked = str(choose_with_arrows(available_usb, "选择可用的采集卡设备") or "").strip()
+        else:
+            picked = str(available_usb[0]).strip()
+        if not picked:
+            raise RuntimeError("CAPTURE_DEVICE_SELECTION_CANCELLED")
+        launch_cfg["device_name"] = picked
+        launch_cfg["pick_device"] = False
+        launch_cfg["allow_non_usb"] = False
+        _write_json_obj(launch_config_path, launch_cfg)
+        self._config.capture_device_name = picked
+
     def is_ready(self, timeout_seconds: float = 1.0) -> bool:
         health_url = self._health_url()
         if health_url:
@@ -926,6 +990,7 @@ class FrameApiAutoLauncher:
             return
         if not self._config.frame_api_auto_start:
             raise RuntimeError("FRAME_API_NOT_READY_AND_AUTO_START_DISABLED")
+        self._ensure_launch_target_selected()
 
         if self._proc is not None and self._proc.poll() is None:
             self.stop()
@@ -2085,10 +2150,14 @@ class TerminalDebugUI:
         self._interactive = False
         self._first_frame = True
         self._last_render_line_count = 0
+        self._started = False
 
     def start(self) -> None:
+        if self._started:
+            return
         if not self._runtime.config.debug_ui_enabled:
             return
+        self._started = True
         self._stop.clear()
         self._first_frame = True
         self._last_render_line_count = 0
@@ -2104,21 +2173,29 @@ class TerminalDebugUI:
         self._thread.start()
 
     def stop(self) -> None:
+        if not self._started:
+            return
+        self._started = False
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.5)
+        self._thread = None
+        was_interactive = self._interactive
         if self._interactive and self._stdin_fd is not None and self._stdin_old_attrs is not None:
             import termios
 
             with contextlib.suppress(Exception):
                 termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_old_attrs)
-        if self._interactive:
+        if was_interactive:
             with contextlib.suppress(Exception):
                 if self._last_render_line_count > 0:
                     sys.stdout.write(f"\r\033[{self._last_render_line_count}F\033[J")
                 else:
                     sys.stdout.write("\r\033[2J\033[H")
                 sys.stdout.flush()
+        self._stdin_fd = None
+        self._stdin_old_attrs = None
+        self._interactive = False
 
     def _poll_key(self) -> None:
         if not self._interactive or self._stdin_fd is None:
@@ -2256,6 +2333,7 @@ class AutoControllerRuntime:
             config,
             on_capture_recovery_pause=self._suspend_timeout_accumulation,
             on_capture_recovery_event=self._push_event,
+            on_capture_interactive_prompt=self._set_capture_interactive_prompt,
         )
         log_path = _resolve_debug_log_path(config.log_file)
         self._logger = RuntimeLogWriter(log_path)
@@ -2336,6 +2414,12 @@ class AutoControllerRuntime:
         with self._status_lock:
             self._status.update(kwargs)
             self._status["updated_at"] = self._timestamp()
+
+    def _set_capture_interactive_prompt(self, active: bool) -> None:
+        if bool(active):
+            self._debug_ui.stop()
+        else:
+            self._debug_ui.start()
 
     def _push_event(self, message: str) -> None:
         with self._status_lock:
@@ -2512,7 +2596,7 @@ class AutoControllerRuntime:
         self._reset_playable_state_timers()
         raise RuntimeError("WAIT_PLAYABLE_TIMEOUT_SURRENDER")
 
-    def _wait_for_next_turn_playable(self) -> None:
+    def _wait_for_next_turn_playable(self) -> bool:
         self._push_event("进入下一回合确认阶段：固定等待 3 秒，不进行 playable 检测。")
         start_ts = time.monotonic()
         self._sleep_with_pause(3.0)
@@ -2539,11 +2623,13 @@ class AutoControllerRuntime:
                     self._push_event("已重新检测到 playable，确认进入下一回合。")
                     self._mark_progress("重新检测到可出牌状态，确认本回合已成功推进。")
                     self._reset_playable_state_timers()
-                    return
+                    return True
                 if not warned_continuous_playable:
-                    self._push_event("出牌后持续检测到 playable，尚未观察到中间的不可出牌阶段，疑似未成功放置，本回合不推进。")
-                    self._logger.write("出牌后 playable 持续为 true，未先变为 false；判定为疑似未成功放置，继续等待状态变化，不增加回合数。")
+                    self._push_event("出牌后持续检测到 playable，尚未观察到中间的不可出牌阶段，判定本回合未成功提交，准备重新执行本回合。")
+                    self._logger.write("出牌后 playable 持续为 true，未先变为 false；判定为本回合未成功提交，将返回重新识别并重试本回合。")
                     warned_continuous_playable = True
+                    self._reset_playable_state_timers()
+                    return False
             else:
                 if not seen_non_playable:
                     self._push_event("出牌后已观察到 playable=false，开始等待下一回合重新出现 playable。")
@@ -2979,7 +3065,14 @@ class AutoControllerRuntime:
                     raise RuntimeError("BATTLE_ACTION_SEQUENCE_ABORTED")
                 self.vision.remember_executed_specials(action)
                 if self.turn_index < self.config.max_turns:
-                    self._wait_for_next_turn_playable()
+                    committed = self._wait_for_next_turn_playable()
+                    if not committed:
+                        self._battle_replay.discard_last_move()
+                        self._set_status(phase="retrying_turn", last_error="ACTION_NOT_COMMITTED_RETRY_TURN")
+                        self._push_event(f"第 {self.turn_index} 回合未成功提交，准备重新识别并重试本回合。")
+                        self._logger.write(f"第 {self.turn_index} 回合动作未成功提交，本回合不推进，重新识别当前局面后重试。")
+                        time.sleep(max(0.1, self.config.playable_poll_seconds))
+                        continue
                 self.turn_index += 1
                 self._mark_progress(f"已完成一次动作执行，进入回合索引 {self.turn_index}。")
                 self._set_status(phase="turn_complete", turn=min(self.turn_index, self.config.max_turns))
@@ -3045,10 +3138,12 @@ class _FrameVisionPipeline:
         config: ControllerConfig,
         on_capture_recovery_pause: Optional[Callable[[float, str], None]] = None,
         on_capture_recovery_event: Optional[Callable[[str], None]] = None,
+        on_capture_interactive_prompt: Optional[Callable[[bool], None]] = None,
     ):
         self._config = config
         self._on_capture_recovery_pause = on_capture_recovery_pause
         self._on_capture_recovery_event = on_capture_recovery_event
+        self._on_capture_interactive_prompt = on_capture_interactive_prompt
         layout_path = Path(config.layout_json)
         if not layout_path.is_absolute():
             layout_path = REPO_ROOT / layout_path
@@ -3133,7 +3228,7 @@ class _FrameVisionPipeline:
                 failed_rounds += 1
 
             elapsed = time.monotonic() - recovery_started_at
-            if elapsed >= float(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS):
+            if elapsed >= float(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS) or failed_rounds >= int(CAPTURE_RECOVERY_MAX_RETRIES):
                 break
 
             if self._on_capture_recovery_event is not None:
@@ -3142,18 +3237,22 @@ class _FrameVisionPipeline:
                     f"(本轮累计失败 {failed_rounds} 次，总恢复 {elapsed:.1f}s)：{last_error}"
                 )
 
-            if failed_rounds % int(CAPTURE_RECOVERY_MAX_RETRIES) == 0:
-                try:
-                    self._frame_api_launcher.restart()
-                    restart_count += 1
-                    if self._on_capture_recovery_event is not None:
-                        self._on_capture_recovery_event(
-                            f"{description} 连续失败 {failed_rounds} 轮，已尝试重启 preview_stream_opencv.py（第 {restart_count} 次）。"
-                        )
-                except Exception as exc:
-                    last_error = f"{last_error}; FRAME_API_RESTART_FAILED:{exc}"
-                    if self._on_capture_recovery_event is not None:
-                        self._on_capture_recovery_event(f"重启 preview_stream_opencv.py 失败：{exc}")
+            try:
+                if self._on_capture_interactive_prompt is not None:
+                    self._on_capture_interactive_prompt(True)
+                self._frame_api_launcher.ensure_started()
+                restart_count += 1
+                if self._on_capture_recovery_event is not None:
+                    self._on_capture_recovery_event(
+                        f"{description} 本轮已尝试恢复/拉起视频流（第 {restart_count} 次）。"
+                    )
+            except Exception as exc:
+                last_error = f"{last_error}; FRAME_API_RESTART_FAILED:{exc}"
+                if self._on_capture_recovery_event is not None:
+                    self._on_capture_recovery_event(f"恢复/拉起视频流失败：{exc}")
+            finally:
+                if self._on_capture_interactive_prompt is not None:
+                    self._on_capture_interactive_prompt(False)
 
             round_elapsed = time.monotonic() - round_started_at
             remaining = float(CAPTURE_RECOVERY_TOTAL_TIMEOUT_SECONDS) - (time.monotonic() - recovery_started_at)

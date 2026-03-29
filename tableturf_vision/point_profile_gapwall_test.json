@@ -1,13 +1,13 @@
 {
   "version": 1,
   "mode": "point_exact_rgb",
-  "source_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/间隔墙.png",
+  "source_image": "../vision_capture/debug/间隔墙.png",
   "map_match": {
     "enum_index": 13,
     "map_id": "Painted",
     "map_name_zh": "间隔墙",
     "score": 1.0,
-    "template_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision/参照基础/间隔墙.png",
+    "template_image": "参照基础/间隔墙.png",
     "match_mode": "reference_png_mask_exact_ratio",
     "expected_cards": [
       {

@@ -83,21 +83,51 @@ def list_avfoundation_video_device_rows() -> List[Dict[str, str]]:
 
 def is_usb_capture_device_name(name: str) -> bool:
     n = (name or "").lower()
-    keywords = ("ugreen", "capture", "uvc", "hdmi")
-    return any(k in n for k in keywords)
+    excluded_keywords = (
+        "capture screen",
+        "screen capture",
+        "screen ",
+        "display",
+        "continuity",
+        "iphone",
+        "ipad",
+        "obs virtual",
+        "virtual camera",
+        "camera extension",
+    )
+    if any(k in n for k in excluded_keywords):
+        return False
+
+    strong_keywords = (
+        "ugreen",
+        "uvc",
+        "hdmi",
+        "cam link",
+        "elgato",
+        "usb video",
+        "video capture",
+        "capture card",
+    )
+    return any(k in n for k in strong_keywords)
 
 
 def rank_capture_device_name(name: str) -> int:
     n = (name or "").lower()
+    if not is_usb_capture_device_name(name):
+        return -1000
     score = 0
     if "ugreen" in n:
         score += 100
-    if "capture" in n:
+    if "capture card" in n or "video capture" in n:
+        score += 50
+    elif "capture" in n:
         score += 40
     if "uvc" in n:
         score += 20
     if "hdmi" in n:
         score += 10
+    if "cam link" in n or "elgato" in n:
+        score += 30
     return score
 
 

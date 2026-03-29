@@ -93,7 +93,7 @@ def main() -> int:
         print(json.dumps(asdict(config), ensure_ascii=False, indent=2))
         return 0
 
-    _ensure_switch_link_ready(config)
+    _ensure_switch_link_ready(config, args.config)
     _ensure_vision_ready(config)
 
     override_target_wins = _prompt_target_wins_if_needed(args)

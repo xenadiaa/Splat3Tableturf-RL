@@ -1,7 +1,7 @@
 # Map State Detector Color Threshold Backup
 
 Date: 2026-03-18
-Source: `/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision/map_state_detector.py`
+Source: `../map_state_detector.py`
 Function: `_classify_cell(mean_bgr)`
 
 This backup records the active color-domain constraints used by map-state recognition.

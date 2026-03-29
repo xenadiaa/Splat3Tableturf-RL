@@ -1,13 +1,13 @@
 {
   "version": 1,
   "mode": "point_exact_rgb",
-  "source_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/双子岛.png",
+  "source_image": "../vision_capture/debug/双子岛.png",
   "map_match": {
     "enum_index": 2,
     "map_id": "WDiamond",
     "map_name_zh": "双子岛",
     "score": 1.0,
-    "template_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision/参照基础/双子岛.png",
+    "template_image": "参照基础/双子岛.png",
     "match_mode": "reference_png_mask_exact_ratio",
     "expected_cards": []
   },

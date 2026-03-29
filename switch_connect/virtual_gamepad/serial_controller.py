@@ -122,3 +122,14 @@ class SerialRemoteController:
             if b[0] == 0xFF:
                 return True
         return False
+
+    def probe_firmware(self, timeout_seconds: float = 1.0) -> bool:
+        try:
+            with contextlib.suppress(Exception):
+                self._ser.reset_input_buffer()
+            with contextlib.suppress(Exception):
+                self._ser.reset_output_buffer()
+            self.send_smart_sequence_payload(encode_smart_sequence_csv("NOTHING,1"))
+            return self.wait_smart_sequence_start_ack(timeout_seconds=timeout_seconds)
+        except Exception:
+            return False

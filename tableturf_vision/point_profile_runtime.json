@@ -1,13 +1,13 @@
 {
   "version": 1,
   "mode": "point_exact_rgb",
-  "source_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/capture_20260312_160358_171377_00002.png",
+  "source_image": "../vision_capture/debug/capture_20260312_160358_171377_00002.png",
   "map_match": {
     "enum_index": 13,
     "map_id": "Painted",
     "map_name_zh": "间隔墙",
     "score": 0.9857142857142858,
-    "template_image": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug/间隔墙.jpg",
+    "template_image": "../vision_capture/debug/间隔墙.jpg",
     "match_mode": "named_template_jpg_exact_mask",
     "expected_cards": []
   },

@@ -33,3 +33,5 @@
 .DS_Store
 *.swp
 /tableturf_vision/error
+/autocontroller_rebuild_for_RL/clone_jelly_state.json
+/autocontroller_rebuild_for_RL/map_battle_stats.json

@@ -2255,4 +2255,4 @@ SP可用卡: [72, 221, 61]
 [L] 查看牌组状态
 提示: 跳过已确认: TURN_RESOLVED
 winner=P2
-log_path=/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_sim/data/logs/Tableturf_20260309T183006Z_Square_Alice_BotAggHigh_5e491cf5.jsonl
+log_path=data/logs/Tableturf_20260309T183006Z_Square_Alice_BotAggHigh_5e491cf5.jsonl

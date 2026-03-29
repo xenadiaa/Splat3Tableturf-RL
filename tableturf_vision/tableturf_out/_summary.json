@@ -1,9 +1,9 @@
 {
   "ok": true,
   "images": 1,
-  "input_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/vision_capture/debug",
+  "input_dir": "../../vision_capture/debug",
   "glob": "capture_*.*",
-  "out_dir": "/Users/xenadia/Documents/GitHub/Splat3Tableturf-RL/tableturf_vision/tableturf_out",
+  "out_dir": ".",
   "layout": {
     "board_roi_norm": [
       0.485,
