@@ -863,6 +863,7 @@ class FrameApiAutoLauncher:
     def __init__(self, config: ControllerConfig):
         self._config = config
         self._proc: Optional[subprocess.Popen] = None
+        self._last_launch_output: str = ""
 
     def _launch_script_path(self) -> Path:
         return _resolve_repo_path(self._config.frame_api_launch_script)
@@ -996,16 +997,27 @@ class FrameApiAutoLauncher:
             self.stop()
         self._cleanup_stale_preview_processes()
         cmd = self._launch_cmd()
+        self._last_launch_output = ""
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(REPO_ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
         )
         deadline = time.monotonic() + max(1.0, float(self._config.frame_api_startup_seconds))
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
+                output = ""
+                with contextlib.suppress(Exception):
+                    output = str(self._proc.stdout.read() if self._proc.stdout is not None else "").strip()
+                self._last_launch_output = output
+                if output:
+                    tail = " | ".join([line.strip() for line in output.splitlines()[-6:] if line.strip()])
+                    raise RuntimeError(f"FRAME_API_PROCESS_EXITED_EARLY:{tail}")
                 raise RuntimeError("FRAME_API_PROCESS_EXITED_EARLY")
             if self.is_ready(timeout_seconds=0.8):
                 return
@@ -2151,24 +2163,41 @@ class TerminalDebugUI:
         self._first_frame = True
         self._last_render_line_count = 0
         self._started = False
+        self._tty_fd: Optional[int] = None
+        self._tty_writer = None
 
     def start(self) -> None:
         if self._started:
             return
         if not self._runtime.config.debug_ui_enabled:
             return
+        self._interactive = False
+        self._stdin_fd = None
+        self._stdin_old_attrs = None
+        self._tty_fd = None
+        self._tty_writer = None
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            self._interactive = True
+            self._stdin_fd = sys.stdin.fileno()
+            self._tty_writer = sys.stdout
+        else:
+            with contextlib.suppress(Exception):
+                tty_fd = os.open("/dev/tty", os.O_RDWR)
+                self._interactive = True
+                self._tty_fd = tty_fd
+                self._stdin_fd = tty_fd
+                self._tty_writer = os.fdopen(os.dup(tty_fd), "w", buffering=1, encoding="utf-8", errors="ignore")
+        if not self._interactive:
+            return
         self._started = True
         self._stop.clear()
         self._first_frame = True
         self._last_render_line_count = 0
-        self._interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-        if self._interactive:
-            import termios
-            import tty
+        import termios
+        import tty
 
-            self._stdin_fd = sys.stdin.fileno()
-            self._stdin_old_attrs = termios.tcgetattr(self._stdin_fd)
-            tty.setcbreak(self._stdin_fd)
+        self._stdin_old_attrs = termios.tcgetattr(self._stdin_fd)
+        tty.setcbreak(self._stdin_fd)
         self._thread = threading.Thread(target=self._run, name="terminal-debug-ui", daemon=True)
         self._thread.start()
 
@@ -2189,13 +2218,21 @@ class TerminalDebugUI:
         if was_interactive:
             with contextlib.suppress(Exception):
                 if self._last_render_line_count > 0:
-                    sys.stdout.write(f"\r\033[{self._last_render_line_count}F\033[J")
+                    self._write_output(f"\r\033[{self._last_render_line_count}F\033[J")
                 else:
-                    sys.stdout.write("\r\033[2J\033[H")
-                sys.stdout.flush()
+                    self._write_output("\r\033[2J\033[H")
+                self._flush_output()
         self._stdin_fd = None
         self._stdin_old_attrs = None
         self._interactive = False
+        if self._tty_writer is not None and self._tty_writer is not sys.stdout:
+            with contextlib.suppress(Exception):
+                self._tty_writer.close()
+        self._tty_writer = None
+        if self._tty_fd is not None:
+            with contextlib.suppress(Exception):
+                os.close(self._tty_fd)
+        self._tty_fd = None
 
     def _poll_key(self) -> None:
         if not self._interactive or self._stdin_fd is None:
@@ -2237,7 +2274,9 @@ class TerminalDebugUI:
             if key == "p":
                 self._runtime.toggle_pause()
             elif key == "r":
-                self._runtime.resume()
+                self._runtime.restart_battle_waiting()
+            elif key == "t":
+                self._runtime.surrender_and_restart_waiting()
             elif key == "q":
                 self._runtime.request_stop("user_requested_quit")
             elif key == "z":
@@ -2255,7 +2294,13 @@ class TerminalDebugUI:
 
     def _render(self) -> None:
         state = self._runtime.debug_snapshot()
-        term_size = shutil.get_terminal_size((120, 32))
+        if self._tty_fd is not None:
+            with contextlib.suppress(Exception):
+                term_size = os.get_terminal_size(self._tty_fd)
+            if "term_size" not in locals():
+                term_size = shutil.get_terminal_size((120, 32))
+        else:
+            term_size = shutil.get_terminal_size((120, 32))
         width = max(40, int(term_size.columns))
         height = max(12, int(term_size.lines))
         if self._runtime.config.continuous_run:
@@ -2272,8 +2317,7 @@ class TerminalDebugUI:
             return s[: width - 3] + "..."
 
         lines = [
-            "Tableturf AutoController Debug",
-            "keys: p=pause/resume  r=resume  q=quit  -=turn-1  ==turn+1  arrows=dpad  enter=HOME  z=A  x=B  a=Y  s=X  c=L  d=+",
+            _fit("keys: p=pause/resume  r=restart-battle  t=surrender+restart  q=quit  -=turn-1  ==turn+1  arrows=dpad  enter=HOME  z=A  x=B  a=Y  s=X  c=L  d=+"),
             "",
             _fit(f"status: {state['status']}"),
             _fit(f"phase: {state['phase']}"),
@@ -2302,16 +2346,25 @@ class TerminalDebugUI:
             lines.append(_fit(f"  {item}"))
         lines = lines[: max(1, height - 1)]
         body = "\n".join(lines)
-        if self._first_frame:
-            sys.stdout.write("\r\033[2J\033[H")
+        force_full_redraw = self._tty_fd is not None
+        if self._first_frame or force_full_redraw:
+            self._write_output("\r\033[2J\033[H")
             self._first_frame = False
         else:
-            sys.stdout.write(f"\r\033[{max(1, self._last_render_line_count)}F\033[J")
-        sys.stdout.write(body)
+            self._write_output(f"\r\033[{max(1, self._last_render_line_count)}F\033[J")
+        self._write_output(body)
         if not body.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+            self._write_output("\n")
+        self._flush_output()
         self._last_render_line_count = max(1, body.count("\n") + 1)
+
+    def _write_output(self, text: str) -> None:
+        writer = self._tty_writer or sys.stdout
+        writer.write(text)
+
+    def _flush_output(self) -> None:
+        writer = self._tty_writer or sys.stdout
+        writer.flush()
 
     def _run(self) -> None:
         last_render = 0.0
@@ -2371,6 +2424,8 @@ class AutoControllerRuntime:
         self._closed = False
         self._paused = threading.Event()
         self._stop_requested = threading.Event()
+        self._restart_battle_requested = threading.Event()
+        self._manual_surrender_requested = threading.Event()
         self._status_lock = threading.Lock()
         self._status: Dict[str, Any] = {
             "status": "initializing",
@@ -2467,6 +2522,7 @@ class AutoControllerRuntime:
         return str(getattr(self.vision, "_map_id", "") or "")
 
     def _reset_after_battle_resolution(self, reason: str) -> None:
+        self._mark_progress(f"battle_reset:{reason}")
         self._battle_started = False
         self.turn_index = 1
         self._wait_a_enabled = True
@@ -2662,7 +2718,6 @@ class AutoControllerRuntime:
                     self._non_playable_seen_since += paused_for
             self._pause_started_ts = None
             self._paused.clear()
-            self._run_resume_reactivation_sequence()
             self._wait_a_enabled = True
             self._wait_silent_logged = False
             self._force_wait_a_reactivation = True
@@ -2670,6 +2725,57 @@ class AutoControllerRuntime:
             self._push_event(
                 f"resumed_by_user，已重新进入按 A 等待与 playable 检测状态。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。"
             )
+
+    def restart_battle_waiting(self) -> None:
+        self._restart_battle_requested.set()
+        paused_for = 0.0
+        if self._paused.is_set():
+            if self._pause_started_ts is not None:
+                paused_for = max(0.0, time.monotonic() - self._pause_started_ts)
+                self._last_progress_ts += paused_for
+                if self._playable_seen_since is not None:
+                    self._playable_seen_since += paused_for
+                if self._non_playable_seen_since is not None:
+                    self._non_playable_seen_since += paused_for
+            self._pause_started_ts = None
+            self._paused.clear()
+        self._set_pending_result_check(False, "manual_restart_battle")
+        self._battle_started = False
+        self.turn_index = 1
+        self._wait_a_enabled = True
+        self._wait_silent_logged = False
+        self._force_wait_a_reactivation = True
+        self._reset_playable_state_timers()
+        self.vision.reset_battle_context()
+        self._current_battle_map_name = ""
+        self._current_battle_stats_recorded = False
+        self._set_status(
+            status="running",
+            phase="waiting_playable",
+            turn=1,
+            map_id="",
+            hand="",
+            p1_sp=0,
+            last_action="",
+            playable=False,
+            pending_result_check=False,
+            strategy_id=self.config.strategy_id,
+            strategy_source="",
+            last_error="",
+        )
+        self._push_event(
+            f"manual_battle_restart，已清空本局进行中状态并重新进入按 A 等待 playable。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。"
+        )
+        self._logger.write("用户触发重开当前对局：已清空本局进行中状态，重新进入按 A 等待 playable 阶段。")
+
+    def surrender_and_restart_waiting(self) -> None:
+        if not self._battle_started:
+            self.restart_battle_waiting()
+            self._push_event("当前不在对局内，已直接重置到按 A 等待 playable 状态。")
+            return
+        self._manual_surrender_requested.set()
+        self._push_event("已请求手动投降并重开：等待当前手柄动作完成后，将执行投降并返回初始等待状态。")
+        self._logger.write("用户触发手动投降并重开：当前手柄动作结束后，将跳出对局状态机并执行投降。")
 
     def adjust_turn_index(self, delta: int) -> None:
         if delta == 0:
@@ -2692,6 +2798,20 @@ class AutoControllerRuntime:
     def _current_serial_port_labels(self) -> List[str]:
         return list_serial_port_labels()
 
+    def _serial_port_supports_switch_link(self, port: str) -> bool:
+        target = str(port or "").strip()
+        if not target:
+            return False
+        try:
+            ctl = SerialRemoteController(port=target, timeout=0.1)
+        except Exception:
+            return False
+        try:
+            return bool(ctl.probe_firmware(timeout_seconds=1.2))
+        finally:
+            with contextlib.suppress(Exception):
+                ctl.close()
+
     def _serial_port_is_available(self, port: str) -> bool:
         target = str(port or "").strip()
         if not target:
@@ -2712,7 +2832,17 @@ class AutoControllerRuntime:
             self._push_event("switch_link_unavailable_exit")
             self._set_status(last_error="NO_AVAILABLE_SWITCH_LINK_PORT", phase="error")
             raise RuntimeError("NO_AVAILABLE_SWITCH_LINK_PORT")
-        next_port = parse_device_from_label(labels[0])
+        next_port = ""
+        for label in labels:
+            candidate = parse_device_from_label(label)
+            if self._serial_port_supports_switch_link(candidate):
+                next_port = candidate
+                break
+        if not next_port:
+            self._logger.write("switch_link 串口检查失败：检测到串口存在，但没有可握手的虚拟手柄串口，程序即将退出。")
+            self._push_event("switch_link_unavailable_exit")
+            self._set_status(last_error="NO_AVAILABLE_SWITCH_LINK_PORT", phase="error")
+            raise RuntimeError("NO_AVAILABLE_SWITCH_LINK_PORT")
         with contextlib.suppress(Exception):
             self.controller.close()
         self.controller = SerialRemoteController(port=next_port)
@@ -2723,6 +2853,23 @@ class AutoControllerRuntime:
         self._logger.write(f"检测到原 switch_link 串口不可用，已自动切换到当前可用串口：{next_port}。")
         self._push_event(f"switch_link_reconnected:{next_port}")
         return True
+
+    def _run_controller_with_reconnect(self, action: Callable[[], None], *, context: str) -> None:
+        try:
+            action()
+            return
+        except Exception as exc:
+            self._logger.write(f"{context} 发送失败，开始检查 switch_link 串口状态。error={exc}")
+        reconnected = self._reconnect_controller_if_needed()
+        if reconnected:
+            self._logger.write(f"switch_link 串口已恢复，重试发送：{context}")
+        else:
+            self._logger.write(f"switch_link 串口表面可用，重试发送：{context}")
+        try:
+            action()
+        except Exception as exc:
+            self._logger.write(f"{context} 重试后仍失败：{exc}")
+            raise RuntimeError("SWITCH_LINK_UNAVAILABLE_EXIT")
 
     def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
         token_upper = str(token).upper()
@@ -2831,12 +2978,21 @@ class AutoControllerRuntime:
                 self._debug_ui.start()
 
     def _run_surrender_sequence(self) -> None:
-        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 2 秒，最后按 A。")
-        self.controller.send_smart_sequence_csv_blocking("PLUS,1", timeout_seconds=2.0)
+        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 0.5 秒，最后按 A。")
+        self._run_controller_with_reconnect(
+            lambda: self.controller.send_smart_sequence_csv_blocking("PLUS,1", timeout_seconds=2.0),
+            context="投降序列:PLUS",
+        )
         time.sleep(2.0)
-        self.controller.run_steps([RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=120, gap_ms=0)])
-        time.sleep(2.0)
-        self.controller.run_steps([RemoteStep(bits=(1 << BIT_A), hold_ms=120, gap_ms=0)])
+        self._run_controller_with_reconnect(
+            lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_DPAD_RIGHT), hold_ms=120, gap_ms=0)]),
+            context="投降序列:DRIGHT",
+        )
+        time.sleep(0.5)
+        self._run_controller_with_reconnect(
+            lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_A), hold_ms=120, gap_ms=0)]),
+            context="投降序列:A",
+        )
 
     def _run_resume_reactivation_sequence(self) -> None:
         self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。")
@@ -2939,6 +3095,10 @@ class AutoControllerRuntime:
     def _ensure_not_stopped(self) -> None:
         if self._stop_requested.is_set():
             raise KeyboardInterrupt("stop requested")
+        if self._restart_battle_requested.is_set():
+            raise RuntimeError("MANUAL_BATTLE_RESTART")
+        if self._manual_surrender_requested.is_set():
+            raise RuntimeError("MANUAL_BATTLE_SURRENDER_RESTART")
 
     def wait_until_playable(self) -> Dict[str, Any]:
         self._set_status(phase="waiting_playable", playable=False)
@@ -3089,6 +3249,32 @@ class AutoControllerRuntime:
         except TargetWinGoalReached:
             raise
         except RuntimeError as exc:
+            if str(exc) == "MANUAL_BATTLE_RESTART":
+                self._restart_battle_requested.clear()
+                self._set_status(phase="waiting_playable", last_error="")
+                self._push_event("已中断当前局内状态机，重新回到新的按 A 等待 playable 状态。")
+                return
+            if str(exc) == "MANUAL_BATTLE_SURRENDER_RESTART":
+                self._manual_surrender_requested.clear()
+                self._set_status(phase="manual_surrender_restarting", last_error="")
+                self._push_event("已中断当前局内状态机，准备执行手动投降并重新开始。")
+                self._run_surrender_sequence()
+                self._set_pending_result_check(False, "manual_surrender_restart")
+                self._finalize_battle_replay("timeout_surrender", None)
+                self._reset_after_battle_resolution("manual_surrender_restart")
+                return
+            if str(exc) in {"NO_AVAILABLE_SWITCH_LINK_PORT", "SWITCH_LINK_UNAVAILABLE_EXIT"}:
+                self._set_status(phase="error", last_error=str(exc), status="stopping")
+                self._push_event("程序已安全退出：switch_link 串口不可用或无法恢复，请检查 CP2104/串口连接后重新启动。")
+                self._logger.write("switch_link 串口不可用，已安全退出。")
+                self.request_stop("switch_link_unavailable_exit")
+                return
+            if "recovery window" in str(exc) and "Capture frame" in str(exc):
+                self._set_status(phase="error", last_error=str(exc), status="stopping")
+                self._push_event(f"视频流在恢复窗口内未能恢复，程序安全退出：{exc}")
+                self._logger.write(f"视频流恢复失败，已达到恢复窗口上限，准备安全退出：{exc}")
+                self.request_stop("capture_frame_unavailable_exit")
+                return
             if str(exc) in {
                 "BATTLE_PROGRESS_TIMEOUT_SURRENDER",
                 "WAIT_PLAYABLE_TIMEOUT_SURRENDER",
@@ -3128,7 +3314,13 @@ class AutoControllerRuntime:
                     if not self._prompt_next_target_after_goal_reached():
                         break
         except KeyboardInterrupt:
-            self._push_event("runtime_stopped")
+            last_error = ""
+            with self._status_lock:
+                last_error = str(self._status.get("last_error", "") or "")
+            if last_error == "capture_frame_unavailable_exit":
+                self._push_event("程序已安全退出：视频流在恢复窗口内未能恢复，请检查采集卡/代理/VPN 状态后重新启动。")
+            else:
+                self._push_event("runtime_stopped")
             self._set_status(status="stopped", phase="stopped")
 
 

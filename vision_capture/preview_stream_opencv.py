@@ -23,10 +23,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from switch_connect.ui.terminal_select import choose_with_arrows
 from vision_capture.adapter import (
-    auto_detect_capture_device_name,
+    FFmpegCaptureSource,
     is_usb_capture_device_name,
     list_avfoundation_video_device_rows,
-    list_avfoundation_video_devices,
+    rank_capture_device_name,
 )
 
 
@@ -54,6 +54,8 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "prefix": "capture",
 }
 
+VERIFY_FRAME_DISTANCE_THRESHOLD = 18.0
+
 
 def _load_config(path: Path) -> Dict[str, object]:
     if not path.exists():
@@ -70,32 +72,69 @@ def _save_config(path: Path, cfg: Dict[str, object]) -> None:
     path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _pick_video_device(prefer_usb_only: bool) -> str:
-    devices = list_avfoundation_video_devices()
+def _fresh_video_device_rows() -> List[Dict[str, str]]:
+    return list_avfoundation_video_device_rows()
+
+
+def _filtered_video_device_rows(prefer_usb_only: bool) -> List[Dict[str, str]]:
+    rows = _fresh_video_device_rows()
     if prefer_usb_only:
-        usb_devices = [d for d in devices if is_usb_capture_device_name(d)]
-        if usb_devices:
-            devices = usb_devices
-    if not devices:
+        usb_rows = [row for row in rows if is_usb_capture_device_name(row["name"])]
+        if usb_rows:
+            rows = usb_rows
+    return rows
+
+
+def _device_label(device_id: str) -> str:
+    value = str(device_id or "").strip()
+    if not value:
         return ""
-    picked = choose_with_arrows(devices, "Select capture video device")
-    return picked or ""
+    if value.isdigit():
+        for row in _fresh_video_device_rows():
+            if row["index"] == value:
+                return f"[{row['index']}] {row['name']}"
+        return f"[{value}] <unknown>"
+    for row in _fresh_video_device_rows():
+        if row["name"] == value:
+            return f"[{row['index']}] {row['name']}"
+    return value
+
+
+def _pick_video_device(prefer_usb_only: bool) -> str:
+    rows = _filtered_video_device_rows(prefer_usb_only=prefer_usb_only)
+    if not rows:
+        return ""
+    options = [f"[{row['index']}] {row['name']}" for row in rows]
+    picked = choose_with_arrows(options, "Select capture video device")
+    if not picked:
+        return ""
+    for row in rows:
+        label = f"[{row['index']}] {row['name']}"
+        if picked == label:
+            return row["index"]
+    return ""
 
 
 def _resolve_device(args: argparse.Namespace) -> str:
     manual = (args.device_name or "").strip()
     if args.pick_device:
         return _pick_video_device(prefer_usb_only=not args.allow_non_usb)
+    if manual.lower() == "invalid":
+        return _pick_video_device(prefer_usb_only=not args.allow_non_usb)
     if manual:
         return manual
-    return auto_detect_capture_device_name(prefer_usb=not args.allow_non_usb) or ""
+    rows = _filtered_video_device_rows(prefer_usb_only=not args.allow_non_usb)
+    if not rows:
+        return ""
+    rows = sorted(rows, key=lambda row: rank_capture_device_name(row["name"]), reverse=True)
+    return rows[0]["index"]
 
 
 def _resolve_video_input_name(device_name: str) -> str:
     name = str(device_name or "").strip()
     if name.isdigit():
         return f"{name}:none"
-    for row in list_avfoundation_video_device_rows():
+    for row in _fresh_video_device_rows():
         if row["name"] == name:
             return f"{row['index']}:none"
     return f"{name}:none"
@@ -127,34 +166,56 @@ def _resolve_video_index(device_name: str) -> Optional[int]:
     name = str(device_name or "").strip()
     if name.isdigit():
         return int(name)
-    for row in list_avfoundation_video_device_rows():
+    for row in _fresh_video_device_rows():
         if row["name"] == name:
             return int(row["index"])
     return None
 
 
 def _candidate_video_indices(device_name: str) -> List[int]:
-    rows = list_avfoundation_video_device_rows()
-    name = str(device_name or "").strip()
+    selected = _resolve_video_index(device_name)
+    rows = _fresh_video_device_rows()
     candidates: List[int] = []
-
-    if name.isdigit():
-        candidates.append(int(name))
-    else:
-        for ordinal, row in enumerate(rows):
-            if row["name"] != name:
-                continue
-            avfoundation_index = int(row["index"])
-            candidates.append(avfoundation_index)
-            if ordinal != avfoundation_index:
-                candidates.append(ordinal)
-            break
-
-    max_scan = max(2, len(rows))
-    for idx in range(max_scan):
+    if selected is not None:
+        candidates.append(int(selected))
+    for idx in range(max(2, len(rows))):
         if idx not in candidates:
             candidates.append(idx)
     return candidates
+
+
+def _frame_signature(frame: np.ndarray, width: int = 160, height: int = 90) -> np.ndarray:
+    resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    return gray.astype(np.float32)
+
+
+def _frame_distance(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    lhs_sig = _frame_signature(lhs)
+    rhs_sig = _frame_signature(rhs)
+    return float(np.mean(np.abs(lhs_sig - rhs_sig)))
+
+
+def _capture_reference_frame(
+    device_id: str,
+    profile: Dict[str, object],
+    fps: int,
+    timeout_seconds: float,
+) -> Optional[np.ndarray]:
+    source = FFmpegCaptureSource(
+        device_name=str(device_id),
+        width=int(profile["width"]),
+        height=int(profile["height"]),
+        fps=int(fps),
+        pixel_format=str(profile["pixel_format"]),
+        strict_usb_only=False,
+    )
+    try:
+        return source.read(timeout_seconds=max(1.0, timeout_seconds))
+    except Exception:
+        return None
+    finally:
+        source.stop()
 
 
 def _open_video_capture(
@@ -162,11 +223,11 @@ def _open_video_capture(
     profiles: List[Dict[str, object]],
     fps: int,
     timeout_seconds: float,
-) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str]:
+) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str, Optional[str]]:
     last_error = ""
     candidate_indices = _candidate_video_indices(device_name)
     if not candidate_indices:
-        return None, None, None, f"DEVICE_INDEX_NOT_FOUND:{device_name}"
+        return None, None, None, f"DEVICE_INDEX_NOT_FOUND:{device_name}", None
 
     for device_index in candidate_indices:
         for profile in profiles:
@@ -192,14 +253,31 @@ def _open_video_capture(
                 time.sleep(0.03)
 
             if frame is not None:
-                if device_index != candidate_indices[0]:
-                    print(f"[open] using fallback OpenCV index {device_index} for {device_name}")
-                return cap, profile, frame, ""
+                reference_frame = _capture_reference_frame(
+                    device_id=str(device_name),
+                    profile=profile,
+                    fps=fps,
+                    timeout_seconds=timeout_seconds,
+                )
+                if reference_frame is None:
+                    last_error = f"VERIFY_REFERENCE_UNAVAILABLE:{_device_label(str(device_name))}"
+                    cap.release()
+                    continue
+                distance = _frame_distance(frame, reference_frame)
+                if distance > VERIFY_FRAME_DISTANCE_THRESHOLD:
+                    last_error = (
+                        f"DEVICE_VERIFICATION_FAILED:{_device_label(str(device_name))} "
+                        f"candidate_index={device_index} distance={distance:.2f} "
+                        f"threshold={VERIFY_FRAME_DISTANCE_THRESHOLD:.2f}"
+                    )
+                    cap.release()
+                    continue
+                return cap, profile, frame, "", str(device_index)
 
             last_error = f"{profile['label']}: FRAME_TIMEOUT({timeout_seconds}s) @ index {device_index}"
             cap.release()
 
-    return None, None, None, last_error
+    return None, None, None, last_error, None
 
 
 def _reopen_video_capture(
@@ -208,7 +286,7 @@ def _reopen_video_capture(
     profiles: List[Dict[str, object]],
     fps: int,
     timeout_seconds: float,
-) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str]:
+) -> Tuple[Optional[cv2.VideoCapture], Optional[Dict[str, object]], Optional[np.ndarray], str, Optional[str]]:
     current_cap.release()
     return _open_video_capture(
         device_name=device_name,
@@ -312,6 +390,34 @@ class FrameState:
                 raise RuntimeError("JPEG_ENCODE_FAILED")
             out.append(encoded.tobytes())
         return out
+
+
+@dataclass
+class FpsState:
+    value: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def set(self, fps: float) -> None:
+        with self.lock:
+            self.value = float(fps)
+
+    def get_text(self) -> str:
+        with self.lock:
+            return f"{self.value:.1f}"
+
+
+def _fps_worker(state: FrameState, fps_state: FpsState, stop_event: threading.Event) -> None:
+    prev_count = 0
+    prev_ts = time.monotonic()
+    while not stop_event.wait(0.5):
+        with state.lock:
+            current_count = state.frame_count
+        now = time.monotonic()
+        elapsed = now - prev_ts
+        if elapsed > 0:
+            fps_state.set((current_count - prev_count) / elapsed)
+        prev_count = current_count
+        prev_ts = now
 
 
 def _make_handler(state: FrameState):
@@ -451,22 +557,31 @@ def _save_burst_frames_worker(
 
 def _overlay_status(
     frame: np.ndarray,
-    profile_label: str,
-    device_name: str,
-    api_url: str,
+    requested_device_label: str,
     saved_count: int,
+    fps_text: str,
+    profile_label: str,
 ) -> None:
-    lines = [
-        f"Device: {device_name}",
-        f"Capture: {profile_label}",
-        f"API: {api_url}/frame.jpg",
+    left_lines = [
+        f"Requested: {requested_device_label}",
         f"Saved: {saved_count}",
         "Keys: Enter save PNG, B burst 30 PNG, R reselect source, Esc/close window/Ctrl+C quit",
     ]
-    for idx, text in enumerate(lines):
+    right_lines = [
+        f"Capture: {profile_label}",
+        f"FPS: {fps_text}",
+    ]
+    for idx, text in enumerate(left_lines):
         y = 30 + idx * 28
         cv2.putText(frame, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 4, cv2.LINE_AA)
         cv2.putText(frame, text, (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 180), 1, cv2.LINE_AA)
+    frame_w = frame.shape[1]
+    for idx, text in enumerate(right_lines):
+        y = 30 + idx * 28
+        (text_w, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)
+        x = max(16, frame_w - text_w - 16)
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 4, cv2.LINE_AA)
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 180), 1, cv2.LINE_AA)
 
 
 def main() -> int:
@@ -527,26 +642,33 @@ def main() -> int:
         return 2
 
     profiles = _build_profiles(args.spec or "")
-    cap, active_profile, first_frame, error = _open_video_capture(
+    cap, active_profile, first_frame, error, actual_device_name = _open_video_capture(
         device_name=device_name,
         profiles=profiles,
         fps=args.fps,
         timeout_seconds=args.probe_seconds,
     )
-    if cap is None or active_profile is None or first_frame is None:
+    if cap is None or active_profile is None or first_frame is None or not actual_device_name:
+        cfg["device_name"] = "invalid"
+        cfg["pick_device"] = False
+        _save_config(cfg_path, cfg)
+        print(f"Config updated: device_name=invalid ({cfg_path})")
         print(f"Unable to open preview stream. last_error={error}")
         return 1
 
     state = FrameState(jpeg_quality=max(30, min(100, args.jpeg_quality)))
-    state.device_name = device_name
+    state.device_name = actual_device_name
     state.profile_label = str(active_profile["label"])
     state.update_frame(first_frame)
     api_url = f"http://{args.host}:{args.port}"
+    requested_device_label = _device_label(device_name)
+    actual_device_label = _device_label(actual_device_name)
 
     server = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
     server_thread = threading.Thread(target=server.serve_forever, name="frame-api-server", daemon=True)
     server_thread.start()
-    print(f"Device: {device_name}")
+    print(f"Requested device: {requested_device_label}")
+    print(f"Actual device: {actual_device_label}")
     print(f"Input index: {_resolve_video_index(device_name)}")
     print(f"Streaming: {active_profile['label']}")
     print(f"Frame API: {api_url}/frame.jpg")
@@ -555,6 +677,15 @@ def main() -> int:
     last_frame_ts = time.monotonic()
     saved_count = 0
     burst_timeout_seconds = max(3.0, 30.0 / max(1, args.fps) + 2.0)
+    fps_state = FpsState()
+    fps_stop_event = threading.Event()
+    fps_thread = threading.Thread(
+        target=_fps_worker,
+        args=(state, fps_state, fps_stop_event),
+        name="fps-worker",
+        daemon=True,
+    )
+    fps_thread.start()
 
     try:
         cv2.namedWindow(args.window_title, cv2.WINDOW_NORMAL)
@@ -578,7 +709,13 @@ def main() -> int:
             if state.frame is None:
                 continue
             display_frame = state.frame.copy()
-            _overlay_status(display_frame, str(active_profile["label"]), device_name, api_url, saved_count)
+            _overlay_status(
+                display_frame,
+                requested_device_label,
+                saved_count,
+                fps_state.get_text(),
+                str(active_profile["label"]),
+            )
             cv2.imshow(args.window_title, display_frame)
             if cv2.getWindowProperty(args.window_title, cv2.WND_PROP_VISIBLE) < 1:
                 break
@@ -608,41 +745,42 @@ def main() -> int:
                     print("[reselect] cancelled")
                     continue
 
-                next_cap, next_profile, next_frame, reopen_error = _reopen_video_capture(
+                next_cap, next_profile, next_frame, reopen_error, next_actual_device_name = _reopen_video_capture(
                     current_cap=cap,
                     device_name=picked_device,
                     profiles=profiles,
                     fps=args.fps,
                     timeout_seconds=args.probe_seconds,
                 )
-                if next_cap is None or next_profile is None or next_frame is None:
+                if (
+                    next_cap is None
+                    or next_profile is None
+                    or next_frame is None
+                    or not next_actual_device_name
+                ):
                     print(f"[reselect] failed: {reopen_error}")
-                    cap, active_profile, first_frame, error = _open_video_capture(
-                        device_name=device_name,
-                        profiles=profiles,
-                        fps=args.fps,
-                        timeout_seconds=args.probe_seconds,
-                    )
-                    if cap is None or active_profile is None or first_frame is None:
-                        print(f"Unable to reopen previous stream. last_error={error}")
-                        break
-                    state.device_name = device_name
-                    state.profile_label = str(active_profile["label"])
-                    state.update_frame(first_frame)
-                    last_frame_ts = time.monotonic()
-                    continue
+                    cfg["device_name"] = "invalid"
+                    cfg["pick_device"] = False
+                    _save_config(cfg_path, cfg)
+                    print(f"[reselect] config kept invalid: {cfg_path}")
+                    print("[reselect] exiting preview because device_name is invalid")
+                    break
 
                 cap = next_cap
                 active_profile = next_profile
                 device_name = picked_device
-                state.device_name = device_name
+                actual_device_name = next_actual_device_name
+                requested_device_label = _device_label(device_name)
+                actual_device_label = _device_label(actual_device_name)
+                state.device_name = actual_device_name
                 state.profile_label = str(active_profile["label"])
                 state.update_frame(next_frame)
                 last_frame_ts = time.monotonic()
                 cfg["device_name"] = device_name
                 cfg["pick_device"] = False
                 _save_config(cfg_path, cfg)
-                print(f"[reselect] switched to {device_name}")
+                print(f"[reselect] requested={requested_device_label}")
+                print(f"[reselect] actual={actual_device_label}")
                 print(f"[reselect] config updated: {cfg_path}")
                 continue
             if key in (10, 13):
@@ -652,6 +790,8 @@ def main() -> int:
                 print(f"[saved] {path}")
                 continue
     finally:
+        fps_stop_event.set()
+        fps_thread.join(timeout=0.5)
         server.shutdown()
         server.server_close()
         cap.release()

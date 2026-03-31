@@ -326,6 +326,30 @@ def _max_finisher_enemy_cover(game_map, finisher_card, player: str) -> int:
     return best
 
 
+def _finisher_full_cover_placements(game_map, finisher_card, player: str) -> List[Tuple[int, int, int]]:
+    placements: List[Tuple[int, int, int]] = []
+    is_p1 = player == "P1"
+    target_cover = int(finisher_card.CardPoint)
+    for rotation in (0, 1, 2, 3):
+        for y in range(game_map.height):
+            for x in range(game_map.width):
+                ok, _reason, _cells = validate_place_card_action(
+                    card=finisher_card,
+                    game_map=game_map,
+                    anchor_x=x,
+                    anchor_y=y,
+                    rotation=rotation,
+                    is_p1=is_p1,
+                    use_sp_attack=True,
+                )
+                if not ok:
+                    continue
+                covered = _finisher_enemy_cover_count(game_map, finisher_card, player, x, y, rotation)
+                if covered >= target_cover:
+                    placements.append((x, y, rotation))
+    return placements
+
+
 def _future_finisher_priority(
     payload: Dict[str, object],
     current_finisher_score: Optional[int],
@@ -339,6 +363,30 @@ def _future_finisher_priority(
     if predicted > current_finisher_score:
         return 1000 + int(predicted)
     return 0
+
+
+def _filter_non_final_sp_actions(
+    state,
+    player: str,
+    actions: List[dict],
+    *,
+    finisher_card,
+    current_finisher_enemy_cover: int,
+) -> List[dict]:
+    protected: List[dict] = []
+    for action in actions:
+        cost = _card_sp_cost(state, player, action)
+        if cost > state.players[player].sp:
+            continue
+        if (state.players[player].sp - cost) < 3:
+            continue
+        if finisher_card is not None:
+            preview_map = _apply_action_to_map(state, player, action)
+            future_enemy_cover = _max_finisher_enemy_cover(preview_map, finisher_card, player)
+            if future_enemy_cover < current_finisher_enemy_cover:
+                continue
+        protected.append(action)
+    return protected
 
 
 def choose_action(state, player: str, legal_actions: List[dict], context: Dict[str, object]) -> Dict[str, object]:
@@ -416,20 +464,15 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
     if ps.sp > 3:
         extra_sp = [
             a for a in sp_actions
-            if _card_sp_cost(state, player, a) <= ps.sp
-            and (ps.sp - _card_sp_cost(state, player, a)) >= 3
-            and _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
+            if _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
         ]
-        protected_sp: List[dict] = []
-        for action in extra_sp:
-            if finisher_card is None:
-                protected_sp.append(action)
-                continue
-            preview_map = _apply_action_to_map(state, player, action)
-            future_enemy_cover = _max_finisher_enemy_cover(preview_map, finisher_card, player)
-            if current_finisher_enemy_cover >= 12 and future_enemy_cover < 12:
-                continue
-            protected_sp.append(action)
+        protected_sp = _filter_non_final_sp_actions(
+            state,
+            player,
+            extra_sp,
+            finisher_card=finisher_card,
+            current_finisher_enemy_cover=current_finisher_enemy_cover,
+        )
         profitable_sp = [a for a in protected_sp if _project_score_swing(state, player, a) > _card_point(state, player, a)]
         if profitable_sp:
             return _best_by_score(
@@ -479,7 +522,13 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
             ),
         )
 
-    usable_sp = [a for a in sp_actions if _card_sp_cost(state, player, a) <= ps.sp]
+    usable_sp = _filter_non_final_sp_actions(
+        state,
+        player,
+        sp_actions,
+        finisher_card=finisher_card,
+        current_finisher_enemy_cover=current_finisher_enemy_cover,
+    )
     if usable_sp:
         return _best_by_score(
             usable_sp,

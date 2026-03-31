@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -77,13 +78,17 @@ def _prompt_target_wins_if_needed(args: argparse.Namespace) -> int | None:
 
 
 def _clear_terminal_for_runtime_ui() -> None:
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return
     with contextlib.suppress(Exception):
-        # Startup cleanup should clear both the visible screen and the scrollback
-        # left by shell prompts / launch commands before the runtime UI begins.
-        sys.stdout.write("\r\033[3J\033[2J\033[H")
-        sys.stdout.flush()
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.stdout.write("\r\033[3J\033[2J\033[H")
+            sys.stdout.flush()
+            return
+    with contextlib.suppress(Exception):
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        try:
+            os.write(tty_fd, b"\r\033[3J\033[2J\033[H")
+        finally:
+            os.close(tty_fd)
 
 
 def _load_json_obj(path: Path) -> Dict[str, object]:
