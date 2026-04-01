@@ -472,8 +472,9 @@ class RuntimeLogWriter:
     def path(self) -> Path:
         return self._path
 
-    def write(self, message: str) -> None:
-        line = f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}\n"
+    def write(self, message: str, tag: str = "SYSTEM") -> None:
+        normalized_tag = str(tag or "SYSTEM").strip().upper() or "SYSTEM"
+        line = f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{normalized_tag}] {message}\n"
         with self._lock:
             self._path.open("a", encoding="utf-8").write(line)
 
@@ -2161,7 +2162,6 @@ class TerminalDebugUI:
         self._stdin_old_attrs = None
         self._interactive = False
         self._first_frame = True
-        self._last_render_line_count = 0
         self._started = False
         self._tty_fd: Optional[int] = None
         self._tty_writer = None
@@ -2192,7 +2192,6 @@ class TerminalDebugUI:
         self._started = True
         self._stop.clear()
         self._first_frame = True
-        self._last_render_line_count = 0
         import termios
         import tty
 
@@ -2217,10 +2216,7 @@ class TerminalDebugUI:
                 termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_old_attrs)
         if was_interactive:
             with contextlib.suppress(Exception):
-                if self._last_render_line_count > 0:
-                    self._write_output(f"\r\033[{self._last_render_line_count}F\033[J")
-                else:
-                    self._write_output("\r\033[2J\033[H")
+                self._write_output("\r\033[H\033[J")
                 self._flush_output()
         self._stdin_fd = None
         self._stdin_old_attrs = None
@@ -2346,17 +2342,15 @@ class TerminalDebugUI:
             lines.append(_fit(f"  {item}"))
         lines = lines[: max(1, height - 1)]
         body = "\n".join(lines)
-        force_full_redraw = self._tty_fd is not None
-        if self._first_frame or force_full_redraw:
+        if self._first_frame:
             self._write_output("\r\033[2J\033[H")
             self._first_frame = False
         else:
-            self._write_output(f"\r\033[{max(1, self._last_render_line_count)}F\033[J")
+            self._write_output("\r\033[H\033[J")
         self._write_output(body)
         if not body.endswith("\n"):
             self._write_output("\n")
         self._flush_output()
-        self._last_render_line_count = max(1, body.count("\n") + 1)
 
     def _write_output(self, text: str) -> None:
         writer = self._tty_writer or sys.stdout
@@ -2385,7 +2379,7 @@ class AutoControllerRuntime:
         self.vision = _FrameVisionPipeline(
             config,
             on_capture_recovery_pause=self._suspend_timeout_accumulation,
-            on_capture_recovery_event=self._push_event,
+            on_capture_recovery_event=self._push_vision_error_event,
             on_capture_interactive_prompt=self._set_capture_interactive_prompt,
         )
         log_path = _resolve_debug_log_path(config.log_file)
@@ -2450,8 +2444,8 @@ class AutoControllerRuntime:
         }
         self._debug_ui = TerminalDebugUI(self)
         self._debug_ui.start()
-        self._logger.write("自动控制器启动，已初始化串口、采集与调试界面。")
-        self._push_event("runtime_ready")
+        self._logger.write("自动控制器启动，已初始化串口、采集与调试界面。", tag="SYSTEM")
+        self._push_event("runtime_ready", tag="SYSTEM")
         self._set_status(status="running", phase="idle")
 
     def close(self) -> None:
@@ -2476,17 +2470,20 @@ class AutoControllerRuntime:
         else:
             self._debug_ui.start()
 
-    def _push_event(self, message: str) -> None:
+    def _push_event(self, message: str, tag: str = "SYSTEM") -> None:
         with self._status_lock:
             events = list(self._status.get("events", []))
             events.append(f"{self._timestamp()} {message}")
-            self._status["events"] = events[-8:]
+            self._status["events"] = events[-48:]
             self._status["updated_at"] = self._timestamp()
-        self._logger.write(message)
+        self._logger.write(message, tag=tag)
+
+    def _push_vision_error_event(self, message: str) -> None:
+        self._push_event(message, tag="VISION_ERROR")
 
     def _mark_progress(self, reason: str) -> None:
         self._last_progress_ts = time.monotonic()
-        self._logger.write(f"进度推进：{reason}")
+        self._logger.write(f"进度推进：{reason}", tag="GAMEROUND")
 
     def _suspend_timeout_accumulation(self, seconds: float, reason: str = "") -> None:
         delta = max(0.0, float(seconds))
@@ -2498,7 +2495,7 @@ class AutoControllerRuntime:
         if self._non_playable_seen_since is not None:
             self._non_playable_seen_since += delta
         if reason:
-            self._logger.write(f"采集恢复等待 {delta:.1f}s：{reason}")
+            self._logger.write(f"采集恢复等待 {delta:.1f}s：{reason}", tag="VISION_ERROR")
 
     def _stats_map_name(self) -> str:
         if str(self._current_battle_map_name or "").strip():
@@ -2510,9 +2507,9 @@ class AutoControllerRuntime:
         target_name = str(map_name or self._stats_map_name()).strip()
         self._global_stats.increment(target_name, key, amount)
         if stats_mode == "aggregate":
-            self._logger.write(f"{self.config.aggregate_stats_name} 统计更新：{key} +{amount}。")
+            self._logger.write(f"{self.config.aggregate_stats_name} 统计更新：{key} +{amount}。", tag="STATISTIC")
         elif target_name:
-            self._logger.write(f"地图统计更新：{target_name} {key} +{amount}。")
+            self._logger.write(f"地图统计更新：{target_name} {key} +{amount}。", tag="STATISTIC")
 
     def _set_pending_result_check(self, value: bool, reason: str) -> None:
         self._pending_result_check = bool(value)
@@ -2542,7 +2539,7 @@ class AutoControllerRuntime:
             strategy_id=self.config.strategy_id,
             strategy_source="",
         )
-        self._logger.write(f"本局已重置上下文，准备进入下一局等待阶段。reason={reason}")
+        self._logger.write(f"本局已重置上下文，准备进入下一局等待阶段。reason={reason}", tag="GAMEROUND")
 
     def _analyze_settlement_result(self, frame) -> Optional[Dict[str, Any]]:
         map_name = self._stats_map_name()
@@ -2579,7 +2576,7 @@ class AutoControllerRuntime:
                 "counts": dict(result.get("counts", {}) or {}),
             }
         except Exception as exc:
-            self._logger.write(f"结算地图状态识别失败：map={map_name} error={exc}")
+            self._logger.write(f"结算地图状态识别失败：map={map_name} error={exc}", tag="VISION")
             return {
                 "map_name": map_name,
                 "analysis_error": str(exc),
@@ -2600,7 +2597,7 @@ class AutoControllerRuntime:
             settlement_map_state=settlement_map_state,
         )
         if path is not None:
-            self._logger.write(f"已写入回放日志：{path}")
+            self._logger.write(f"已写入回放日志：{path}", tag="REPLAY")
 
     def _check_progress_timeout(self, phase: str) -> None:
         if not self._battle_started:
@@ -2609,7 +2606,7 @@ class AutoControllerRuntime:
         elapsed = time.monotonic() - self._last_progress_ts
         if elapsed < timeout:
             return
-        self._push_event(f"progress_timeout phase={phase} elapsed={elapsed:.1f}s，触发投降并重开。")
+        self._push_event(f"progress_timeout phase={phase} elapsed={elapsed:.1f}s，触发投降并重开。", tag="TIMEOUT")
         self._run_surrender_sequence()
         self._battle_started = False
         self._set_pending_result_check(False, f"progress_timeout:{phase}")
@@ -2643,8 +2640,11 @@ class AutoControllerRuntime:
         if elapsed < timeout:
             return
         state_name = "playable" if is_playable else "non_playable"
-        self._push_event(f"state_timeout phase={phase} state={state_name} elapsed={elapsed:.1f}s，触发投降并重开。")
-        self._logger.write(f"状态 {state_name} 持续超过阈值，执行投降序列并重置到等待阶段。")
+        self._push_event(
+            f"state_timeout phase={phase} state={state_name} elapsed={elapsed:.1f}s，触发投降并重开。",
+            tag="TIMEOUT",
+        )
+        self._logger.write(f"状态 {state_name} 持续超过阈值，执行投降序列并重置到等待阶段。", tag="TIMEOUT")
         self._run_surrender_sequence()
         self._battle_started = False
         self._set_pending_result_check(False, f"state_timeout:{phase}:{state_name}")
@@ -2652,14 +2652,15 @@ class AutoControllerRuntime:
         self._reset_playable_state_timers()
         raise RuntimeError("WAIT_PLAYABLE_TIMEOUT_SURRENDER")
 
-    def _wait_for_next_turn_playable(self) -> bool:
-        self._push_event("进入下一回合确认阶段：固定等待 3 秒，不进行 playable 检测。")
+    def _wait_for_next_turn_playable(self, action_sent_successfully: bool) -> bool:
+        self._push_event("进入下一回合确认阶段：固定等待 3 秒，不进行 playable 检测。", tag="GAMEROUND")
         start_ts = time.monotonic()
         self._sleep_with_pause(3.0)
         self._suspend_timeout_accumulation(time.monotonic() - start_ts)
         self._reset_playable_state_timers()
         seen_non_playable = False
         warned_continuous_playable = False
+        recovery_count_at_entry = int(getattr(self.vision, "capture_recovery_success_count", 0))
         while True:
             self._wait_if_paused()
             self._ensure_not_stopped()
@@ -2674,21 +2675,53 @@ class AutoControllerRuntime:
             )
             is_playable = bool(playable_result.get("playable"))
             self._update_playable_state_timers(is_playable)
+            recovery_happened_during_wait = (
+                int(getattr(self.vision, "capture_recovery_success_count", 0)) > recovery_count_at_entry
+            )
             if is_playable:
                 if seen_non_playable:
-                    self._push_event("已重新检测到 playable，确认进入下一回合。")
+                    self._push_event("已重新检测到 playable，确认进入下一回合。", tag="GAMEROUND")
                     self._mark_progress("重新检测到可出牌状态，确认本回合已成功推进。")
                     self._reset_playable_state_timers()
                     return True
+                if recovery_happened_during_wait:
+                    if bool(action_sent_successfully):
+                        self._push_event(
+                            "检测到本轮等待期间发生视频流恢复，且当前 playable=true；本回合动作已成功发送，按已提交处理。",
+                            tag="GAMEROUND",
+                        )
+                        self._logger.write(
+                            "本轮等待期间存在视频流恢复，可能错过了中间 playable=false 窗口；因动作已发送成功，按本回合已提交处理。",
+                            tag="GAMEROUND",
+                        )
+                        self._mark_progress("视频流恢复后按本回合已提交成功推进。")
+                        self._reset_playable_state_timers()
+                        return True
+                    self._push_event(
+                        "检测到本轮等待期间发生视频流恢复，但本回合动作未成功发送；按未提交处理并重试本回合。",
+                        tag="GAMEROUND",
+                    )
+                    self._logger.write(
+                        "本轮等待期间存在视频流恢复，且动作未发送成功；按本回合未提交处理。",
+                        tag="GAMEROUND",
+                    )
+                    self._reset_playable_state_timers()
+                    return False
                 if not warned_continuous_playable:
-                    self._push_event("出牌后持续检测到 playable，尚未观察到中间的不可出牌阶段，判定本回合未成功提交，准备重新执行本回合。")
-                    self._logger.write("出牌后 playable 持续为 true，未先变为 false；判定为本回合未成功提交，将返回重新识别并重试本回合。")
+                    self._push_event(
+                        "出牌后持续检测到 playable，尚未观察到中间的不可出牌阶段，判定本回合未成功提交，准备重新执行本回合。",
+                        tag="GAMEROUND",
+                    )
+                    self._logger.write(
+                        "出牌后 playable 持续为 true，未先变为 false；判定为本回合未成功提交，将返回重新识别并重试本回合。",
+                        tag="GAMEROUND",
+                    )
                     warned_continuous_playable = True
                     self._reset_playable_state_timers()
                     return False
             else:
                 if not seen_non_playable:
-                    self._push_event("出牌后已观察到 playable=false，开始等待下一回合重新出现 playable。")
+                    self._push_event("出牌后已观察到 playable=false，开始等待下一回合重新出现 playable。", tag="GAMEROUND")
                 seen_non_playable = True
             self._check_playable_state_timeout(is_playable, "wait_next_turn_playable")
             time.sleep(max(0.1, self.config.playable_poll_seconds))
@@ -2704,7 +2737,7 @@ class AutoControllerRuntime:
             self._pause_started_ts = time.monotonic()
             self._paused.set()
             self._set_status(status="paused")
-            self._push_event("paused_by_user")
+            self._push_event("paused_by_user", tag="USER")
 
     def resume(self) -> None:
         if self._paused.is_set():
@@ -2723,7 +2756,8 @@ class AutoControllerRuntime:
             self._force_wait_a_reactivation = True
             self._set_status(status="running")
             self._push_event(
-                f"resumed_by_user，已重新进入按 A 等待与 playable 检测状态。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。"
+                f"resumed_by_user，已重新进入按 A 等待与 playable 检测状态。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。",
+                tag="USER",
             )
 
     def restart_battle_waiting(self) -> None:
@@ -2764,18 +2798,19 @@ class AutoControllerRuntime:
             last_error="",
         )
         self._push_event(
-            f"manual_battle_restart，已清空本局进行中状态并重新进入按 A 等待 playable。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。"
+            f"manual_battle_restart，已清空本局进行中状态并重新进入按 A 等待 playable。暂停时长 {paused_for:.1f}s 已从超时计时中扣除。",
+            tag="USER",
         )
-        self._logger.write("用户触发重开当前对局：已清空本局进行中状态，重新进入按 A 等待 playable 阶段。")
+        self._logger.write("用户触发重开当前对局：已清空本局进行中状态，重新进入按 A 等待 playable 阶段。", tag="USER")
 
     def surrender_and_restart_waiting(self) -> None:
         if not self._battle_started:
             self.restart_battle_waiting()
-            self._push_event("当前不在对局内，已直接重置到按 A 等待 playable 状态。")
+            self._push_event("当前不在对局内，已直接重置到按 A 等待 playable 状态。", tag="USER")
             return
         self._manual_surrender_requested.set()
-        self._push_event("已请求手动投降并重开：等待当前手柄动作完成后，将执行投降并返回初始等待状态。")
-        self._logger.write("用户触发手动投降并重开：当前手柄动作结束后，将跳出对局状态机并执行投降。")
+        self._push_event("已请求手动投降并重开：等待当前手柄动作完成后，将执行投降并返回初始等待状态。", tag="USER")
+        self._logger.write("用户触发手动投降并重开：当前手柄动作结束后，将跳出对局状态机并执行投降。", tag="USER")
 
     def adjust_turn_index(self, delta: int) -> None:
         if delta == 0:
@@ -2783,17 +2818,17 @@ class AutoControllerRuntime:
         old_turn = int(self.turn_index)
         new_turn = max(1, min(int(self.config.max_turns), old_turn + int(delta)))
         if new_turn == old_turn:
-            self._push_event(f"turn_adjust_ignored current={old_turn} delta={delta}")
+            self._push_event(f"turn_adjust_ignored current={old_turn} delta={delta}", tag="USER")
             return
         self.turn_index = new_turn
         self._set_status(turn=self.turn_index)
-        self._push_event(f"turn_adjusted {old_turn}->{new_turn}")
-        self._logger.write(f"用户手动调整当前回合：从第 {old_turn} 回合改为第 {new_turn} 回合。")
+        self._push_event(f"turn_adjusted {old_turn}->{new_turn}", tag="USER")
+        self._logger.write(f"用户手动调整当前回合：从第 {old_turn} 回合改为第 {new_turn} 回合。", tag="USER")
 
-    def request_stop(self, reason: str) -> None:
+    def request_stop(self, reason: str, tag: str = "SYSTEM") -> None:
         self._stop_requested.set()
         self._set_status(status="stopping", last_error=reason)
-        self._push_event(reason)
+        self._push_event(reason, tag=tag)
 
     def _current_serial_port_labels(self) -> List[str]:
         return list_serial_port_labels()
@@ -2828,8 +2863,8 @@ class AutoControllerRuntime:
                 pass
         labels = self._current_serial_port_labels()
         if not labels:
-            self._logger.write("switch_link 串口检查失败：当前没有可用串口，程序即将退出。")
-            self._push_event("switch_link_unavailable_exit")
+            self._logger.write("switch_link 串口检查失败：当前没有可用串口，程序即将退出。", tag="CONTROLLER_ERROR")
+            self._push_event("switch_link_unavailable_exit", tag="CONTROLLER_ERROR")
             self._set_status(last_error="NO_AVAILABLE_SWITCH_LINK_PORT", phase="error")
             raise RuntimeError("NO_AVAILABLE_SWITCH_LINK_PORT")
         next_port = ""
@@ -2839,8 +2874,11 @@ class AutoControllerRuntime:
                 next_port = candidate
                 break
         if not next_port:
-            self._logger.write("switch_link 串口检查失败：检测到串口存在，但没有可握手的虚拟手柄串口，程序即将退出。")
-            self._push_event("switch_link_unavailable_exit")
+            self._logger.write(
+                "switch_link 串口检查失败：检测到串口存在，但没有可握手的虚拟手柄串口，程序即将退出。",
+                tag="CONTROLLER_ERROR",
+            )
+            self._push_event("switch_link_unavailable_exit", tag="CONTROLLER_ERROR")
             self._set_status(last_error="NO_AVAILABLE_SWITCH_LINK_PORT", phase="error")
             raise RuntimeError("NO_AVAILABLE_SWITCH_LINK_PORT")
         with contextlib.suppress(Exception):
@@ -2850,8 +2888,8 @@ class AutoControllerRuntime:
         self.config.serial_port = next_port
         self.config.pick_serial = False
         self._set_status(serial_port=self.serial_port)
-        self._logger.write(f"检测到原 switch_link 串口不可用，已自动切换到当前可用串口：{next_port}。")
-        self._push_event(f"switch_link_reconnected:{next_port}")
+        self._logger.write(f"检测到原 switch_link 串口不可用，已自动切换到当前可用串口：{next_port}。", tag="CONTROLLER")
+        self._push_event(f"switch_link_reconnected:{next_port}", tag="CONTROLLER")
         return True
 
     def _run_controller_with_reconnect(self, action: Callable[[], None], *, context: str) -> None:
@@ -2859,23 +2897,23 @@ class AutoControllerRuntime:
             action()
             return
         except Exception as exc:
-            self._logger.write(f"{context} 发送失败，开始检查 switch_link 串口状态。error={exc}")
+            self._logger.write(f"{context} 发送失败，开始检查 switch_link 串口状态。error={exc}", tag="CONTROLLER_ERROR")
         reconnected = self._reconnect_controller_if_needed()
         if reconnected:
-            self._logger.write(f"switch_link 串口已恢复，重试发送：{context}")
+            self._logger.write(f"switch_link 串口已恢复，重试发送：{context}", tag="CONTROLLER")
         else:
-            self._logger.write(f"switch_link 串口表面可用，重试发送：{context}")
+            self._logger.write(f"switch_link 串口表面可用，重试发送：{context}", tag="CONTROLLER")
         try:
             action()
         except Exception as exc:
-            self._logger.write(f"{context} 重试后仍失败：{exc}")
+            self._logger.write(f"{context} 重试后仍失败：{exc}", tag="CONTROLLER_ERROR")
             raise RuntimeError("SWITCH_LINK_UNAVAILABLE_EXIT")
 
     def send_manual_controller_input(self, token: str, hold_ms: int = 50, gap_ms: int = 100) -> None:
         token_upper = str(token).upper()
         if token_upper in {"PLUS", "HOME"}:
             self.controller.send_smart_sequence_csv_blocking(f"{token_upper},1", timeout_seconds=2.0)
-            self._push_event(f"manual_controller_input:{token}")
+            self._push_event(f"manual_controller_input:{token}", tag="USER")
             return
         special_timing = {
             "L": (80, 120),
@@ -2906,20 +2944,20 @@ class AutoControllerRuntime:
         self.controller.run_steps(
             [RemoteStep(bits=(1 << bit_index), hold_ms=press_ms, gap_ms=release_gap_ms)]
         )
-        self._push_event(f"manual_controller_input:{token}")
+        self._push_event(f"manual_controller_input:{token}", tag="USER")
 
-    def _press_home_and_stop(self, reason: str) -> None:
+    def _press_home_and_stop(self, reason: str, tag: str = "SYSTEM") -> None:
         self._set_status(phase="stopping", last_error=reason)
-        self._push_event(reason)
+        self._push_event(reason, tag=tag)
         self.controller.send_smart_sequence_csv_blocking("HOME,1", timeout_seconds=2.0)
         time.sleep(0.3)
-        self.request_stop(reason)
+        self.request_stop(reason, tag=tag)
 
     def _prompt_next_target_after_goal_reached(self) -> bool:
         reached = int(self.win_count)
         should_restart_ui = False
-        self._logger.write(f"已达成本次目标胜场：{reached}。等待用户选择是否继续对战。")
-        self._push_event(f"已达成目标胜场 {reached}。等待用户选择是否继续。")
+        self._logger.write(f"已达成本次目标胜场：{reached}。等待用户选择是否继续对战。", tag="SYSTEM")
+        self._push_event(f"已达成目标胜场 {reached}。等待用户选择是否继续。", tag="SYSTEM")
         self._set_status(status="paused", phase="target_reached", last_error="", wins=reached)
         self._debug_ui.stop()
         try:
@@ -2929,7 +2967,7 @@ class AutoControllerRuntime:
                 footer="",
             )
             if choice != "继续对战":
-                self._logger.write(f"用户选择结束本次自动对战。已达成胜场：{reached}。")
+                self._logger.write(f"用户选择结束本次自动对战。已达成胜场：{reached}。", tag="USER")
                 self._set_status(status="stopped", phase="stopped")
                 return False
 
@@ -2943,8 +2981,8 @@ class AutoControllerRuntime:
                     )
                     self.config.continuous_run = original_continuous_run
                     self.config.target_win_count = original_target_win_count
-                    self._logger.write("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。")
-                    self._push_event("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。")
+                    self._logger.write("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。", tag="USER")
+                    self._push_event("用户未输入新的目标胜场，已恢复为配置文件中的原始运行模式。", tag="USER")
                     self._set_status(status="running", phase="idle", last_error="")
                     should_restart_ui = True
                     return True
@@ -2958,17 +2996,19 @@ class AutoControllerRuntime:
                     continue
                 if value == 0:
                     self.config.continuous_run = True
-                    self._logger.write(f"用户选择继续对战，并切换为无限循环模式。当前累计胜场={reached}。")
-                    self._push_event("用户选择继续对战，后续改为无限循环。")
+                    self._logger.write(f"用户选择继续对战，并切换为无限循环模式。当前累计胜场={reached}。", tag="USER")
+                    self._push_event("用户选择继续对战，后续改为无限循环。", tag="USER")
                 else:
                     self.config.continuous_run = False
                     self.config.target_win_count = reached + value
                     self._logger.write(
                         f"用户选择继续对战，并设置新的目标：还需再赢 {value} 局；"
-                        f"新的累计停止胜场={self.config.target_win_count}。"
+                        f"新的累计停止胜场={self.config.target_win_count}。",
+                        tag="USER",
                     )
                     self._push_event(
-                        f"用户选择继续对战，新的目标为再赢 {value} 局（累计 {self.config.target_win_count} 胜停止）。"
+                        f"用户选择继续对战，新的目标为再赢 {value} 局（累计 {self.config.target_win_count} 胜停止）。",
+                        tag="USER",
                     )
                 self._set_status(status="running", phase="idle", last_error="")
                 should_restart_ui = True
@@ -2978,7 +3018,7 @@ class AutoControllerRuntime:
                 self._debug_ui.start()
 
     def _run_surrender_sequence(self) -> None:
-        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 0.5 秒，最后按 A。")
+        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 0.5 秒，最后按 A。", tag="CONTROLLER")
         self._run_controller_with_reconnect(
             lambda: self.controller.send_smart_sequence_csv_blocking("PLUS,1", timeout_seconds=2.0),
             context="投降序列:PLUS",
@@ -2995,7 +3035,7 @@ class AutoControllerRuntime:
         )
 
     def _run_resume_reactivation_sequence(self) -> None:
-        self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。")
+        self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。", tag="CONTROLLER")
         for idx in range(3):
             self.controller.run_steps([RemoteStep(bits=(1 << BIT_R), hold_ms=50, gap_ms=100)])
             if idx < 2:
@@ -3022,8 +3062,8 @@ class AutoControllerRuntime:
         if not self._pending_result_check:
             return
         self._set_pending_result_check(False, f"finalize_previous_battle_as_not_win:{reason}")
-        self._push_event(reason)
-        self._logger.write("上一局在重新进入可出牌前未检测到明确 win/lose/draw 标志，按结果不确定处理。")
+        self._push_event(reason, tag="GAMEROUND")
+        self._logger.write("上一局在重新进入可出牌前未检测到明确 win/lose/draw 标志，按结果不确定处理。", tag="GAMEROUND")
         self._finalize_battle_replay("uncertain", None)
         self._current_battle_map_name = ""
         self._current_battle_stats_recorded = False
@@ -3041,14 +3081,14 @@ class AutoControllerRuntime:
             settlement_map_state = self._analyze_settlement_result(frame)
             if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
                 p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
-                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}", tag="GAMEROUND")
             self._set_pending_result_check(False, "settlement_detected_lose_banner")
             self.win_count += 1
             stats_map_name = self._stats_map_name()
             if stats_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate":
                 self._increment_stats("Wins", 1, stats_map_name)
             self._set_status(wins=self.win_count)
-            self._push_event(f"battle_result=win total_wins={self.win_count}")
+            self._push_event(f"battle_result=win total_wins={self.win_count}", tag="GAMEROUND")
             self._mark_progress("检测到敌方战败标志，本局记为胜利。")
             self._finalize_battle_replay("win", "P1", settlement_map_state=settlement_map_state)
             self._reset_after_battle_resolution("win")
@@ -3059,9 +3099,9 @@ class AutoControllerRuntime:
             settlement_map_state = self._analyze_settlement_result(frame)
             if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
                 p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
-                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}", tag="GAMEROUND")
             self._set_pending_result_check(False, "settlement_detected_win_banner")
-            self._push_event("battle_result=lose")
+            self._push_event("battle_result=lose", tag="GAMEROUND")
             self._mark_progress("检测到我方战败标志，本局记为战败。")
             self._finalize_battle_replay("lose", "P2", settlement_map_state=settlement_map_state)
             self._reset_after_battle_resolution("lose")
@@ -3070,9 +3110,9 @@ class AutoControllerRuntime:
             settlement_map_state = self._analyze_settlement_result(frame)
             if isinstance(settlement_map_state, dict) and isinstance(settlement_map_state.get("map_grid"), list):
                 p1_score, p2_score = _compute_board_scores_from_grid(settlement_map_state["map_grid"])
-                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}")
+                self._logger.write(f"结算比分：{_format_score_broadcast(p1_score, p2_score)}", tag="GAMEROUND")
             self._set_pending_result_check(False, "settlement_detected_draw_banner")
-            self._push_event("battle_result=draw")
+            self._push_event("battle_result=draw", tag="GAMEROUND")
             self._mark_progress("检测到平局标志，本局记为平局。")
             self._finalize_battle_replay("draw", "draw", settlement_map_state=settlement_map_state)
             self._reset_after_battle_resolution("draw")
@@ -3102,7 +3142,10 @@ class AutoControllerRuntime:
 
     def wait_until_playable(self) -> Dict[str, Any]:
         self._set_status(phase="waiting_playable", playable=False)
-        self._push_event("开始等待进入可出牌状态。每次按 A 前都会先检查当前帧，避免在已可出牌时误按 A 选中第一张卡。")
+        self._push_event(
+            "开始等待进入可出牌状态。每次按 A 前都会先检查当前帧，避免在已可出牌时误按 A 选中第一张卡。",
+            tag="GAMEROUND",
+        )
         self._mark_progress("进入等待可出牌阶段。")
         self._reset_playable_state_timers()
         wait_a_step = [RemoteStep(bits=(1 << BIT_A), hold_ms=self.config.wait_press_hold_ms, gap_ms=0)]
@@ -3130,12 +3173,15 @@ class AutoControllerRuntime:
             if is_playable:
                 if self._pending_result_check:
                     self._set_pending_result_check(False, "playable_detected_before_settlement_resolved")
-                    self._push_event("battle_result_unresolved_on_playable")
-                    self._logger.write("已重新进入可出牌状态，但上一局未检测到明确 win/lose/draw 标志；不按 playable 推断胜负，本局结果记为 uncertain。")
+                    self._push_event("battle_result_unresolved_on_playable", tag="GAMEROUND")
+                    self._logger.write(
+                        "已重新进入可出牌状态，但上一局未检测到明确 win/lose/draw 标志；不按 playable 推断胜负，本局结果记为 uncertain。",
+                        tag="GAMEROUND",
+                    )
                     self._finalize_battle_replay("uncertain", None)
                     self._reset_after_battle_resolution("uncertain")
-                    self._push_event("上一局结果未解析，已清除旧地图上下文，下一局将重新检测地图。")
-                self._push_event("playable_detected")
+                    self._push_event("上一局结果未解析，已清除旧地图上下文，下一局将重新检测地图。", tag="GAMEROUND")
+                self._push_event("playable_detected", tag="VISION")
                 self._mark_progress("检测到可出牌状态，停止继续按 A。")
                 self._wait_a_enabled = False
                 self._wait_silent_logged = False
@@ -3153,7 +3199,7 @@ class AutoControllerRuntime:
                     next_wait_a_ts = now + max(0.1, self.config.wait_press_gap_ms / 1000.0)
             else:
                 if not self._wait_silent_logged:
-                    self._push_event("当前未进入可出牌状态，但已进入静默等待阶段，本轮不再自动按 A。")
+                    self._push_event("当前未进入可出牌状态，但已进入静默等待阶段，本轮不再自动按 A。", tag="GAMEROUND")
                     self._wait_silent_logged = True
             time.sleep(max(0.05, self.config.playable_poll_seconds))
 
@@ -3169,7 +3215,7 @@ class AutoControllerRuntime:
             self._battle_started = True
             self._mark_progress("新对局开始。")
             self._set_status(phase="battle_started", turn=1, battles=self.battle_count)
-            self._push_event("battle_started")
+            self._push_event("battle_started", tag="GAMEROUND")
             while self.turn_index <= self.config.max_turns:
                 self._wait_if_paused()
                 self._ensure_not_stopped()
@@ -3185,8 +3231,8 @@ class AutoControllerRuntime:
                 p1_score_now, p2_score_now = _compute_board_scores_from_grid(state.map_grid)
                 self._logger.write(
                     f"第 {self.turn_index} 回合识别完成：地图={state.map_name}({state.map_id})，手牌={state.hand_card_numbers}，SP={state.p1_sp}。"
-                )
-                self._logger.write(f"第 {self.turn_index} 回合{_format_score_broadcast(p1_score_now, p2_score_now)}")
+                , tag="VISION")
+                self._logger.write(f"第 {self.turn_index} 回合{_format_score_broadcast(p1_score_now, p2_score_now)}", tag="GAMEROUND")
                 self._set_status(
                     phase="planning_action",
                     turn=self.turn_index,
@@ -3206,45 +3252,57 @@ class AutoControllerRuntime:
                     f"xy=({action.x},{action.y}) pass={action.pass_turn} sp={action.use_sp_attack} surrender={action.surrender}"
                 )
                 self._set_status(last_action=action_text)
-                self._push_event(f"action_turn_{self.turn_index}: {action_text}")
-                self._logger.write(f"第 {self.turn_index} 回合采用策略 {resolved_strategy.label}，来源={resolved_strategy.source}，动作={action_text}。")
+                self._push_event(f"action_turn_{self.turn_index}: {action_text}", tag="STRATEGY")
+                self._logger.write(
+                    f"第 {self.turn_index} 回合采用策略 {resolved_strategy.label}，来源={resolved_strategy.source}，动作={action_text}。",
+                    tag="STRATEGY",
+                )
                 self._battle_replay.record_turn(state, action)
                 self._set_status(phase="executing_action")
+                action_sent_successfully = False
                 try:
                     self._execute_battle_action(action, observed_state)
+                    action_sent_successfully = True
                 except Exception:
-                    self._logger.write("当前出牌 RemoteStep 序列执行异常，开始检查 switch_link 串口状态。")
+                    self._logger.write("当前出牌序列发送异常，开始检查 switch_link 串口状态，并保留在当前回合重试。", tag="CONTROLLER_ERROR")
                     reconnected = self._reconnect_controller_if_needed()
                     if reconnected:
-                        self._logger.write("switch_link 串口已恢复，准备重新回到等待阶段。")
+                        self._logger.write("switch_link 串口已恢复，当前回合将重新识别并重试。", tag="CONTROLLER")
                     else:
-                        self._logger.write("switch_link 串口检查正常，不做额外处理，准备回到等待阶段。")
-                    self._battle_started = False
-                    self._set_pending_result_check(False, "battle_action_sequence_error")
-                    self.vision.reset_battle_context()
-                    raise RuntimeError("BATTLE_ACTION_SEQUENCE_ABORTED")
+                        self._logger.write("switch_link 串口检查正常，当前回合将重新识别并重试。", tag="CONTROLLER")
+                    self._battle_replay.discard_last_move()
+                    self._set_status(phase="retrying_turn", last_error="ACTION_SEND_FAILED_RETRY_TURN")
+                    self._push_event(f"第 {self.turn_index} 回合动作发送失败，保留在当前回合并重试。", tag="CONTROLLER_ERROR")
+                    time.sleep(max(0.1, self.config.playable_poll_seconds))
+                    continue
                 self.vision.remember_executed_specials(action)
                 if self.turn_index < self.config.max_turns:
-                    committed = self._wait_for_next_turn_playable()
+                    committed = self._wait_for_next_turn_playable(action_sent_successfully=action_sent_successfully)
                     if not committed:
                         self._battle_replay.discard_last_move()
                         self._set_status(phase="retrying_turn", last_error="ACTION_NOT_COMMITTED_RETRY_TURN")
-                        self._push_event(f"第 {self.turn_index} 回合未成功提交，准备重新识别并重试本回合。")
-                        self._logger.write(f"第 {self.turn_index} 回合动作未成功提交，本回合不推进，重新识别当前局面后重试。")
+                        self._push_event(f"第 {self.turn_index} 回合未成功提交，准备重新识别并重试本回合。", tag="GAMEROUND")
+                        self._logger.write(
+                            f"第 {self.turn_index} 回合动作未成功提交，本回合不推进，重新识别当前局面后重试。",
+                            tag="GAMEROUND",
+                        )
                         time.sleep(max(0.1, self.config.playable_poll_seconds))
                         continue
                 self.turn_index += 1
                 self._mark_progress(f"已完成一次动作执行，进入回合索引 {self.turn_index}。")
                 self._set_status(phase="turn_complete", turn=min(self.turn_index, self.config.max_turns))
                 time.sleep(max(0.1, self.config.playable_poll_seconds))
-            self._push_event("battle_complete")
+            self._push_event("battle_complete", tag="GAMEROUND")
             self._set_pending_result_check(True, "battle_complete_after_turn_12")
             self._battle_started = False
             self._wait_a_enabled = True
             self._wait_silent_logged = False
-            self._logger.write(f"12 回合结束，进入结算检查阶段。当前累计局数={self.battle_count}，累计胜场={self.win_count}。")
+            self._logger.write(
+                f"12 回合结束，进入结算检查阶段。当前累计局数={self.battle_count}，累计胜场={self.win_count}。",
+                tag="GAMEROUND",
+            )
             self._set_status(phase="battle_complete", battles=self.battle_count)
-            self._push_event("结算阶段冷却：固定等待 7 秒，结束后再重启按 A 与 playable 检测。")
+            self._push_event("结算阶段冷却：固定等待 7 秒，结束后再重启按 A 与 playable 检测。", tag="GAMEROUND")
             self._sleep_with_pause(7.0)
         except TargetWinGoalReached:
             raise
@@ -3252,12 +3310,12 @@ class AutoControllerRuntime:
             if str(exc) == "MANUAL_BATTLE_RESTART":
                 self._restart_battle_requested.clear()
                 self._set_status(phase="waiting_playable", last_error="")
-                self._push_event("已中断当前局内状态机，重新回到新的按 A 等待 playable 状态。")
+                self._push_event("已中断当前局内状态机，重新回到新的按 A 等待 playable 状态。", tag="USER")
                 return
             if str(exc) == "MANUAL_BATTLE_SURRENDER_RESTART":
                 self._manual_surrender_requested.clear()
                 self._set_status(phase="manual_surrender_restarting", last_error="")
-                self._push_event("已中断当前局内状态机，准备执行手动投降并重新开始。")
+                self._push_event("已中断当前局内状态机，准备执行手动投降并重新开始。", tag="USER")
                 self._run_surrender_sequence()
                 self._set_pending_result_check(False, "manual_surrender_restart")
                 self._finalize_battle_replay("timeout_surrender", None)
@@ -3265,15 +3323,15 @@ class AutoControllerRuntime:
                 return
             if str(exc) in {"NO_AVAILABLE_SWITCH_LINK_PORT", "SWITCH_LINK_UNAVAILABLE_EXIT"}:
                 self._set_status(phase="error", last_error=str(exc), status="stopping")
-                self._push_event("程序已安全退出：switch_link 串口不可用或无法恢复，请检查 CP2104/串口连接后重新启动。")
-                self._logger.write("switch_link 串口不可用，已安全退出。")
-                self.request_stop("switch_link_unavailable_exit")
+                self._push_event("程序已安全退出：switch_link 串口不可用或无法恢复，请检查 CP2104/串口连接后重新启动。", tag="CONTROLLER_ERROR")
+                self._logger.write("switch_link 串口不可用，已安全退出。", tag="CONTROLLER_ERROR")
+                self.request_stop("switch_link_unavailable_exit", tag="CONTROLLER_ERROR")
                 return
             if "recovery window" in str(exc) and "Capture frame" in str(exc):
                 self._set_status(phase="error", last_error=str(exc), status="stopping")
-                self._push_event(f"视频流在恢复窗口内未能恢复，程序安全退出：{exc}")
-                self._logger.write(f"视频流恢复失败，已达到恢复窗口上限，准备安全退出：{exc}")
-                self.request_stop("capture_frame_unavailable_exit")
+                self._push_event(f"视频流在恢复窗口内未能恢复，程序安全退出：{exc}", tag="VISION_ERROR")
+                self._logger.write(f"视频流恢复失败，已达到恢复窗口上限，准备安全退出：{exc}", tag="VISION_ERROR")
+                self.request_stop("capture_frame_unavailable_exit", tag="VISION_ERROR")
                 return
             if str(exc) in {
                 "BATTLE_PROGRESS_TIMEOUT_SURRENDER",
@@ -3283,25 +3341,25 @@ class AutoControllerRuntime:
                     self._current_battle_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate"
                 ):
                     self._increment_stats("Errors", 1, self._current_battle_map_name)
-                    self._logger.write("本局超时投降，已计入错误统计。")
+                    self._logger.write("本局超时投降，已计入错误统计。", tag="STATISTIC")
                 self._finalize_battle_replay("timeout_surrender", None)
                 self._set_pending_result_check(False, f"runtime_error:{exc}")
                 self._set_status(phase="battle_timeout_restarting", last_error=str(exc))
-                self._push_event("对局因长时间无推进而投降，已重置状态，准备重新从等待阶段开始。")
+                self._push_event("对局因长时间无推进而投降，已重置状态，准备重新从等待阶段开始。", tag="TIMEOUT")
                 self._reset_after_battle_resolution("timeout_surrender")
                 return
             if str(exc) == "BATTLE_ACTION_SEQUENCE_ABORTED":
                 self._set_status(phase="battle_action_aborted", last_error=str(exc))
-                self._push_event("当前出牌序列已中止，已重置状态并重新回到等待阶段。")
+                self._push_event("当前出牌序列已中止，已重置状态并重新回到等待阶段。", tag="CONTROLLER_ERROR")
                 self._reset_after_battle_resolution("battle_action_sequence_aborted")
                 return
             self._set_status(last_error=str(exc), phase="error")
-            self._push_event(f"error: {exc}")
+            self._push_event(f"error: {exc}", tag="SYSTEM")
             raise
         except Exception as exc:
             self._finalize_battle_replay("error", None)
             self._set_status(last_error=str(exc), phase="error")
-            self._push_event(f"error: {exc}")
+            self._push_event(f"error: {exc}", tag="SYSTEM")
             raise
 
     def run_forever(self) -> None:
@@ -3318,9 +3376,9 @@ class AutoControllerRuntime:
             with self._status_lock:
                 last_error = str(self._status.get("last_error", "") or "")
             if last_error == "capture_frame_unavailable_exit":
-                self._push_event("程序已安全退出：视频流在恢复窗口内未能恢复，请检查采集卡/代理/VPN 状态后重新启动。")
+                self._push_event("程序已安全退出：视频流在恢复窗口内未能恢复，请检查采集卡/代理/VPN 状态后重新启动。", tag="VISION_ERROR")
             else:
-                self._push_event("runtime_stopped")
+                self._push_event("runtime_stopped", tag="SYSTEM")
             self._set_status(status="stopped", phase="stopped")
 
 
@@ -3379,6 +3437,7 @@ class _FrameVisionPipeline:
         self.last_analysis_path = ""
         self._playable_shot_index = 0
         self._settlement_shot_index = 0
+        self._capture_recovery_success_count = 0
 
     def close(self) -> None:
         self._capture.stop()
@@ -3414,6 +3473,8 @@ class _FrameVisionPipeline:
                     self._on_capture_recovery_event(
                         f"{description} 已恢复成功（此前失败 {failed_rounds} 轮，重启预览 {restart_count} 次）。"
                     )
+                if failed_rounds > 0:
+                    self._capture_recovery_success_count += 1
                 return result
             except Exception as exc:
                 last_error = str(exc)
@@ -3485,6 +3546,10 @@ class _FrameVisionPipeline:
             return frame
 
         return self.run_frame_api_operation(_op, "Capture frame")
+
+    @property
+    def capture_recovery_success_count(self) -> int:
+        return int(self._capture_recovery_success_count)
 
     def _save_debug_snapshot(self, frame, payload: Dict[str, Any]) -> None:
         if not self._config.save_debug_frames:

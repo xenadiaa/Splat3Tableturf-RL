@@ -649,10 +649,9 @@ def main() -> int:
         timeout_seconds=args.probe_seconds,
     )
     if cap is None or active_profile is None or first_frame is None or not actual_device_name:
-        cfg["device_name"] = "invalid"
         cfg["pick_device"] = False
         _save_config(cfg_path, cfg)
-        print(f"Config updated: device_name=invalid ({cfg_path})")
+        print(f"Config preserved: device_name={cfg.get('device_name', '')} ({cfg_path})")
         print(f"Unable to open preview stream. last_error={error}")
         return 1
 
@@ -759,11 +758,10 @@ def main() -> int:
                     or not next_actual_device_name
                 ):
                     print(f"[reselect] failed: {reopen_error}")
-                    cfg["device_name"] = "invalid"
                     cfg["pick_device"] = False
                     _save_config(cfg_path, cfg)
-                    print(f"[reselect] config kept invalid: {cfg_path}")
-                    print("[reselect] exiting preview because device_name is invalid")
+                    print(f"[reselect] config preserved: device_name={cfg.get('device_name', '')} ({cfg_path})")
+                    print("[reselect] exiting preview because selected device could not be opened")
                     break
 
                 cap = next_cap

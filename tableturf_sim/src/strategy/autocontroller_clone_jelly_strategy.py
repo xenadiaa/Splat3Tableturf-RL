@@ -20,9 +20,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from src.assets.tableturf_types import Map_PointBit, Map_PointMask
 from src.engine.env_core import _card_cells_on_map, _find_card_in_hand
+from src.engine.loaders import load_map
 from src.utils.common_utils import create_card_from_id, validate_place_card_action
 
 STRATEGY_LABEL = "AutoController Clone Jelly"
+PREDICT_FINISHER_CARD_ID = 73  # SpMultiMissile
+LEAST_REPLACE_TO_WIN = 120
+LAST_TURN_EXPAND_TURF = 9
 
 
 def _payload_to_card(state, player: str, payload: Dict[str, object]):
@@ -80,6 +84,10 @@ def _finisher_card(state, player: str):
         if int(card.CardPoint) == 12:
             return card
     return None
+
+
+def _predict_finisher_card():
+    return create_card_from_id(PREDICT_FINISHER_CARD_ID)
 
 
 def _project_score_swing(state, player: str, payload: Dict[str, object]) -> float:
@@ -159,19 +167,28 @@ def _build_special_delta(state, player: str, payload: Dict[str, object]) -> int:
 
 
 def _home_anchor(state, player: str) -> Tuple[float, float]:
-    valid_cells: List[Tuple[int, int]] = []
-    for y in range(state.map.height):
-        for x in range(state.map.width):
-            m = int(state.map.get_point(x, y))
-            if (m & int(Map_PointBit.IsValid)) != 0:
-                valid_cells.append((x, y))
-    if not valid_cells:
+    if str(state.map.map_id) == "Rectangle":
+        return (4.0, 22.0)
+    try:
+        base_map = load_map(state.map.map_id)
+    except Exception:
+        base_map = state.map
+    own_bit, _opp_bit = _owner_bits(player)
+    own_special_cells: List[Tuple[int, int]] = []
+    for y in range(base_map.height):
+        for x in range(base_map.width):
+            m = int(base_map.get_point(x, y))
+            if (m & own_bit) != 0 and (m & int(Map_PointBit.IsSp)) != 0:
+                own_special_cells.append((x, y))
+    if not own_special_cells:
         return 0.0, 0.0
-    target_y = max(y for _x, y in valid_cells) if player == "P1" else min(y for _x, y in valid_cells)
-    xs = [x for x, y in valid_cells if y == target_y]
-    if not xs:
-        return 0.0, float(target_y)
-    return sum(xs) / len(xs), float(target_y)
+    if str(base_map.map_id) == "ManyHole":
+        own_special_cells.sort(key=lambda p: (p[0], -p[1]))
+        x, y = own_special_cells[0]
+        return float(x), float(y)
+    own_special_cells.sort(key=lambda p: (p[0], p[1]), reverse=True)
+    x, y = own_special_cells[0]
+    return float(x), float(y)
 
 
 def _rotation_penalty(payload: Dict[str, object]) -> int:
@@ -303,53 +320,6 @@ def _max_finisher_special_score(game_map, finisher_card, player: str) -> Optiona
     return best
 
 
-def _max_finisher_enemy_cover(game_map, finisher_card, player: str) -> int:
-    best = 0
-    is_p1 = player == "P1"
-    for rotation in (0, 1, 2, 3):
-        for y in range(game_map.height):
-            for x in range(game_map.width):
-                ok, _reason, _cells = validate_place_card_action(
-                    card=finisher_card,
-                    game_map=game_map,
-                    anchor_x=x,
-                    anchor_y=y,
-                    rotation=rotation,
-                    is_p1=is_p1,
-                    use_sp_attack=True,
-                )
-                if not ok:
-                    continue
-                covered = _finisher_enemy_cover_count(game_map, finisher_card, player, x, y, rotation)
-                if covered > best:
-                    best = covered
-    return best
-
-
-def _finisher_full_cover_placements(game_map, finisher_card, player: str) -> List[Tuple[int, int, int]]:
-    placements: List[Tuple[int, int, int]] = []
-    is_p1 = player == "P1"
-    target_cover = int(finisher_card.CardPoint)
-    for rotation in (0, 1, 2, 3):
-        for y in range(game_map.height):
-            for x in range(game_map.width):
-                ok, _reason, _cells = validate_place_card_action(
-                    card=finisher_card,
-                    game_map=game_map,
-                    anchor_x=x,
-                    anchor_y=y,
-                    rotation=rotation,
-                    is_p1=is_p1,
-                    use_sp_attack=True,
-                )
-                if not ok:
-                    continue
-                covered = _finisher_enemy_cover_count(game_map, finisher_card, player, x, y, rotation)
-                if covered >= target_cover:
-                    placements.append((x, y, rotation))
-    return placements
-
-
 def _future_finisher_priority(
     payload: Dict[str, object],
     current_finisher_score: Optional[int],
@@ -365,28 +335,10 @@ def _future_finisher_priority(
     return 0
 
 
-def _filter_non_final_sp_actions(
-    state,
-    player: str,
-    actions: List[dict],
-    *,
-    finisher_card,
-    current_finisher_enemy_cover: int,
-) -> List[dict]:
-    protected: List[dict] = []
-    for action in actions:
-        cost = _card_sp_cost(state, player, action)
-        if cost > state.players[player].sp:
-            continue
-        if (state.players[player].sp - cost) < 3:
-            continue
-        if finisher_card is not None:
-            preview_map = _apply_action_to_map(state, player, action)
-            future_enemy_cover = _max_finisher_enemy_cover(preview_map, finisher_card, player)
-            if future_enemy_cover < current_finisher_enemy_cover:
-                continue
-        protected.append(action)
-    return protected
+def _max_predict_score(game_map, player: str) -> int:
+    finisher_card = _predict_finisher_card()
+    score = _max_finisher_special_score(game_map, finisher_card, player)
+    return int(score) if score is not None else 0
 
 
 def choose_action(state, player: str, legal_actions: List[dict], context: Dict[str, object]) -> Dict[str, object]:
@@ -397,6 +349,7 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
     turns_left = max(1, int(state.max_turns) - int(state.turn) + 1)
     finishers = set(_finisher_card_numbers(state, player))
     finisher_card = _finisher_card(state, player)
+    predict_finisher_card = _predict_finisher_card()
     finisher_in_hand = {c.Number for c in ps.hand if c.Number in finishers}
 
     non_pass = [a for a in legal_actions if not bool(a.get("pass_turn", False))]
@@ -443,13 +396,11 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
 
     current_finisher_score: Optional[int] = None
     future_finisher_scores: Dict[Tuple[object, ...], Optional[int]] = {}
-    current_finisher_enemy_cover = 0
     if finisher_card is not None and ps.sp >= 3 and state.turn < state.max_turns:
-        current_finisher_score = _max_finisher_special_score(state.map, finisher_card, player)
-        current_finisher_enemy_cover = _max_finisher_enemy_cover(state.map, finisher_card, player)
+        current_finisher_score = _max_predict_score(state.map, player)
         for action in normal:
             preview_map = _apply_normal_action_to_map(state, player, action)
-            future_finisher_scores[_action_key(action)] = _max_finisher_special_score(preview_map, finisher_card, player)
+            future_finisher_scores[_action_key(action)] = _max_predict_score(preview_map, player)
 
         if current_finisher_score is not None:
             preserved_normal: List[dict] = []
@@ -461,31 +412,32 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
                 normal = preserved_normal
 
     # Spend excess SP on small cards if we are already above the finisher threshold.
-    if ps.sp > 3:
+    if ps.sp > 3 and (current_finisher_score or 0) < LEAST_REPLACE_TO_WIN:
         extra_sp = [
             a for a in sp_actions
-            if _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
+            if _card_sp_cost(state, player, a) <= ps.sp
+            and _card_point(state, player, a) <= (4 if ps.sp >= 5 else 3)
         ]
-        protected_sp = _filter_non_final_sp_actions(
-            state,
-            player,
-            extra_sp,
-            finisher_card=finisher_card,
-            current_finisher_enemy_cover=current_finisher_enemy_cover,
-        )
-        profitable_sp = [a for a in protected_sp if _project_score_swing(state, player, a) > _card_point(state, player, a)]
+        profitable_sp = []
+        for action in extra_sp:
+            preview_map = _apply_action_to_map(state, player, action)
+            score = _cover_enemy_turf_score(state.map, preview_map, player)
+            if score > int(_card_point(state, player, action)):
+                profitable_sp.append(action)
         if profitable_sp:
             return _best_by_score(
                 profitable_sp,
                 lambda a: (
-                    _project_score_swing(state, player, a),
+                    _cover_enemy_turf_score(state.map, _apply_action_to_map(state, player, a), player),
                     -_card_sp_cost(state, player, a),
                     _card_point(state, player, a),
                 ),
             )
 
-    # First 4 turns: extend toward the opponent with small cards.
-    if turns_left >= 9 and normal:
+    # Match BrianUuu's phase split:
+    # - turns_left >= 9: ExpandTurf
+    # - turns_left < 9: BuildSpecial, unless late-game LeastMoves condition applies
+    if turns_left >= LAST_TURN_EXPAND_TURF and normal:
         return _best_by_score(
             normal,
             lambda a: (
@@ -496,44 +448,34 @@ def choose_action(state, player: str, legal_actions: List[dict], context: Dict[s
             ),
         )
 
-    # Mid game before 3 SP: build special as aggressively as possible.
-    if normal and ps.sp < 3:
+    if normal and ((turns_left == 2 or (current_finisher_score or 0) >= LEAST_REPLACE_TO_WIN) and ps.sp >= 3):
+        return _best_by_score(
+            normal,
+            lambda a: (
+                _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
+                _least_moves_score(state, player, a),
+                _card_point(state, player, a),
+            ),
+        )
+
+    # Otherwise, build special like BrianUuu's helper.
+    if normal:
         return _best_by_score(
             normal,
             lambda a: (
                 _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
                 _build_special_delta(state, player, a),
                 _build_special_score(state, player, a),
-                _expand_turf_score(state, player, a),
                 _card_point(state, player, a),
             ),
         )
 
-    # Late game with finisher ready: keep expanding while preferring easy placements.
-    if normal:
-        return _best_by_score(
-            normal,
-            lambda a: (
-                _future_finisher_priority(a, current_finisher_score, future_finisher_scores),
-                _expand_turf_score(state, player, a),
-                _least_moves_score(state, player, a),
-                _build_special_delta(state, player, a),
-                _card_point(state, player, a),
-            ),
-        )
-
-    usable_sp = _filter_non_final_sp_actions(
-        state,
-        player,
-        sp_actions,
-        finisher_card=finisher_card,
-        current_finisher_enemy_cover=current_finisher_enemy_cover,
-    )
+    usable_sp = [a for a in sp_actions if _card_sp_cost(state, player, a) <= ps.sp]
     if usable_sp:
         return _best_by_score(
             usable_sp,
             lambda a: (
-                _project_score_swing(state, player, a),
+                _cover_enemy_turf_score(state.map, _apply_action_to_map(state, player, a), player),
                 -_card_sp_cost(state, player, a),
                 _card_point(state, player, a),
             ),
