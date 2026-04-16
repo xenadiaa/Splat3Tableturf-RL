@@ -2408,6 +2408,7 @@ class AutoControllerRuntime:
         self._battle_started = False
         self._current_battle_map_name = ""
         self._current_battle_stats_recorded = False
+        self._turn_progress_failure_streak = 0
         self._last_progress_ts = time.monotonic()
         self._playable_seen_since: Optional[float] = None
         self._non_playable_seen_since: Optional[float] = None
@@ -2420,6 +2421,8 @@ class AutoControllerRuntime:
         self._stop_requested = threading.Event()
         self._restart_battle_requested = threading.Event()
         self._manual_surrender_requested = threading.Event()
+        self._manual_surrender_trigger_after_ts: Optional[float] = None
+        self._manual_surrender_wait_logged = False
         self._status_lock = threading.Lock()
         self._status: Dict[str, Any] = {
             "status": "initializing",
@@ -2485,6 +2488,19 @@ class AutoControllerRuntime:
         self._last_progress_ts = time.monotonic()
         self._logger.write(f"进度推进：{reason}", tag="GAMEROUND")
 
+    def _reset_turn_progress_failure_streak(self, reason: str = "") -> None:
+        previous = int(getattr(self, "_turn_progress_failure_streak", 0))
+        self._turn_progress_failure_streak = 0
+        if previous > 0 and reason:
+            self._logger.write(f"回合推进失败累计已清零（此前连续失败 {previous} 次）：{reason}", tag="GAMEROUND")
+
+    def _record_turn_progress_failure(self, reason: str) -> bool:
+        self._turn_progress_failure_streak = int(getattr(self, "_turn_progress_failure_streak", 0)) + 1
+        count = self._turn_progress_failure_streak
+        self._push_event(f"回合推进失败累计：{count}/3。原因：{reason}", tag="TIMEOUT")
+        self._logger.write(f"回合推进失败累计 {count}/3。原因：{reason}", tag="TIMEOUT")
+        return count >= 3
+
     def _suspend_timeout_accumulation(self, seconds: float, reason: str = "") -> None:
         delta = max(0.0, float(seconds))
         if delta <= 0.0:
@@ -2521,6 +2537,7 @@ class AutoControllerRuntime:
     def _reset_after_battle_resolution(self, reason: str) -> None:
         self._mark_progress(f"battle_reset:{reason}")
         self._battle_started = False
+        self._reset_turn_progress_failure_streak("battle_reset")
         self.turn_index = 1
         self._wait_a_enabled = True
         self._wait_silent_logged = False
@@ -2762,6 +2779,9 @@ class AutoControllerRuntime:
 
     def restart_battle_waiting(self) -> None:
         self._restart_battle_requested.set()
+        self._manual_surrender_requested.clear()
+        self._manual_surrender_trigger_after_ts = None
+        self._manual_surrender_wait_logged = False
         paused_for = 0.0
         if self._paused.is_set():
             if self._pause_started_ts is not None:
@@ -2808,9 +2828,34 @@ class AutoControllerRuntime:
             self.restart_battle_waiting()
             self._push_event("当前不在对局内，已直接重置到按 A 等待 playable 状态。", tag="USER")
             return
+        self._restart_battle_requested.set()
         self._manual_surrender_requested.set()
-        self._push_event("已请求手动投降并重开：等待当前手柄动作完成后，将执行投降并返回初始等待状态。", tag="USER")
-        self._logger.write("用户触发手动投降并重开：当前手柄动作结束后，将跳出对局状态机并执行投降。", tag="USER")
+        delay_seconds = 15.0
+        self._manual_surrender_trigger_after_ts = time.monotonic() + delay_seconds
+        self._manual_surrender_wait_logged = False
+        self._push_event(
+            f"已请求手动投降并重开：先等待 {int(delay_seconds)} 秒让当前动作收尾，再执行投降并重置到初始等待状态。",
+            tag="USER",
+        )
+        self._logger.write(
+            f"用户触发手动投降并重开：已设置 {int(delay_seconds)} 秒缓冲，缓冲结束后执行投降并重置到按 A 等待 playable。",
+            tag="USER",
+        )
+
+    def _execute_manual_surrender_restart(self) -> None:
+        self._manual_surrender_requested.clear()
+        self._manual_surrender_trigger_after_ts = None
+        self._manual_surrender_wait_logged = False
+        self._restart_battle_requested.clear()
+        self._set_status(phase="manual_surrender_restarting", last_error="")
+        self._push_event("已中断当前局内状态机，准备执行手动投降并重新开始。", tag="USER")
+        had_pending_result = bool(self._pending_result_check)
+        with contextlib.suppress(Exception):
+            self._run_surrender_sequence()
+        self._set_pending_result_check(False, "manual_surrender_restart")
+        if self._battle_started or had_pending_result:
+            self._finalize_battle_replay("timeout_surrender", None)
+        self._reset_after_battle_resolution("manual_surrender_restart")
 
     def adjust_turn_index(self, delta: int) -> None:
         if delta == 0:
@@ -3018,7 +3063,7 @@ class AutoControllerRuntime:
                 self._debug_ui.start()
 
     def _run_surrender_sequence(self) -> None:
-        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 0.5 秒，最后按 A。", tag="CONTROLLER")
+        self._push_event("执行投降：按手柄 +，等待 2 秒，再按右，等待 0.5 秒，按 A；再等待 2 秒后再按一次 A，最后等待 5 秒。", tag="CONTROLLER")
         self._run_controller_with_reconnect(
             lambda: self.controller.send_smart_sequence_csv_blocking("PLUS,1", timeout_seconds=2.0),
             context="投降序列:PLUS",
@@ -3033,6 +3078,13 @@ class AutoControllerRuntime:
             lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_A), hold_ms=120, gap_ms=0)]),
             context="投降序列:A",
         )
+        time.sleep(2.0)
+        self._run_controller_with_reconnect(
+            lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_A), hold_ms=120, gap_ms=0)]),
+            context="投降序列:A_2nd",
+        )
+        self._push_event("投降序列完成，冷却等待 5 秒后再继续后续检测。", tag="GAMEROUND")
+        self._sleep_with_pause(5.0)
 
     def _run_resume_reactivation_sequence(self) -> None:
         self._push_event("恢复后执行手柄 R x3，每次间隔 1 秒，然后回到按 A 等待与 playable 检测。", tag="CONTROLLER")
@@ -3135,10 +3187,13 @@ class AutoControllerRuntime:
     def _ensure_not_stopped(self) -> None:
         if self._stop_requested.is_set():
             raise KeyboardInterrupt("stop requested")
+        if self._manual_surrender_requested.is_set():
+            trigger_ts = self._manual_surrender_trigger_after_ts
+            if trigger_ts is None or time.monotonic() >= trigger_ts:
+                raise RuntimeError("MANUAL_BATTLE_SURRENDER_RESTART")
+            raise RuntimeError("MANUAL_BATTLE_SURRENDER_WAIT")
         if self._restart_battle_requested.is_set():
             raise RuntimeError("MANUAL_BATTLE_RESTART")
-        if self._manual_surrender_requested.is_set():
-            raise RuntimeError("MANUAL_BATTLE_SURRENDER_RESTART")
 
     def wait_until_playable(self) -> Dict[str, Any]:
         self._set_status(phase="waiting_playable", playable=False)
@@ -3205,6 +3260,7 @@ class AutoControllerRuntime:
 
     def play_one_battle(self) -> None:
         self.turn_index = 1
+        self._reset_turn_progress_failure_streak("new_battle")
         try:
             self.wait_until_playable()
             self._current_battle_map_name = ""
@@ -3273,6 +3329,15 @@ class AutoControllerRuntime:
                     self._battle_replay.discard_last_move()
                     self._set_status(phase="retrying_turn", last_error="ACTION_SEND_FAILED_RETRY_TURN")
                     self._push_event(f"第 {self.turn_index} 回合动作发送失败，保留在当前回合并重试。", tag="CONTROLLER_ERROR")
+                    if self._record_turn_progress_failure("action_send_failed"):
+                        self._push_event("连续 3 次回合推进失败，触发投降并重开。", tag="TIMEOUT")
+                        self._logger.write("连续 3 次回合推进失败（动作发送失败/未提交），执行投降并重开。", tag="TIMEOUT")
+                        self._run_surrender_sequence()
+                        self._battle_started = False
+                        self._set_pending_result_check(False, "turn_progress_failure_streak_surrender")
+                        self.vision.reset_battle_context()
+                        self._reset_playable_state_timers()
+                        raise RuntimeError("TURN_PROGRESS_FAILURE_STREAK_SURRENDER")
                     time.sleep(max(0.1, self.config.playable_poll_seconds))
                     continue
                 self.vision.remember_executed_specials(action)
@@ -3286,8 +3351,18 @@ class AutoControllerRuntime:
                             f"第 {self.turn_index} 回合动作未成功提交，本回合不推进，重新识别当前局面后重试。",
                             tag="GAMEROUND",
                         )
+                        if self._record_turn_progress_failure("action_not_committed"):
+                            self._push_event("连续 3 次回合推进失败，触发投降并重开。", tag="TIMEOUT")
+                            self._logger.write("连续 3 次回合推进失败（动作发送失败/未提交），执行投降并重开。", tag="TIMEOUT")
+                            self._run_surrender_sequence()
+                            self._battle_started = False
+                            self._set_pending_result_check(False, "turn_progress_failure_streak_surrender")
+                            self.vision.reset_battle_context()
+                            self._reset_playable_state_timers()
+                            raise RuntimeError("TURN_PROGRESS_FAILURE_STREAK_SURRENDER")
                         time.sleep(max(0.1, self.config.playable_poll_seconds))
                         continue
+                self._reset_turn_progress_failure_streak("turn_advanced")
                 self.turn_index += 1
                 self._mark_progress(f"已完成一次动作执行，进入回合索引 {self.turn_index}。")
                 self._set_status(phase="turn_complete", turn=min(self.turn_index, self.config.max_turns))
@@ -3312,14 +3387,24 @@ class AutoControllerRuntime:
                 self._set_status(phase="waiting_playable", last_error="")
                 self._push_event("已中断当前局内状态机，重新回到新的按 A 等待 playable 状态。", tag="USER")
                 return
+            if str(exc) == "MANUAL_BATTLE_SURRENDER_WAIT":
+                remaining = max(
+                    0.0,
+                    float(self._manual_surrender_trigger_after_ts or time.monotonic()) - time.monotonic(),
+                )
+                self._set_status(phase="manual_surrender_waiting", last_error="")
+                if not self._manual_surrender_wait_logged:
+                    self._push_event(
+                        f"手动投降缓冲中：等待 {remaining:.1f}s 后执行投降。缓冲期间暂停 playable 检测与对局主流程。",
+                        tag="USER",
+                    )
+                    self._manual_surrender_wait_logged = True
+                if remaining > 0.0:
+                    time.sleep(remaining)
+                self._execute_manual_surrender_restart()
+                return
             if str(exc) == "MANUAL_BATTLE_SURRENDER_RESTART":
-                self._manual_surrender_requested.clear()
-                self._set_status(phase="manual_surrender_restarting", last_error="")
-                self._push_event("已中断当前局内状态机，准备执行手动投降并重新开始。", tag="USER")
-                self._run_surrender_sequence()
-                self._set_pending_result_check(False, "manual_surrender_restart")
-                self._finalize_battle_replay("timeout_surrender", None)
-                self._reset_after_battle_resolution("manual_surrender_restart")
+                self._execute_manual_surrender_restart()
                 return
             if str(exc) in {"NO_AVAILABLE_SWITCH_LINK_PORT", "SWITCH_LINK_UNAVAILABLE_EXIT"}:
                 self._set_status(phase="error", last_error=str(exc), status="stopping")
@@ -3336,6 +3421,7 @@ class AutoControllerRuntime:
             if str(exc) in {
                 "BATTLE_PROGRESS_TIMEOUT_SURRENDER",
                 "WAIT_PLAYABLE_TIMEOUT_SURRENDER",
+                "TURN_PROGRESS_FAILURE_STREAK_SURRENDER",
             }:
                 if self._current_battle_stats_recorded and (
                     self._current_battle_map_name or str(self.config.stats_mode or "").strip().lower() == "aggregate"

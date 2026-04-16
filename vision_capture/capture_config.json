@@ -12,7 +12,7 @@
   "out_dir": "vision_capture/debug",
   "prefix": "capture",
   "audio_device": "none",
-  "auto_device": true,
+  "auto_device": false,
   "pick_audio": false,
   "prefer_usb_only": true,
   "width": 1920,
