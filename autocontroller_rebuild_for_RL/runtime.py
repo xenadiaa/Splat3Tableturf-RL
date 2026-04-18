@@ -3241,6 +3241,11 @@ class AutoControllerRuntime:
                 self._wait_a_enabled = False
                 self._wait_silent_logged = False
                 self._reset_playable_state_timers()
+                with contextlib.suppress(Exception):
+                    self._run_controller_with_reconnect(
+                        lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_B), hold_ms=50, gap_ms=0)]),
+                        context="playable_detected_post_disable_a:B",
+                    )
                 return playable_result
             self._check_playable_state_timeout(False, "wait_until_playable")
             if self._wait_a_enabled:
@@ -3251,7 +3256,7 @@ class AutoControllerRuntime:
                 now = time.monotonic()
                 if now >= next_wait_a_ts:
                     self.controller.run_steps(wait_a_step)
-                    next_wait_a_ts = now + max(0.1, self.config.wait_press_gap_ms / 1000.0)
+                    next_wait_a_ts = now + max(0.1, self.config.wait_press_gap_ms / 1000.0) + 0.1
             else:
                 if not self._wait_silent_logged:
                     self._push_event("当前未进入可出牌状态，但已进入静默等待阶段，本轮不再自动按 A。", tag="GAMEROUND")
