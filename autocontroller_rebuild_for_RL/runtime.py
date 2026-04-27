@@ -3246,6 +3246,7 @@ class AutoControllerRuntime:
                         lambda: self.controller.run_steps([RemoteStep(bits=(1 << BIT_B), hold_ms=50, gap_ms=0)]),
                         context="playable_detected_post_disable_a:B",
                     )
+                self._sleep_with_pause(0.5)
                 return playable_result
             self._check_playable_state_timeout(False, "wait_until_playable")
             if self._wait_a_enabled:
