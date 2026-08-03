@@ -39,6 +39,12 @@ conda install -c conda-forge ffmpeg
 .venv/bin/python autocontroller_rebuild_for_RL/main.py --config autocontroller_rebuild_for_RL/runtime_config.local.json --tmp_win_target
 ```
 
+智能宏手柄（沿用宏手柄控制，并增加视频状态判断与转移）：
+
+```bash
+.venv/bin/python autocontroller_rebuild_for_RL/smart_macro_gamepad.py
+```
+
 克隆水母对战：
 
 ```bash

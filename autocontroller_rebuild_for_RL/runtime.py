@@ -35,7 +35,22 @@ if str(TABLETURF_SIM_ROOT) not in sys.path:
 from src.assets.tableturf_types import Map_PointBit, Map_PointMask
 from switch_connect.ui.terminal_select import choose_with_arrows
 from switch_connect.virtual_gamepad.device_discovery import list_serial_port_labels, parse_device_from_label
-from switch_connect.virtual_gamepad.input_mapper import BIT_A, BIT_DPAD_DOWN, BIT_DPAD_LEFT, BIT_DPAD_RIGHT, BIT_DPAD_UP, BIT_X, BIT_Y, RemoteStep
+from switch_connect.virtual_gamepad.input_mapper import (
+    BIT_A,
+    BIT_B,
+    BIT_DPAD_DOWN,
+    BIT_DPAD_LEFT,
+    BIT_DPAD_RIGHT,
+    BIT_DPAD_UP,
+    BIT_HOME,
+    BIT_L,
+    BIT_PLUS,
+    BIT_R,
+    BIT_X,
+    BIT_Y,
+    REMOTE_INPUT_BITS,
+    RemoteStep,
+)
 from switch_connect.virtual_gamepad.serial_controller import SerialRemoteController
 from tableturf_vision.hand_card_detector import SLOT_NAMES as HAND_CARD_SLOT_NAMES, detect_hand_cards
 from tableturf_vision.map_state_detector import MapStateTracker, detect_map_state, detect_map_state_from_frames
@@ -1179,13 +1194,6 @@ class ASpamWorker:
 
 def _press_button(steps: List[RemoteStep], bit_index: int, hold_ms: int = 50, gap_ms: int = 100) -> None:
     steps.append(RemoteStep(bits=(1 << bit_index), hold_ms=hold_ms, gap_ms=gap_ms))
-
-
-BIT_PLUS = 9
-BIT_HOME = 12
-BIT_B = 1
-BIT_L = 4
-BIT_R = 5
 
 
 def _move_axis(steps: List[RemoteStep], dx: int, dy: int, move_hold_ms: int = 50) -> None:
@@ -2969,20 +2977,23 @@ class AutoControllerRuntime:
         else:
             press_ms = max(20, int(hold_ms))
             release_gap_ms = max(40, int(gap_ms))
-        bit_map = {
-            "A": BIT_A,
-            "B": BIT_B,
-            "X": BIT_X,
-            "Y": BIT_Y,
-            "L": BIT_L,
-            "R": BIT_R,
-            "PLUS": BIT_PLUS,
-            "HOME": BIT_HOME,
-            "DUP": BIT_DPAD_UP,
-            "DDOWN": BIT_DPAD_DOWN,
-            "DLEFT": BIT_DPAD_LEFT,
-            "DRIGHT": BIT_DPAD_RIGHT,
-        }
+        bit_map = dict(REMOTE_INPUT_BITS)
+        bit_map.update(
+            {
+                "LUP": REMOTE_INPUT_BITS["LSTICK_UP"],
+                "LDOWN": REMOTE_INPUT_BITS["LSTICK_DOWN"],
+                "LLEFT": REMOTE_INPUT_BITS["LSTICK_LEFT"],
+                "LRIGHT": REMOTE_INPUT_BITS["LSTICK_RIGHT"],
+                "RUP": REMOTE_INPUT_BITS["RSTICK_UP"],
+                "RDOWN": REMOTE_INPUT_BITS["RSTICK_DOWN"],
+                "RLEFT": REMOTE_INPUT_BITS["RSTICK_LEFT"],
+                "RRIGHT": REMOTE_INPUT_BITS["RSTICK_RIGHT"],
+                "DUP": REMOTE_INPUT_BITS["DPAD_UP"],
+                "DDOWN": REMOTE_INPUT_BITS["DPAD_DOWN"],
+                "DLEFT": REMOTE_INPUT_BITS["DPAD_LEFT"],
+                "DRIGHT": REMOTE_INPUT_BITS["DPAD_RIGHT"],
+            }
+        )
         bit_index = bit_map.get(token_upper)
         if bit_index is None:
             raise ValueError(f"unsupported manual controller token: {token}")

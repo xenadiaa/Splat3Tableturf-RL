@@ -1,0 +1,13 @@
+Net,From,To,Constraint
+SW_USB_DP,J1.D+,U3.DP_IN,USB 90-ohm differential pair
+SW_USB_DM,J1.D-,U3.DM_IN,USB 90-ohm differential pair
+SW_MCU_DP,U3.DP_OUT,R1 then U1.USB_DP,Keep short and matched
+SW_MCU_DM,U3.DM_OUT,R2 then U1.USB_DM,Keep short and matched
++5V_SWITCH,J1.VBUS,F1 then U1 power pins,Never connect to +5V_PC
+PC_USB_DP,J2.D+,U4.DP_IN then U2.D+,USB 90-ohm differential pair
+PC_USB_DM,J2.D-,U4.DM_IN then U2.D-,USB 90-ohm differential pair
++5V_PC,J2.VBUS,U2.REGIN and U2.VBUS,Never connect to +5V_SWITCH
+CP_VDD,U2.VDD,U2.VIO plus C12,About 3.45 V regulator output
+UART_PC_TO_MCU,U2.TXD,R21 then U1.RXD,9600 baud
+UART_MCU_TO_PC,U1.TXD,R22 then U2.RXD,Verify CP2104 RX voltage tolerance
+GND,J1/J2/U1/U2,Common ground only,Use solid ground plane

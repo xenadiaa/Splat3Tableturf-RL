@@ -1,0 +1,20 @@
+Reference,Quantity,Part,Value/Variant,Notes
+U1,1,ATmega16U2-AU,TQFP-32,AutoController Switch HID MCU
+U2,1,CP2104-F03-GM,QFN-24,PC USB-to-UART bridge
+U3 U4,2,USBLC6-2SC6,SOT-23-6,USB ESD protection
+J1 J2,2,USB Micro-B receptacle,USB2.0 device,Switch side and PC side
+J3,1,AVR ICSP header,2x3 2.54mm,Recovery/programming
+Y1,1,Crystal,16MHz,ATmega16U2 clock
+F1,1,Resettable fuse,500mA,Switch VBUS protection
+R1 R2,2,Resistor,22 ohm,Switch USB D+/D- series
+R3 R4,2,Resistor,10k,RESET and HWB pull-ups
+R5,1,Resistor,4.7k,CP2104 RST pull-up
+R21 R22,2,Resistor,1k,UART series protection
+C1 C2,2,Capacitor,22pF,Crystal load
+C3,1,Capacitor,1uF,ATmega UCAP
+C4-C9,6,Capacitor,100nF,Local decoupling
+C10 C11,2,Capacitor,4.7uF,USB-side bulk capacitors
+C12,1,Capacitor,1uF,CP2104 VDD regulator
+C13,1,Capacitor,4.7uF,CP2104 VPP programming
+SW1 SW2,2,Pushbutton,Normally open,RESET and DFU/HWB
+
