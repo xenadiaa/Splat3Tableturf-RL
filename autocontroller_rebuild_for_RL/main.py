@@ -7,7 +7,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -122,6 +122,21 @@ def _persist_runtime_serial_selection(config_path: Path, serial_port: str) -> No
     _write_json_obj(config_path, payload)
 
 
+def _persist_runtime_capture_selection(config_path: Path, device_name: str) -> None:
+    payload = _load_json_obj(config_path)
+    payload["capture_device_name"] = str(device_name or "").strip()
+    _write_json_obj(config_path, payload)
+
+
+def _resolved_runtime_config_path(config_path: str | Path) -> Optional[Path]:
+    if not config_path:
+        return None
+    resolved = Path(config_path)
+    if not resolved.is_absolute():
+        resolved = REPO_ROOT / resolved
+    return resolved
+
+
 def _serial_port_supports_switch_link(serial_port: str) -> bool:
     port = str(serial_port or "").strip()
     if not port:
@@ -168,10 +183,15 @@ def _ensure_switch_link_ready(config, config_path: str | Path = "") -> None:
             config.serial_port = configured
             config.pick_serial = False
             return
-    remaining_labels = [label for label in labels if parse_device_from_label(label) != configured]
-    usable_labels = _usable_switch_link_labels(remaining_labels, configured)
+    usable_labels = _usable_switch_link_labels(labels, configured)
     if not usable_labels:
-        raise RuntimeError("未检测到可用的 switch_link 串口，请先连接正确的 CP2104/虚拟手柄串口后再启动。")
+        if not labels:
+            raise RuntimeError("系统未枚举到任何串口，请连接运行 AutoController 兼容固件的虚拟手柄设备。")
+        detected = "; ".join(labels)
+        raise RuntimeError(
+            "检测到了串口，但没有端口通过 AutoController 固件握手。"
+            f"请检查固件、驱动、数据线和端口占用。当前串口：{detected}"
+        )
     picked = _prompt_choice(usable_labels, "选择可用的 switch_link 串口")
     if not picked:
         raise RuntimeError("未选择 switch_link 串口，启动已取消。")
@@ -184,9 +204,8 @@ def _ensure_switch_link_ready(config, config_path: str | Path = "") -> None:
         _persist_runtime_serial_selection(resolved, str(config.serial_port or "").strip())
 
 
-def _usb_capture_device_names() -> List[str]:
+def _all_video_device_names() -> List[str]:
     names = [str(name).strip() for name in list_avfoundation_video_devices()]
-    names = [name for name in names if name and is_usb_capture_device_name(name)]
     seen = set()
     out: List[str] = []
     for name in names:
@@ -197,7 +216,16 @@ def _usb_capture_device_names() -> List[str]:
     return out
 
 
-def _ensure_frame_api_capture_device_selected(config) -> None:
+def _ordered_video_device_names() -> List[str]:
+    names = _all_video_device_names()
+    return sorted(names, key=lambda name: 0 if is_usb_capture_device_name(name) else 1)
+
+
+def _usb_capture_device_names() -> List[str]:
+    return [name for name in _all_video_device_names() if is_usb_capture_device_name(name)]
+
+
+def _ensure_frame_api_capture_device_selected(config, config_path: str | Path = "") -> None:
     if not str(config.frame_api_url or "").strip():
         return
     launch_config_path = Path(config.frame_api_launch_config)
@@ -205,34 +233,42 @@ def _ensure_frame_api_capture_device_selected(config) -> None:
         launch_config_path = REPO_ROOT / launch_config_path
     launch_cfg = _load_json_obj(launch_config_path)
     configured_name = str(launch_cfg.get("device_name", "") or config.capture_device_name or "").strip()
-    available_usb = _usb_capture_device_names()
-    if configured_name and configured_name in available_usb and is_usb_capture_device_name(configured_name):
+    all_devices = _ordered_video_device_names()
+    if configured_name and configured_name in all_devices:
         return
-    if not available_usb:
-        raise RuntimeError("未检测到可用采集卡设备，已禁止回退到摄像头。")
-    picked = _prompt_choice(available_usb, "选择可用的采集卡设备")
+    if not all_devices:
+        raise RuntimeError("系统未枚举到任何视频设备，请检查采集卡连接、权限和驱动。")
+    title = (
+        f"配置的视频设备不存在（{configured_name}），请选择当前视频设备"
+        if configured_name and configured_name.lower() != "invalid"
+        else "请选择视频采集设备（疑似采集卡优先显示）"
+    )
+    picked = _prompt_choice(all_devices, title)
     if not picked:
-        raise RuntimeError("未选择采集卡设备，启动已取消。")
+        raise RuntimeError("未选择视频设备，启动已取消。")
     launch_cfg["device_name"] = picked
     launch_cfg["pick_device"] = False
-    launch_cfg["allow_non_usb"] = False
+    launch_cfg["allow_non_usb"] = not is_usb_capture_device_name(picked)
     _write_json_obj(launch_config_path, launch_cfg)
     config.capture_device_name = picked
+    resolved = _resolved_runtime_config_path(config_path)
+    if resolved is not None:
+        _persist_runtime_capture_selection(resolved, picked)
 
 
-def _ensure_vision_ready(config) -> None:
+def _ensure_vision_ready(config, config_path: str | Path = "") -> None:
     if not str(config.frame_api_url or "").strip():
         return
-    _ensure_frame_api_capture_device_selected(config)
+    _ensure_frame_api_capture_device_selected(config, config_path)
     launcher = FrameApiAutoLauncher(config)
     try:
         launcher.ensure_started()
         return
     except Exception:
-        available_usb = _usb_capture_device_names()
-        if not available_usb:
-            raise RuntimeError("采集卡启动失败，且当前没有检测到可重新选择的 USB 采集卡。")
-        picked = _prompt_choice(available_usb, "采集卡启动失败，请重新选择可用采集卡")
+        all_devices = _ordered_video_device_names()
+        if not all_devices:
+            raise RuntimeError("视频采集启动失败，且系统没有枚举到可重新选择的视频设备。")
+        picked = _prompt_choice(all_devices, "视频采集启动失败，请重新选择视频设备")
         if not picked:
             raise RuntimeError("未重新选择采集卡设备，启动已取消。")
         launch_config_path = Path(config.frame_api_launch_config)
@@ -241,9 +277,12 @@ def _ensure_vision_ready(config) -> None:
         launch_cfg = _load_json_obj(launch_config_path)
         launch_cfg["device_name"] = picked
         launch_cfg["pick_device"] = False
-        launch_cfg["allow_non_usb"] = False
+        launch_cfg["allow_non_usb"] = not is_usb_capture_device_name(picked)
         _write_json_obj(launch_config_path, launch_cfg)
         config.capture_device_name = picked
+        resolved = _resolved_runtime_config_path(config_path)
+        if resolved is not None:
+            _persist_runtime_capture_selection(resolved, picked)
         launcher = FrameApiAutoLauncher(config)
         launcher.ensure_started()
 
@@ -251,6 +290,9 @@ def _ensure_vision_ready(config) -> None:
 def main() -> int:
     args = _parse_args()
     config = load_config(args.config)
+    resolved_config_path = _resolved_runtime_config_path(args.config)
+    if resolved_config_path is not None:
+        setattr(config, "_runtime_config_path", str(resolved_config_path))
     setattr(config, "_original_continuous_run", bool(config.continuous_run))
     setattr(config, "_original_target_win_count", int(config.target_win_count))
     if args.print_config:
@@ -258,7 +300,7 @@ def main() -> int:
         return 0
 
     _ensure_switch_link_ready(config, args.config)
-    _ensure_vision_ready(config)
+    _ensure_vision_ready(config, args.config)
 
     override_target_wins = _prompt_target_wins_if_needed(args)
     if override_target_wins is not None:

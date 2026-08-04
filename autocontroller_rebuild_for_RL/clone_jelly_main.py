@@ -101,7 +101,7 @@ def main() -> int:
         return 0
 
     _ensure_switch_link_ready(config, args.config)
-    _ensure_vision_ready(config)
+    _ensure_vision_ready(config, args.config)
 
     override_target_wins = _prompt_target_wins_if_needed(args)
     if override_target_wins is not None:
