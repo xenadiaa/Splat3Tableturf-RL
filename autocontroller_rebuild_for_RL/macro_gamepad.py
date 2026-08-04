@@ -3,16 +3,21 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-import select
+import os
 import shutil
 import sys
-import termios
 import threading
 import time
-import tty
 import unicodedata
 from pathlib import Path
 from typing import Callable, Dict, List
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -49,9 +54,61 @@ from switch_connect.virtual_gamepad.serial_controller import SerialRemoteControl
 
 DEFAULT_CONFIG = "autocontroller_rebuild_for_RL/runtime_config.local.json"
 MACRO_PROFILE_NAMES = tuple(f"macro{index}" for index in range(1, 1000))
-MACRO5_PERIODIC_INTERVAL_SECONDS = 90 * 60
+AUTO_SELL_MACRO_PROFILES = frozenset(f"macro{index}" for index in range(1, 6))
+SELL_EQUIPMENT_INTERVAL_SECONDS = 90 * 60
 _TERMINAL_LOCK = threading.Lock()
 _ACTIVE_STATUS_LINE: str | None = None
+
+
+class _PauseState:
+    """Thread-safe pause clock shared by the macro and keyboard listener."""
+
+    def __init__(self) -> None:
+        self._paused = threading.Event()
+        self._resume_detection_pending = threading.Event()
+        self._lock = threading.Lock()
+        self._paused_since: float | None = None
+        self._total_paused_seconds = 0.0
+
+    def toggle(self) -> bool:
+        """Toggle pause and return True when the new state is paused."""
+        now = time.monotonic()
+        with self._lock:
+            if self._paused.is_set():
+                if self._paused_since is not None:
+                    self._total_paused_seconds += now - self._paused_since
+                self._paused_since = None
+                self._paused.clear()
+                self._resume_detection_pending.set()
+                return False
+            self._paused_since = now
+            self._paused.set()
+            return True
+
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    def consume_resume_detection(self) -> bool:
+        if not self._resume_detection_pending.is_set():
+            return False
+        self._resume_detection_pending.clear()
+        return True
+
+    def has_resume_detection(self) -> bool:
+        return self._resume_detection_pending.is_set()
+
+    def exclude_elapsed(self, seconds: float) -> None:
+        """Exclude non-macro work, such as resume detection, from active time."""
+        with self._lock:
+            self._total_paused_seconds += max(0.0, seconds)
+
+    def active_monotonic(self) -> float:
+        now = time.monotonic()
+        with self._lock:
+            paused_seconds = self._total_paused_seconds
+            if self._paused_since is not None:
+                paused_seconds += now - self._paused_since
+        return now - paused_seconds
 
 
 def _timestamped_log(message: str, *, file=None) -> None:
@@ -299,10 +356,19 @@ class _MacroContext:
         self,
         controller: SerialRemoteController,
         stop_event: threading.Event,
+        pause_state: _PauseState,
     ) -> None:
         self.controller = controller
         self.stop_event = stop_event
+        self.pause_state = pause_state
         self.status_callback: Callable[[bool], None] | None = None
+        self.auto_sell_profile_name: str | None = None
+        self.auto_sell_started_active = 0.0
+        self.next_sell_active = 0.0
+        self.last_sell_wall: float | None = None
+        self.sell_count = 0
+        self.macro_loop_count = 0
+        self.last_status_render = 0.0
         self.active_bits = 0
         self.stick_direction_mask = (
             (1 << BIT_LSTICK_UP)
@@ -314,20 +380,75 @@ class _MacroContext:
     def send_active_bits(self) -> None:
         self.controller.send_bits(self.active_bits)
 
-    def wait_ms(self, duration_ms: int) -> bool:
-        deadline = time.monotonic() + max(0, duration_ms) / 1000.0
+    def active_monotonic(self) -> float:
+        return self.pause_state.active_monotonic()
+
+    def is_paused(self) -> bool:
+        return self.pause_state.is_paused()
+
+    def _raw_wait_ms(self, duration_ms: int) -> bool:
+        """Wait during resume detection without recursively handling pause."""
+        return not self.stop_event.wait(max(0, duration_ms) / 1000.0)
+
+    def _run_resume_detection(self) -> bool:
+        detection_bit = 1 << BIT_A
+        for gap_ms in (1000, 1000, 1000, 1000, 1000, 1000, 3000):
+            self.controller.send_bits(detection_bit)
+            if not self._raw_wait_ms(50):
+                return False
+            self.controller.release()
+            if not self._raw_wait_ms(gap_ms):
+                return False
+        return True
+
+    def _service_pause(self) -> bool:
+        if not (
+            self.pause_state.is_paused()
+            or self.pause_state.has_resume_detection()
+        ):
+            return True
+
+        saved_bits = self.active_bits
+        self.controller.release()
+
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return True
+            while self.pause_state.is_paused():
+                if self.status_callback is not None:
+                    self.status_callback(False)
+                if self.stop_event.wait(0.1):
+                    return False
+
+            if self.pause_state.consume_resume_detection():
+                _timestamped_log("宏已恢复，重新执行手柄检测后继续原序列。")
+                self.active_bits = 0
+                detection_started = time.monotonic()
+                detection_completed = self._run_resume_detection()
+                self.pause_state.exclude_elapsed(time.monotonic() - detection_started)
+                if not detection_completed:
+                    return False
+                if self.pause_state.is_paused():
+                    self.controller.release()
+                    continue
+            break
+
+        self.active_bits = saved_bits
+        self.send_active_bits()
+        return True
+
+    def wait_ms(self, duration_ms: int) -> bool:
+        remaining = max(0, duration_ms) / 1000.0
+        while remaining > 0:
+            if not self._service_pause():
+                return False
             if self.status_callback is not None:
                 self.status_callback(False)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return True
-            poll_seconds = min(remaining, 0.25 if self.status_callback is not None else remaining)
+            started_wait = self.active_monotonic()
+            poll_seconds = min(remaining, 0.1)
             if self.stop_event.wait(poll_seconds):
                 return False
+            if not self.pause_state.is_paused():
+                remaining -= max(0.0, self.active_monotonic() - started_wait)
+        return self._service_pause()
 
     def set_held(self, bit_index: int, pressed: bool) -> None:
         bit = 1 << bit_index
@@ -365,6 +486,73 @@ class _MacroContext:
         self.active_bits &= ~self.stick_direction_mask
         self.send_active_bits()
 
+    @staticmethod
+    def _format_duration(total_seconds: float) -> str:
+        seconds = max(0, int(total_seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def enable_auto_sell(self, profile_name: str) -> None:
+        self.auto_sell_profile_name = profile_name
+        self.auto_sell_started_active = self.active_monotonic()
+        self.next_sell_active = (
+            self.auto_sell_started_active + SELL_EQUIPMENT_INTERVAL_SECONDS
+        )
+        self.status_callback = self.render_auto_sell_status
+        self.render_auto_sell_status(force=True)
+
+    def render_auto_sell_status(self, force: bool = False) -> None:
+        if self.auto_sell_profile_name is None or not sys.stdout.isatty():
+            return
+        now_wall = time.monotonic()
+        if not force and now_wall - self.last_status_render < 1.0:
+            return
+        self.last_status_render = now_wall
+        now_active = self.active_monotonic()
+        last_text = (
+            time.strftime("%m-%d %H:%M:%S", time.localtime(self.last_sell_wall))
+            if self.last_sell_wall is not None
+            else "尚未执行"
+        )
+        status = (
+            f"宏 {self.auto_sell_profile_name}"
+            f"｜状态 {'暂停' if self.is_paused() else '运行'}"
+            f"｜已运行 {self._format_duration(now_active - self.auto_sell_started_active)}"
+            f"｜宏循环次数 {self.macro_loop_count}"
+            f"｜上次卖装 {last_text}"
+            f"｜卖装次数 {self.sell_count}"
+            f"｜下次卖装 {self._format_duration(self.next_sell_active - now_active)}"
+        )
+        columns = shutil.get_terminal_size(fallback=(120, 24)).columns
+        _set_status_line(_fit_terminal_line(status, columns))
+
+    def run_auto_sell_if_due(self) -> bool:
+        if self.auto_sell_profile_name is None:
+            return True
+        now_active = self.active_monotonic()
+        if now_active < self.next_sell_active:
+            return True
+        _timestamped_log(
+            f"{self.auto_sell_profile_name}：已到 90 分钟定时点，"
+            f"开始第 {self.sell_count + 1} 次卖装序列。"
+        )
+        if not _run_sell_equipment_sequence(self):
+            return False
+        now_active = self.active_monotonic()
+        while self.next_sell_active <= now_active:
+            self.next_sell_active += SELL_EQUIPMENT_INTERVAL_SECONDS
+        self.sell_count += 1
+        self.last_sell_wall = time.time()
+        self.render_auto_sell_status(force=True)
+        return True
+
+    def complete_macro_loop(self) -> None:
+        if self.auto_sell_profile_name is None:
+            return
+        self.macro_loop_count += 1
+        self.render_auto_sell_status(force=True)
+
 
 def _run_controller_detection(context: _MacroContext) -> bool:
     """Run the common controller detection sequence exactly once."""
@@ -377,6 +565,8 @@ def _run_controller_detection(context: _MacroContext) -> bool:
 def _run_macro_1_loop(context: _MacroContext) -> None:
     """宏1：三配件为 L 跃升、R 冲刺、A 黏索。"""
     while not context.stop_event.is_set():
+        if not context.run_auto_sell_if_due():
+            return
         # 进入地图。
         for bit_index, gap_ms in (
             (BIT_X, 500),
@@ -437,11 +627,14 @@ def _run_macro_1_loop(context: _MacroContext) -> None:
         for _ in range(7):
             if not context.tap(BIT_A, hold_ms=50, gap_ms=1500):
                 return
+        context.complete_macro_loop()
 
 
 def _run_macro_2_loop(context: _MacroContext) -> None:
     """宏2（速刷）：L 跃升、R 黏索、A 风扇；风扇收集蛋。"""
     while not context.stop_event.is_set():
+        if not context.run_auto_sell_if_due():
+            return
         # 进入地图。
         for bit_index, gap_ms in (
             (BIT_X, 500),
@@ -505,11 +698,14 @@ def _run_macro_2_loop(context: _MacroContext) -> None:
         for gap_ms in (1500, 1500, 1500, 1500, 1500, 500):
             if not context.tap(BIT_A, hold_ms=50, gap_ms=gap_ms):
                 return
+        context.complete_macro_loop()
 
 
 def _run_macro_3_loop(context: _MacroContext) -> None:
     """宏3（力量）：L 任意、R 砸地、A 卫星；卫星收集蛋。"""
     while not context.stop_event.is_set():
+        if not context.run_auto_sell_if_due():
+            return
         # 进入地图。
         for bit_index, gap_ms in (
             (BIT_X, 500),
@@ -604,11 +800,14 @@ def _run_macro_3_loop(context: _MacroContext) -> None:
         for _ in range(6):
             if not context.tap(BIT_A, hold_ms=50, gap_ms=1500):
                 return
+        context.complete_macro_loop()
 
 
 def _run_macro_4_loop(context: _MacroContext) -> None:
     """宏4（技术）：L 砸地、R 风扇、A 任意；手动收集蛋。"""
     while not context.stop_event.is_set():
+        if not context.run_auto_sell_if_due():
+            return
         # 进入地图。
         for bit_index, gap_ms in (
             (BIT_X, 500),
@@ -730,10 +929,11 @@ def _run_macro_4_loop(context: _MacroContext) -> None:
         for _ in range(6):
             if not context.tap(BIT_A, hold_ms=50, gap_ms=1500):
                 return
+        context.complete_macro_loop()
 
 
-def _run_macro_5_periodic_sequence(context: _MacroContext) -> bool:
-    """Run the macro5 sell-equipment sequence once before a new map round."""
+def _run_sell_equipment_sequence(context: _MacroContext) -> bool:
+    """Run the common sell-equipment sequence before a new map round."""
     for bit_index, gap_ms in (
         (BIT_X, 500),
         (BIT_DPAD_UP, 500),
@@ -764,62 +964,9 @@ def _run_macro_5_periodic_sequence(context: _MacroContext) -> bool:
 
 def _run_macro_5_loop(context: _MacroContext) -> None:
     """宏5（打怪）：天妇罗巢穴长蓝自动。"""
-    started_monotonic = time.monotonic()
-    next_periodic_at = started_monotonic + MACRO5_PERIODIC_INTERVAL_SECONDS
-    last_periodic_wall: float | None = None
-    periodic_count = 0
-    macro_loop_count = 0
-    last_status_render = 0.0
-
-    def format_duration(total_seconds: float) -> str:
-        seconds = max(0, int(total_seconds))
-        hours, remainder = divmod(seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-    def render_status(force: bool = False) -> None:
-        nonlocal last_status_render
-        if not sys.stdout.isatty():
-            return
-        now_monotonic = time.monotonic()
-        if not force and now_monotonic - last_status_render < 1.0:
-            return
-        last_status_render = now_monotonic
-        last_text = (
-            time.strftime("%m-%d %H:%M:%S", time.localtime(last_periodic_wall))
-            if last_periodic_wall is not None
-            else "尚未执行"
-        )
-        status = (
-            f"宏 macro5"
-            f"｜已运行 {format_duration(now_monotonic - started_monotonic)}"
-            f"｜宏循环次数 {macro_loop_count}"
-            f"｜上次卖装 {last_text}"
-            f"｜卖装次数 {periodic_count}"
-            f"｜下次卖装 {format_duration(next_periodic_at - now_monotonic)}"
-        )
-        columns = shutil.get_terminal_size(fallback=(120, 24)).columns
-        status = _fit_terminal_line(status, columns)
-        _set_status_line(status)
-
-    context.status_callback = render_status
-    render_status(force=True)
-
     while not context.stop_event.is_set():
-        # 定时卖装不打断当前轮；到期后在下一轮进入地图前执行一次。
-        now = time.monotonic()
-        if now >= next_periodic_at:
-            _timestamped_log(
-                f"macro5：已到 90 分钟定时点，开始第 {periodic_count + 1} 次卖装序列。"
-            )
-            if not _run_macro_5_periodic_sequence(context):
-                return
-            now = time.monotonic()
-            while next_periodic_at <= now:
-                next_periodic_at += MACRO5_PERIODIC_INTERVAL_SECONDS
-            periodic_count += 1
-            last_periodic_wall = time.time()
-            render_status(force=True)
+        if not context.run_auto_sell_if_due():
+            return
 
         # 进入地图。
         for bit_index, gap_ms in (
@@ -856,8 +1003,7 @@ def _run_macro_5_loop(context: _MacroContext) -> None:
         for gap_ms in (1500, 1500, 1500, 1500, 1500, 500):
             if not context.tap(BIT_A, hold_ms=50, gap_ms=gap_ms):
                 return
-        macro_loop_count += 1
-        render_status(force=True)
+        context.complete_macro_loop()
 
 
 def _run_macro_6_once(context: _MacroContext) -> None:
@@ -946,18 +1092,21 @@ def _run_macro_profile(
     profile_name: str,
     controller: SerialRemoteController,
     stop_event: threading.Event,
+    pause_state: _PauseState,
     worker_errors: List[BaseException],
 ) -> None:
-    context = _MacroContext(controller, stop_event)
+    context = _MacroContext(controller, stop_event, pause_state)
     try:
         if not _run_controller_detection(context):
             return
+        if profile_name in AUTO_SELL_MACRO_PROFILES:
+            context.enable_auto_sell(profile_name)
         MACRO_PROFILES[profile_name](context)
     except BaseException as exc:
         worker_errors.append(exc)
         stop_event.set()
     finally:
-        if profile_name == "macro5" and context.status_callback is not None:
+        if context.status_callback is not None:
             context.status_callback(True)
             context.status_callback = None
             _commit_status_line()
@@ -965,26 +1114,53 @@ def _run_macro_profile(
 
 def _listen_for_quit(
     stop_event: threading.Event,
+    pause_state: _PauseState,
     worker_errors: List[BaseException],
 ) -> None:
     if not sys.stdin.isatty():
         stop_event.wait()
         return
 
-    input_fd = sys.stdin.fileno()
-    previous_terminal_mode = termios.tcgetattr(input_fd)
+    def handle_key(key: str) -> bool:
+        normalized = key.lower()
+        if normalized == "q":
+            stop_event.set()
+            return False
+        if normalized == "p":
+            paused = pause_state.toggle()
+            if paused:
+                _timestamped_log("宏已暂停；按键、摇杆和定时器均已冻结。再次按 P 恢复。")
+            else:
+                _timestamped_log("收到恢复指令，准备重新执行手柄检测。")
+        return True
+
     try:
-        tty.setcbreak(input_fd)
-        while not stop_event.is_set():
-            readable, _, _ = select.select([input_fd], [], [], 0.1)
-            if readable and sys.stdin.read(1).lower() == "q":
-                stop_event.set()
-                return
+        if os.name == "nt":
+            while not stop_event.is_set():
+                if not msvcrt.kbhit():
+                    stop_event.wait(0.05)
+                    continue
+                key = msvcrt.getwch()
+                if key in {"\x00", "\xe0"}:
+                    msvcrt.getwch()
+                    continue
+                if not handle_key(key):
+                    return
+            return
+
+        input_fd = sys.stdin.fileno()
+        previous_terminal_mode = termios.tcgetattr(input_fd)
+        try:
+            tty.setcbreak(input_fd)
+            while not stop_event.is_set():
+                readable, _, _ = select.select([input_fd], [], [], 0.1)
+                if readable and not handle_key(sys.stdin.read(1)):
+                    return
+        finally:
+            termios.tcsetattr(input_fd, termios.TCSADRAIN, previous_terminal_mode)
     except BaseException as exc:
         worker_errors.append(exc)
         stop_event.set()
-    finally:
-        termios.tcsetattr(input_fd, termios.TCSADRAIN, previous_terminal_mode)
 
 
 def run_macro_forever(controller: SerialRemoteController, macro_profile: str = "macro1") -> None:
@@ -993,17 +1169,18 @@ def run_macro_forever(controller: SerialRemoteController, macro_profile: str = "
         raise ValueError(f"未知宏配置：{macro_profile}")
 
     stop_event = threading.Event()
+    pause_state = _PauseState()
     worker_errors: List[BaseException] = []
     workers = [
         threading.Thread(
             target=_run_macro_profile,
-            args=(macro_profile, controller, stop_event, worker_errors),
+            args=(macro_profile, controller, stop_event, pause_state, worker_errors),
             name=f"{macro_profile}-sequence-worker",
             daemon=True,
         ),
         threading.Thread(
             target=_listen_for_quit,
-            args=(stop_event, worker_errors),
+            args=(stop_event, pause_state, worker_errors),
             name="macro-quit-listener",
             daemon=True,
         ),
@@ -1052,7 +1229,7 @@ def main() -> int:
             _timestamped_log(
                 f"宏手柄已启动：{selected_port}，当前配置：{args.macro}。"
                 f"先执行一次手柄检测，{loop_description}；"
-                "按 Q 或 Ctrl+C 退出。"
+                "按 P 暂停/恢复，按 Q 或 Ctrl+C 退出。"
             )
             run_macro_forever(controller, macro_profile=args.macro)
         finally:

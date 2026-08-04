@@ -3,20 +3,27 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-import termios
-import tty
 from typing import List, Optional, Sequence
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import termios
+    import tty
 
 
 class _RawMode:
     def __enter__(self):
+        if os.name == "nt":
+            return self
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
         tty.setraw(self.fd)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        if os.name != "nt":
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
 
 
 def _clear_screen() -> None:
@@ -25,6 +32,20 @@ def _clear_screen() -> None:
 
 
 def _read_key() -> str:
+    if os.name == "nt":
+        ch = msvcrt.getwch()
+        if ch in {"\r", "\n"}:
+            return "enter"
+        if ch == "\x03":
+            return "ctrl_c"
+        if ch in {"\x00", "\xe0"}:
+            extended = msvcrt.getwch()
+            if extended == "H":
+                return "up"
+            if extended == "P":
+                return "down"
+        return "other"
+
     ch = os.read(sys.stdin.fileno(), 1)
     if not ch:
         return ""
