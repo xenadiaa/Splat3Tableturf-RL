@@ -147,17 +147,24 @@ def _write_json_obj(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _usb_capture_device_names() -> List[str]:
+def _all_video_device_names() -> List[str]:
     names = [str(name).strip() for name in list_avfoundation_video_devices()]
-    names = [name for name in names if name and is_usb_capture_device_name(name)]
     seen: Set[str] = set()
     out: List[str] = []
     for name in names:
-        if name in seen:
+        if not name or name in seen:
             continue
         seen.add(name)
         out.append(name)
     return out
+
+
+def _usb_capture_device_names() -> List[str]:
+    return [
+        name
+        for name in _all_video_device_names()
+        if is_usb_capture_device_name(name)
+    ]
 
 
 def _board_label_to_mask(label: str) -> int:
@@ -959,6 +966,9 @@ class FrameApiAutoLauncher:
         launch_config_path = self._launch_config_path()
         launch_cfg = _load_json_obj(launch_config_path)
         configured_name = str(launch_cfg.get("device_name", "") or self._config.capture_device_name or "").strip()
+        if configured_name and not bool(launch_cfg.get("pick_device", False)):
+            self._config.capture_device_name = configured_name
+            return
         all_devices = _all_video_device_names()
         if configured_name and configured_name in all_devices:
             return
